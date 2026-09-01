@@ -51,6 +51,17 @@ func NewEnvironmentService(store *Store, lookup func(string) string, transport h
 				},
 				Tokens: RedisCachedTokenLoader{},
 			},
+			executioncontracts.AccountScopeKISMockUS: KISMockUSBroker{
+				Transport: transport,
+				LoadConfig: func() (kismockread.Config, string) {
+					config, err := kismockread.ConfigFromEnv(lookup)
+					if err != nil {
+						return kismockread.Config{}, string(err.Code)
+					}
+					return config, ""
+				},
+				Tokens: RedisCachedTokenLoader{},
+			},
 			executioncontracts.AccountScopeAlpacaPaperCrypto: AlpacaPaperCryptoBroker{
 				Transport: transport,
 				LoadConfig: func() (AlpacaPaperCryptoConfig, string) {

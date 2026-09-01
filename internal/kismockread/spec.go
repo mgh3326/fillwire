@@ -16,6 +16,7 @@ const (
 	OperationDomesticBalance      Operation = "domestic-balance"
 	OperationOverseasBalance      Operation = "overseas-balance"
 	OperationDomesticOrderHistory Operation = "domestic-order-history"
+	OperationOverseasOrderHistory Operation = "overseas-order-history"
 )
 
 // ReadSpec describes one verified mock read endpoint. Every entry is GET-only
@@ -64,6 +65,16 @@ var readSpecs = map[Operation]ReadSpec{
 		ResponseCursorNK: "ctx_area_nk100",
 		MaximumPages:     100,
 	},
+	OperationOverseasOrderHistory: {
+		Operation:        OperationOverseasOrderHistory,
+		Path:             "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+		TRID:             "VTTS3035R",
+		RequestCursorFK:  "CTX_AREA_FK200",
+		RequestCursorNK:  "CTX_AREA_NK200",
+		ResponseCursorFK: "ctx_area_fk200",
+		ResponseCursorNK: "ctx_area_nk200",
+		MaximumPages:     100,
+	},
 }
 
 // ParseOperation canonicalizes the two short CLI aliases without widening the
@@ -76,6 +87,8 @@ func ParseOperation(value string) (Operation, *SafeError) {
 		return OperationOverseasBalance, nil
 	case string(OperationDomesticOrderHistory), "orders":
 		return OperationDomesticOrderHistory, nil
+	case string(OperationOverseasOrderHistory), "overseas-orders":
+		return OperationOverseasOrderHistory, nil
 	default:
 		return OperationUnknown, safeError(CodeInvalidInput)
 	}

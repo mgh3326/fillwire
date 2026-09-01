@@ -321,6 +321,7 @@ func (store *Store) ReservePending(ctx context.Context, receipt executioncontrac
 	if !validReceipt(receipt) || receipt.Disposition != executioncontracts.DispositionUnknown ||
 		command.CommandID != receipt.CommandID ||
 		(command.AccountScope != executioncontracts.AccountScopeKISMock &&
+			command.AccountScope != executioncontracts.AccountScopeKISMockUS &&
 			command.AccountScope != executioncontracts.AccountScopeAlpacaPaperCrypto) {
 		return executioncontracts.ExecutionReceiptV1{}, false, errors.New("invalid pending receipt")
 	}
@@ -412,8 +413,8 @@ type PendingResolution struct {
 	ContextPresent bool
 }
 
-// PendingKISMockResolutions returns only unresolved UNKNOWN records in this
-// mock-only store. It never changes a receipt.
+// PendingKISMockResolutions returns only unresolved UNKNOWN records for the
+// domestic and US KIS mock scopes. It never changes a receipt.
 func (store *Store) PendingKISMockResolutions(ctx context.Context) ([]PendingResolution, error) {
 	if store == nil || store.db == nil {
 		return nil, errors.New("store unavailable")
@@ -424,9 +425,9 @@ func (store *Store) PendingKISMockResolutions(ctx context.Context) ([]PendingRes
 		FROM commands c
 		LEFT JOIN command_contexts x ON x.command_id = c.command_id
 		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
-		WHERE c.disposition = 'UNKNOWN' AND c.account_scope = ? AND r.command_id IS NULL
+		WHERE c.disposition = 'UNKNOWN' AND c.account_scope IN (?, ?) AND r.command_id IS NULL
 		ORDER BY c.id
-	`, executioncontracts.AccountScopeKISMock)
+	`, executioncontracts.AccountScopeKISMock, executioncontracts.AccountScopeKISMockUS)
 	if err != nil {
 		return nil, err
 	}

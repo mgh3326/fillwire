@@ -31,6 +31,7 @@ sources. Every operation is HTTP GET and its TR ID ends in `R`.
 | `domestic-balance` (or `balance`) | `/uapi/domestic-stock/v1/trading/inquire-balance` | `VTTC8434R` |
 | `overseas-balance` | `/uapi/overseas-stock/v1/trading/inquire-balance` | `VTTS3012R` |
 | `domestic-order-history` (or `orders`) | `/uapi/domestic-stock/v1/trading/inquire-daily-ccld` | `VTTC8001R` |
+| `overseas-order-history` (or `overseas-orders`) | `/uapi/overseas-stock/v1/trading/inquire-ccnl` | `VTTS3035R` |
 
 The mock pending-order inquiry is deliberately excluded because the reference
 implementation rejects it in mock mode. Integrated-margin, buyable-amount, and
@@ -60,6 +61,7 @@ out of this public repository.
 go run ./cmd/kis-mock-read domestic-balance
 go run ./cmd/kis-mock-read domestic-balance --json
 go run ./cmd/kis-mock-read domestic-order-history --from 20260901 --to 20260901 --json
+go run ./cmd/kis-mock-read overseas-order-history --from 20260901 --to 20260901 --exchange NASD --json
 ```
 
 ## Provider-scoped token gateway: `gatewayd`
@@ -102,7 +104,7 @@ cache contracts are separately pinned:
 `kis-mock-edge` accepts `POST /v1/commands` and
 `POST /v1/commands/{command_id}/cancel` on `127.0.0.1:8080` by default. The
 listener rejects non-loopback overrides. `account_scope` is closed
-to `kis_mock` and `alpaca_paper_crypto`; both use the same SQLite receipt store,
+to `kis_mock`, `kis_mock_us`, and `alpaca_paper_crypto`; all use the same SQLite receipt store,
 where `command_id UNIQUE` means a repeated ID returns the saved receipt and
 makes zero additional broker POSTs.
 
@@ -194,3 +196,30 @@ go test -race ./...
 go vet ./...
 ./scripts/secret_scan.sh
 ```
+
+
+### KIS mock US extension
+
+`kis_mock_us` is an additive, fixed-NASD KIS VTS limit-order surface. It
+accepts uppercase US symbols (including `BRK.B`, sent as `BRK/B`), positive
+integer shares, and positive decimal prices. It mirrors auto_trader's overseas
+VTS TR IDs: buy `VTTT1002U`, US sell `VTTT1001U`, and cancellation
+`VTTT1004U`; no hashkey is sent. Its immutable limits are 100 shares and USD
+1,000 notional.
+
+UNKNOWN US receipts are resolved only by mock-available overseas daily history:
+GET `/uapi/overseas-stock/v1/trading/inquire-ccnl` with `VTTS3035R`.
+`TTTS3018R` is not used because auto_trader rejects that mock pending-order
+inquiry. A domestic-only reader is never evidence for a US conclusion.
+
+With the local edge already running and its placement gate armed, run the
+bounded one-shot smoke path with:
+
+```sh
+sh ./scripts/kis_mock_us_smoke.sh
+```
+
+It creates a `broker-edge-smoke:` correlation ID, places exactly one AAPL
+share at a USD 1–50 limit (default USD 1), requires ACCEPTED, cancels it, then
+runs the read-only resolver. `BROKER_EDGE_SMOKE_URL` must stay on
+`http://127.0.0.1:...`.

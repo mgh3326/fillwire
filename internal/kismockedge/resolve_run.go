@@ -84,3 +84,27 @@ func (reader environmentOrderHistoryReader) DomesticOrderHistory(ctx context.Con
 	}
 	return orders, nil
 }
+
+
+// OverseasOrderHistory is the only mock-US evidence reader. It deliberately
+// mirrors auto_trader's mock-available daily history TR, not the mock-blocked
+// overseas pending-orders inquiry.
+func (reader environmentOrderHistoryReader) OverseasOrderHistory(ctx context.Context, day string) ([]kismockread.OverseasOrder, error) {
+	lookup := reader.lookup
+	if lookup == nil {
+		lookup = func(string) string { return "" }
+	}
+	config, configErr := kismockread.ConfigFromEnv(lookup)
+	if configErr != nil {
+		return nil, configErr
+	}
+	getter, getterErr := kismockread.NewRedisGETClient(config.RedisURL)
+	if getterErr != nil {
+		return nil, getterErr
+	}
+	orders, readErr := (kismockread.Executor{TokenGetter: getter, Now: time.Now}).OverseasOrderHistory(ctx, config, day)
+	if readErr != nil {
+		return nil, readErr
+	}
+	return orders, nil
+}

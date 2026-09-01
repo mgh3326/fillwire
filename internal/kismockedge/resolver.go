@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 	"sort"
+	"strings"
 	"time"
 
 	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
@@ -22,6 +23,14 @@ const (
 // refresh, write, or clear a token and must use a GET-only broker path.
 type OrderHistoryReader interface {
 	DomesticOrderHistory(context.Context, string) ([]kismockread.DomesticOrder, error)
+}
+
+// OverseasOrderHistoryReader is an optional extension of the original
+// domestic reader contract. Resolver requires it before it can make any
+// conclusion for kis_mock_us; a domestic-only reader is intentionally not
+// treated as evidence for an overseas receipt.
+type OverseasOrderHistoryReader interface {
+	OverseasOrderHistory(context.Context, string) ([]kismockread.OverseasOrder, error)
 }
 
 // Resolver turns only proven KIS mock UNKNOWN receipts into a conclusion.
@@ -73,49 +82,111 @@ func (resolver Resolver) Resolve(ctx context.Context) (ResolutionResult, error) 
 	if window == 0 {
 		window = defaultMatchWindow
 	}
-	byDay := make(map[string][]PendingResolution)
-	for _, item := range pending {
-		byDay[kisTradingDay(item.SentAt)] = append(byDay[kisTradingDay(item.SentAt)], item)
+	type evidenceDay struct {
+		Scope string
+		Day   string
 	}
-	days := make([]string, 0, len(byDay))
+	byDay := make(map[evidenceDay][]PendingResolution)
+	for _, item := range pending {
+		key := evidenceDay{Scope: item.AccountScope, Day: kisTradingDay(item.SentAt)}
+		byDay[key] = append(byDay[key], item)
+	}
+	days := make([]evidenceDay, 0, len(byDay))
 	for day := range byDay {
 		days = append(days, day)
 	}
-	sort.Strings(days)
+	sort.Slice(days, func(left, right int) bool {
+		if days[left].Scope == days[right].Scope {
+			return days[left].Day < days[right].Day
+		}
+		return days[left].Scope < days[right].Scope
+	})
 	result := ResolutionResult{}
 	for _, day := range days {
-		orders, readErr := resolver.Reader.DomesticOrderHistory(ctx, day)
-		if readErr != nil {
+		items := byDay[day]
+		switch day.Scope {
+		case executioncontracts.AccountScopeKISMock:
+			orders, readErr := resolver.Reader.DomesticOrderHistory(ctx, day.Day)
+			if readErr != nil {
+				result.ReadFailures++
+				result.Unresolved += len(items)
+				continue
+			}
+			resolved, unresolved, resolveErr := resolver.resolveEvidence(ctx, items, now, grace, len(orders), func(item PendingResolution) []string {
+				matches := matchingOrders(item, orders, window)
+				return domesticMatchIDs(matches)
+			})
+			if resolveErr != nil {
+				return result, resolveErr
+			}
+			result.Resolved = append(result.Resolved, resolved...)
+			result.Unresolved += unresolved
+		case executioncontracts.AccountScopeKISMockUS:
+			overseasReader, available := resolver.Reader.(OverseasOrderHistoryReader)
+			if !available {
+				// There is no evidence source capable of proving a US conclusion.
+				result.ReadFailures++
+				result.Unresolved += len(items)
+				continue
+			}
+			orders, readErr := overseasReader.OverseasOrderHistory(ctx, day.Day)
+			if readErr != nil {
+				result.ReadFailures++
+				result.Unresolved += len(items)
+				continue
+			}
+			resolved, unresolved, resolveErr := resolver.resolveEvidence(ctx, items, now, grace, len(orders), func(item PendingResolution) []string {
+				matches := matchingOverseasOrders(item, orders, window)
+				return overseasMatchIDs(matches)
+			})
+			if resolveErr != nil {
+				return result, resolveErr
+			}
+			result.Resolved = append(result.Resolved, resolved...)
+			result.Unresolved += unresolved
+		default:
 			result.ReadFailures++
-			result.Unresolved += len(byDay[day])
-			continue
-		}
-		for _, item := range byDay[day] {
-			matches := matchingOrders(item, orders, window)
-			if len(matches) == 1 {
-				receipt, resolveErr := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, executioncontracts.DispositionAccepted, matches[0].BrokerOrderID, "", now())
-				if resolveErr != nil {
-					return result, resolveErr
-				}
-				result.Resolved = append(result.Resolved, receipt)
-				continue
-			}
-			// A legacy receipt has no immutable command facts. An empty, successful
-			// day is nevertheless evidence that it was not created; any nonempty
-			// day remains UNKNOWN rather than guessing a correspondence.
-			absentProven := item.ContextPresent || len(orders) == 0
-			if len(matches) == 0 && absentProven && !now().Before(item.SentAt.Add(grace)) {
-				receipt, resolveErr := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, executioncontracts.DispositionNotCreated, "", ErrorResolvedAbsent, now())
-				if resolveErr != nil {
-					return result, resolveErr
-				}
-				result.Resolved = append(result.Resolved, receipt)
-				continue
-			}
-			result.Unresolved++
+			result.Unresolved += len(items)
 		}
 	}
 	return result, nil
+}
+
+func (resolver Resolver) resolveEvidence(
+	ctx context.Context,
+	items []PendingResolution,
+	now func() time.Time,
+	grace time.Duration,
+	orderCount int,
+	matchingIDs func(PendingResolution) []string,
+) ([]executioncontracts.ExecutionReceiptV1, int, error) {
+	resolved := make([]executioncontracts.ExecutionReceiptV1, 0, len(items))
+	unresolved := 0
+	for _, item := range items {
+		matches := matchingIDs(item)
+		if len(matches) == 1 {
+			receipt, err := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, executioncontracts.DispositionAccepted, matches[0], "", now())
+			if err != nil {
+				return resolved, unresolved, err
+			}
+			resolved = append(resolved, receipt)
+			continue
+		}
+		// A legacy receipt has no immutable command facts. An empty, successful
+		// day is nevertheless evidence that it was not created; any nonempty
+		// day remains UNKNOWN rather than guessing a correspondence.
+		absentProven := item.ContextPresent || orderCount == 0
+		if len(matches) == 0 && absentProven && !now().Before(item.SentAt.Add(grace)) {
+			receipt, err := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, executioncontracts.DispositionNotCreated, "", ErrorResolvedAbsent, now())
+			if err != nil {
+				return resolved, unresolved, err
+			}
+			resolved = append(resolved, receipt)
+			continue
+		}
+		unresolved++
+	}
+	return resolved, unresolved, nil
 }
 
 var errResolverUnavailable = &resolverError{}
@@ -144,10 +215,54 @@ func matchingOrders(pending PendingResolution, orders []kismockread.DomesticOrde
 	return matches
 }
 
+
+func domesticMatchIDs(matches []kismockread.DomesticOrder) []string {
+	result := make([]string, 0, len(matches))
+	for _, match := range matches {
+		result = append(result, match.BrokerOrderID)
+	}
+	return result
+}
+
+func matchingOverseasOrders(pending PendingResolution, orders []kismockread.OverseasOrder, window time.Duration) []kismockread.OverseasOrder {
+	if !pending.ContextPresent {
+		return nil
+	}
+	matches := make([]kismockread.OverseasOrder, 0, 1)
+	for _, order := range orders {
+		if order.Side != pending.Side || normalizeKISMockUSSymbol(order.StockCode) != pending.StockCode ||
+			!samePositiveInteger(order.Quantity, pending.Quantity) || !samePositiveDecimal(order.Price, pending.Price) ||
+			absDuration(order.OrderedAt.Sub(pending.SentAt)) > window {
+			continue
+		}
+		matches = append(matches, order)
+	}
+	return matches
+}
+
+func overseasMatchIDs(matches []kismockread.OverseasOrder) []string {
+	result := make([]string, 0, len(matches))
+	for _, match := range matches {
+		result = append(result, match.BrokerOrderID)
+	}
+	return result
+}
+
+func normalizeKISMockUSSymbol(value string) string {
+	return strings.ReplaceAll(strings.TrimSpace(value), "/", ".")
+}
+
 func samePositiveInteger(left, right string) bool {
 	leftValue, leftOK := new(big.Int).SetString(left, 10)
 	rightValue, rightOK := new(big.Int).SetString(right, 10)
 	return leftOK && rightOK && leftValue.Sign() > 0 && rightValue.Sign() > 0 && leftValue.Cmp(rightValue) == 0
+}
+
+
+func samePositiveDecimal(left, right string) bool {
+	leftValue, leftOK := positiveDecimal(left)
+	rightValue, rightOK := positiveDecimal(right)
+	return leftOK && rightOK && leftValue.Cmp(rightValue) == 0
 }
 
 func absDuration(value time.Duration) time.Duration {

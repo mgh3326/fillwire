@@ -113,7 +113,7 @@ func TestTokenPayloadIsStrictAndBuffered(t *testing.T) {
 
 func TestAllowlistContainsOnlyReadTRs(t *testing.T) {
 	specs := AllowedReadSpecs()
-	if len(specs) != 3 {
+	if len(specs) != 4 {
 		t.Fatalf("allowlist size = %d", len(specs))
 	}
 	for _, spec := range specs {

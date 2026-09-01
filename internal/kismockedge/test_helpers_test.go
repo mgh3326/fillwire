@@ -37,6 +37,15 @@ func testAlpacaCommand(commandID string) executioncontracts.ExecutionCommandV1 {
 	return command
 }
 
+func testKISMockUSCommand(commandID string) executioncontracts.ExecutionCommandV1 {
+	command := testCommand(commandID)
+	command.AccountScope = executioncontracts.AccountScopeKISMockUS
+	command.StockCode = "AAPL"
+	command.Quantity = "1"
+	command.Price = "1"
+	return command
+}
+
 func testBrokerConfig() kismockread.Config {
 	return kismockread.Config{
 		BaseURL:   kismockread.MockBaseURL,
@@ -130,6 +139,16 @@ func newTestServiceWithBrokers(store *Store, brokers map[string]Broker, enabled 
 
 func testKISMockBroker(transport http.RoundTripper) KISMockBroker {
 	return KISMockBroker{
+		Transport: transport,
+		LoadConfig: func() (kismockread.Config, string) {
+			return testBrokerConfig(), ""
+		},
+		Tokens: &fakeTokenLoader{token: "cached-token-for-test"},
+	}
+}
+
+func testKISMockUSBroker(transport http.RoundTripper) KISMockUSBroker {
+	return KISMockUSBroker{
 		Transport: transport,
 		LoadConfig: func() (kismockread.Config, string) {
 			return testBrokerConfig(), ""

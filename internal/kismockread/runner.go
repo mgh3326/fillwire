@@ -121,6 +121,26 @@ func validateReadRequest(input *ReadRequest) *SafeError {
 			return safeError(CodeInvalidInput)
 		}
 	}
+	if input.Operation == OperationOverseasOrderHistory {
+		if !validDate(input.FromDate) || !validDate(input.ToDate) || input.FromDate > input.ToDate {
+			return safeError(CodeInvalidInput)
+		}
+		if input.Side == "" {
+			input.Side = "00"
+		}
+		if input.Side != "00" && input.Side != "01" && input.Side != "02" {
+			return safeError(CodeInvalidInput)
+		}
+		if input.StockCode != "" && !validOverseasStockCode(input.StockCode) {
+			return safeError(CodeInvalidInput)
+		}
+		if input.Exchange == "" {
+			input.Exchange = "NASD"
+		}
+		if input.Exchange != "NASD" && input.Exchange != "NYSE" && input.Exchange != "AMEX" {
+			return safeError(CodeInvalidInput)
+		}
+	}
 	return nil
 }
 
@@ -142,6 +162,31 @@ func allDigitsAtMost(value string, maximum int) bool {
 	}
 	for _, character := range value {
 		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+
+// validOverseasStockCode retains auto_trader's DB symbol convention. A period
+// is converted to KIS's slash form only while constructing the KIS request.
+func validOverseasStockCode(value string) bool {
+	if len(value) == 0 || len(value) > 16 {
+		return false
+	}
+	separators := 0
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch {
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '.' || character == '/':
+			separators++
+			if separators > 1 || index == 0 || index == len(value)-1 {
+				return false
+			}
+		default:
 			return false
 		}
 	}
@@ -291,6 +336,21 @@ func readQuery(
 		query.Set("ORD_GNO_BRNO", "")
 		query.Set("ODNO", input.OrderNo)
 		query.Set("EXCG_ID_DVSN_CD", "ALL")
+	case OperationOverseasOrderHistory:
+		stockCode := input.StockCode
+		if stockCode != "" {
+			stockCode = strings.ReplaceAll(stockCode, ".", "/")
+		}
+		query.Set("PDNO", stockCode)
+		query.Set("ORD_STRT_DT", input.FromDate)
+		query.Set("ORD_END_DT", input.ToDate)
+		query.Set("SLL_BUY_DVSN", input.Side)
+		query.Set("CCLD_NCCS_DVSN", "00")
+		query.Set("OVRS_EXCG_CD", input.Exchange)
+		query.Set("SORT_SQN", "DS")
+		query.Set("ORD_DT", "")
+		query.Set("ORD_GNO_BRNO", "")
+		query.Set("ODNO", "")
 	}
 	return query
 }

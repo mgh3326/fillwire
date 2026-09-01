@@ -94,10 +94,15 @@ func TestAccountScopesAreNamedPaperBackends(t *testing.T) {
 	if AccountScopeKISMock != "kis_mock" {
 		t.Fatalf("KIS account scope = %q", AccountScopeKISMock)
 	}
+	if AccountScopeKISMockUS != "kis_mock_us" {
+		t.Fatalf("KIS US account scope = %q", AccountScopeKISMockUS)
+	}
 	if AccountScopeAlpacaPaperCrypto != "alpaca_paper_crypto" {
 		t.Fatalf("Alpaca account scope = %q", AccountScopeAlpacaPaperCrypto)
 	}
-	if AccountScopeKISMock == AccountScopeAlpacaPaperCrypto {
+	if AccountScopeKISMock == AccountScopeKISMockUS ||
+		AccountScopeKISMock == AccountScopeAlpacaPaperCrypto ||
+		AccountScopeKISMockUS == AccountScopeAlpacaPaperCrypto {
 		t.Fatal("account scopes must be distinct")
 	}
 }

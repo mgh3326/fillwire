@@ -18,6 +18,8 @@ const (
 	// MaxAlpacaPaperCryptoNotionalUSD is the immutable paper-crypto smoke cap.
 	// It is deliberately an integer constant rather than an environment setting.
 	MaxAlpacaPaperCryptoNotionalUSD int64 = 10
+	// MaxKISMockUSNotionalUSD bounds the dedicated NASD mock-US surface.
+	MaxKISMockUSNotionalUSD int64 = 1_000
 
 	ErrorInvalidCommand       = "invalid_command"
 	ErrorTickMismatch         = "tick_mismatch"
@@ -47,6 +49,8 @@ func ValidateCommand(command executioncontracts.ExecutionCommandV1) string {
 	switch command.AccountScope {
 	case executioncontracts.AccountScopeKISMock:
 		return validateKISMockCommand(command)
+	case executioncontracts.AccountScopeKISMockUS:
+		return validateKISMockUSCommand(command)
 	case executioncontracts.AccountScopeAlpacaPaperCrypto:
 		return validateAlpacaPaperCryptoCommand(command)
 	default:
@@ -66,6 +70,19 @@ func validateKISMockCommand(command executioncontracts.ExecutionCommandV1) strin
 	}
 	if !TickMatchesKR(price, command.Side) {
 		return ErrorTickMismatch
+	}
+	return ""
+}
+
+func validateKISMockUSCommand(command executioncontracts.ExecutionCommandV1) string {
+	if command.AccountScope != executioncontracts.AccountScopeKISMockUS ||
+		(command.Side != "buy" && command.Side != "sell") || !validKISMockUSSymbol(command.StockCode) {
+		return ErrorInvalidCommand
+	}
+	_, validQuantity := positiveInteger(command.Quantity)
+	_, validPrice := positiveDecimal(command.Price)
+	if !validQuantity || !validPrice {
+		return ErrorInvalidCommand
 	}
 	return ""
 }
@@ -91,6 +108,8 @@ func ValidateOrderCaps(command executioncontracts.ExecutionCommandV1) string {
 	switch command.AccountScope {
 	case executioncontracts.AccountScopeKISMock:
 		return validateKISMockOrderCaps(command)
+	case executioncontracts.AccountScopeKISMockUS:
+		return validateKISMockUSOrderCaps(command)
 	case executioncontracts.AccountScopeAlpacaPaperCrypto:
 		return validateAlpacaPaperCryptoOrderCaps(command)
 	default:
@@ -109,6 +128,22 @@ func validateKISMockOrderCaps(command executioncontracts.ExecutionCommandV1) str
 	}
 	notional := new(big.Int).Mul(price, quantity)
 	if notional.Cmp(big.NewInt(MaxOrderNotionalKRW)) > 0 {
+		return ErrorOrderLimitExceeded
+	}
+	return ""
+}
+
+func validateKISMockUSOrderCaps(command executioncontracts.ExecutionCommandV1) string {
+	quantity, validQuantity := positiveInteger(command.Quantity)
+	price, validPrice := positiveDecimal(command.Price)
+	if !validQuantity || !validPrice {
+		return ErrorInvalidCommand
+	}
+	if quantity.Cmp(big.NewInt(MaxOrderQuantity)) > 0 {
+		return ErrorOrderLimitExceeded
+	}
+	notional := new(big.Rat).Mul(new(big.Rat).SetInt(quantity), price)
+	if notional.Cmp(new(big.Rat).SetInt64(MaxKISMockUSNotionalUSD)) > 0 {
 		return ErrorOrderLimitExceeded
 	}
 	return ""
@@ -243,6 +278,33 @@ func allDigits(value string, length int) bool {
 	}
 	for _, character := range value {
 		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+
+// validKISMockUSSymbol retains auto_trader's database convention: a class
+// share is expressed with a period (BRK.B), which request construction mirrors
+// to KIS's slash form (BRK/B). The edge deliberately does not uppercase or
+// otherwise normalize caller input.
+func validKISMockUSSymbol(value string) bool {
+	if len(value) == 0 || len(value) > 16 {
+		return false
+	}
+	dots := 0
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch {
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '.':
+			dots++
+			if dots > 1 || index == 0 || index == len(value)-1 {
+				return false
+			}
+		default:
 			return false
 		}
 	}

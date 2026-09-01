@@ -15,6 +15,9 @@ const (
 	ExecutionReceiptV1SchemaVersion = "execution-receipt/v1"
 	// AccountScopeKISMock routes a command to the KIS VTS backend.
 	AccountScopeKISMock = "kis_mock"
+	// AccountScopeKISMockUS routes a command to the KIS VTS US-equity
+	// backend. It is intentionally distinct from the domestic KIS mock scope.
+	AccountScopeKISMockUS = "kis_mock_us"
 	// AccountScopeAlpacaPaperCrypto routes a command to the Alpaca paper
 	// crypto backend. It never represents Alpaca's live trading authority.
 	AccountScopeAlpacaPaperCrypto = "alpaca_paper_crypto"
