@@ -21,11 +21,12 @@ const (
 	brokerResponseLimit = 1024 * 1024
 )
 
-// Broker prepares a mock-only order and exposes one non-retryable send step.
-// Separating preparation from Send lets the service commit its pending marker
-// immediately before the irreversible HTTP boundary.
+// Broker prepares an account-scoped paper order and exposes one non-retryable
+// send step. Each implementation owns only its own credential lookup and
+// request construction. Separating preparation from Send lets Service commit
+// its shared pending marker immediately before the irreversible HTTP boundary.
 type Broker interface {
-	Prepare(context.Context, kismockread.Config, executioncontracts.ExecutionCommandV1, string) (PreparedBroker, string)
+	Prepare(context.Context, executioncontracts.ExecutionCommandV1) (PreparedBroker, string)
 }
 
 // PreparedBroker sends exactly one prepared broker HTTP request.
@@ -43,13 +44,39 @@ type BrokerResult struct {
 
 // KISMockBroker is the real VTS-only broker implementation.
 type KISMockBroker struct {
-	Transport http.RoundTripper
+	Transport  http.RoundTripper
+	LoadConfig ConfigLoader
+	Tokens     TokenLoader
 }
 
-// Prepare validates all local request construction before the pending marker.
-// Its URL and client both reuse kis-mock-read's HTTPS host pin and redirect
-// refusal; no live host is representable here.
+// Prepare lazily loads the KIS-only cached-token dependencies after Service has
+// completed its shared pre-send validation and placement gate. No Alpaca path
+// can reach either dependency because scope routing selects its own Broker.
 func (broker KISMockBroker) Prepare(
+	ctx context.Context,
+	command executioncontracts.ExecutionCommandV1,
+) (PreparedBroker, string) {
+	if command.AccountScope != executioncontracts.AccountScopeKISMock {
+		return nil, ErrorInvalidCommand
+	}
+	if broker.LoadConfig == nil || broker.Tokens == nil {
+		return nil, ErrorStorageFailure
+	}
+	config, configCode := broker.LoadConfig()
+	if configCode != "" {
+		return nil, configCode
+	}
+	token, tokenCode := broker.Tokens.Load(ctx, config)
+	if tokenCode != "" {
+		return nil, tokenCode
+	}
+	return broker.prepareWithCredentials(ctx, config, command, token)
+}
+
+// prepareWithCredentials validates all KIS local request construction before
+// the pending marker. Its URL and client both reuse kis-mock-read's HTTPS host
+// pin and redirect refusal; no KIS live host is representable here.
+func (broker KISMockBroker) prepareWithCredentials(
 	ctx context.Context,
 	config kismockread.Config,
 	command executioncontracts.ExecutionCommandV1,

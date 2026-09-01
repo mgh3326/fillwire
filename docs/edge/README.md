@@ -1,8 +1,9 @@
 # broker-edge
 
-`broker-edge` contains two deliberately bounded KIS VTS paths:
-`kis-mock-read` is GET-only, and `kis-mock-edge` is a separately approved,
-loopback-only mock placement edge. `cmd/` follows Go convention only—Python
+`broker-edge` contains deliberately bounded paper-trading paths:
+`kis-mock-read` is KIS VTS GET-only, and `kis-mock-edge` is a separately
+approved, loopback-only placement edge that routes a closed account scope to
+either KIS VTS or Alpaca paper crypto. `cmd/` follows Go convention only—Python
 does not import it, and Python retains ownership of `order_send_intents`.
 
 ## Read path: `kis-mock-read`
@@ -64,21 +65,30 @@ go run ./cmd/kis-mock-read domestic-order-history --from 20260901 --to 20260901 
 ## Mock placement edge: `kis-mock-edge`
 
 `kis-mock-edge` accepts only `POST /v1/commands` on `127.0.0.1:8080` by
-default. The listener rejects non-loopback overrides. Its SQLite receipt store
-has `command_id UNIQUE`; a repeated ID returns the saved receipt and makes zero
-additional broker POSTs.
+default. The listener rejects non-loopback overrides. `account_scope` is closed
+to `kis_mock` and `alpaca_paper_crypto`; both use the same SQLite receipt store,
+where `command_id UNIQUE` means a repeated ID returns the saved receipt and
+makes zero additional broker POSTs.
 
 Placement is disabled by default. It is allowed only when
-`BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit, and then only to the pinned
-HTTPS VTS host. A pending `UNKNOWN` receipt is committed immediately before the
-one possible broker POST. Therefore a kill, timeout, 5xx, redirect, or ambiguous
-provider response cannot be retried as `NOT_CREATED`.
+`BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit. A pending `UNKNOWN` receipt
+is committed immediately before the one possible broker POST. Therefore a kill,
+timeout, 5xx, redirect, or ambiguous provider response cannot be retried as
+`NOT_CREATED`.
 
-The first edge supports Korean limit orders only. It preserves price and
+The `kis_mock` path supports Korean limit orders only. It preserves price and
 quantity strings verbatim, rejects invalid KRX ticks rather than adjusting them,
 and has non-configurable caps of 100 shares and KRW 1,000,000 notional. It
 reuses the read path's GET-only cached token loader; it cannot issue or mutate a
 token.
+
+The `alpaca_paper_crypto` smoke path is independent of Redis and KIS tokens.
+It accepts only a `buy` limit order for `BTC/USD` (carried in the existing
+`stock_code` field), with positive decimal `quantity` and `price` strings and a
+non-configurable USD 10 notional cap. It sends those strings unchanged to only
+`https://paper-api.alpaca.markets/v2/orders`, authenticating with static paper
+key headers. The live `https://api.alpaca.markets` authority, HTTP, host
+overrides, and redirects are all refused before a second transfer can occur.
 
 Local settings:
 
@@ -87,6 +97,10 @@ Local settings:
   `127.0.0.1:8080`.
 - `BROKER_EDGE_SQLITE_PATH` — optional local receipt database; default
   `kis-mock-edge.sqlite`.
+- `ALPACA_PAPER_CRYPTO_API_KEY` — static paper API key, used only for
+  `alpaca_paper_crypto`.
+- `ALPACA_PAPER_CRYPTO_API_SECRET` — static paper API secret, used only for
+  `alpaca_paper_crypto`.
 
 Run it only after the explicit gate is intentionally armed:
 
@@ -122,8 +136,10 @@ place real VTS orders.
 
 This repository does **not** contain Go PG intents, gRPC, proto, a live host,
 or an `auto_trader` modification/dependency. It does not place live orders or
-support order modification, cancellation, market orders, or any mock mutation
-other than the specifically gated domestic limit placement boundary.
+support order modification, cancellation, market orders, Binance, or any paper
+mutation beyond the specifically gated KIS domestic limit and Alpaca BTC/USD
+limit placement boundaries. Alpaca cancellation remains an external operator
+action and has no endpoint or client method here.
 
 Do not cite or integrate the orphan `auto_trader kis_websocket` Redis pub/sub
 legacy path. OPSP8996 때문에 live WS shadow는 금지하며,

@@ -89,3 +89,15 @@ func TestExecutionReceiptDispositionIsClosed(t *testing.T) {
 		t.Fatal("empty optional error_code was encoded")
 	}
 }
+
+func TestAccountScopesAreNamedPaperBackends(t *testing.T) {
+	if AccountScopeKISMock != "kis_mock" {
+		t.Fatalf("KIS account scope = %q", AccountScopeKISMock)
+	}
+	if AccountScopeAlpacaPaperCrypto != "alpaca_paper_crypto" {
+		t.Fatalf("Alpaca account scope = %q", AccountScopeAlpacaPaperCrypto)
+	}
+	if AccountScopeKISMock == AccountScopeAlpacaPaperCrypto {
+		t.Fatal("account scopes must be distinct")
+	}
+}

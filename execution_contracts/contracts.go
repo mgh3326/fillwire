@@ -13,8 +13,11 @@ const (
 	ExecutionCommandV1SchemaVersion = "execution-command/v1"
 	// ExecutionReceiptV1SchemaVersion identifies the first receipt wire shape.
 	ExecutionReceiptV1SchemaVersion = "execution-receipt/v1"
-	// AccountScopeKISMock is the only account scope accepted by kis-mock-edge.
+	// AccountScopeKISMock routes a command to the KIS VTS backend.
 	AccountScopeKISMock = "kis_mock"
+	// AccountScopeAlpacaPaperCrypto routes a command to the Alpaca paper
+	// crypto backend. It never represents Alpaca's live trading authority.
+	AccountScopeAlpacaPaperCrypto = "alpaca_paper_crypto"
 )
 
 // ExecutionCommandV1 is the narrow, mock-only request accepted by

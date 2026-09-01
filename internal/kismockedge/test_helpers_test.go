@@ -28,6 +28,15 @@ func testCommand(commandID string) executioncontracts.ExecutionCommandV1 {
 	}
 }
 
+func testAlpacaCommand(commandID string) executioncontracts.ExecutionCommandV1 {
+	command := testCommand(commandID)
+	command.AccountScope = executioncontracts.AccountScopeAlpacaPaperCrypto
+	command.StockCode = AlpacaPaperCryptoSymbolBTCUSD
+	command.Quantity = "0.5"
+	command.Price = "10.01"
+	return command
+}
+
 func testBrokerConfig() kismockread.Config {
 	return kismockread.Config{
 		BaseURL:   kismockread.MockBaseURL,
@@ -72,7 +81,7 @@ type fakeBroker struct {
 	once    sync.Once
 }
 
-func (broker *fakeBroker) Prepare(context.Context, kismockread.Config, executioncontracts.ExecutionCommandV1, string) (PreparedBroker, string) {
+func (broker *fakeBroker) Prepare(context.Context, executioncontracts.ExecutionCommandV1) (PreparedBroker, string) {
 	broker.prepared.Add(1)
 	if broker.code != "" {
 		return nil, broker.code
@@ -103,12 +112,43 @@ func newTestService(store *Store, broker Broker, enabled bool) *Service {
 	return &Service{
 		Store:        store,
 		PlaceEnabled: enabled,
+		Brokers: map[string]Broker{
+			executioncontracts.AccountScopeKISMock: broker,
+		},
+		Now: func() time.Time { return time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC) },
+	}
+}
+
+func newTestServiceWithBrokers(store *Store, brokers map[string]Broker, enabled bool) *Service {
+	return &Service{
+		Store:        store,
+		PlaceEnabled: enabled,
+		Brokers:      brokers,
+		Now:          func() time.Time { return time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC) },
+	}
+}
+
+func testKISMockBroker(transport http.RoundTripper) KISMockBroker {
+	return KISMockBroker{
+		Transport: transport,
 		LoadConfig: func() (kismockread.Config, string) {
 			return testBrokerConfig(), ""
 		},
 		Tokens: &fakeTokenLoader{token: "cached-token-for-test"},
-		Broker: broker,
-		Now:    func() time.Time { return time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC) },
+	}
+}
+
+func testAlpacaPaperCryptoBroker(transport http.RoundTripper) AlpacaPaperCryptoBroker {
+	return AlpacaPaperCryptoBroker{
+		Transport: transport,
+		LoadConfig: func() (AlpacaPaperCryptoConfig, string) {
+			return AlpacaPaperCryptoConfig{
+				BaseURL:   AlpacaPaperCryptoBaseURL,
+				APIKey:    "alpaca-paper-key-for-test",
+				APISecret: "alpaca-paper-secret-for-test",
+				Timeout:   time.Second,
+			}, ""
+		},
 	}
 }
 

@@ -12,9 +12,9 @@ fi
 if git grep -nE -- 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'; then
   exit 1
 fi
-# Real values in the documented env assignments are forbidden; angle-bracket
-# placeholders in .env.example are intentionally permitted.
-if git grep -nE -- '^(KIS_MOCK_APP_KEY|KIS_MOCK_APP_SECRET|KIS_MOCK_ACCOUNT_NO|REDIS_URL)=[^<[:space:]#]'; then
+# Real values in documented credential assignments are forbidden;
+# angle-bracket placeholders in .env.example are intentionally permitted.
+if git grep -nE -- '^(KIS_MOCK_APP_KEY|KIS_MOCK_APP_SECRET|KIS_MOCK_ACCOUNT_NO|REDIS_URL|ALPACA_PAPER_CRYPTO_API_KEY|ALPACA_PAPER_CRYPTO_API_SECRET)=[^<[:space:]#]'; then
   exit 1
 fi
 printf '%s\n' 'secrets check: clean'

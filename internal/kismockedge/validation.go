@@ -15,30 +15,47 @@ const (
 	MaxOrderQuantity    int64 = 100
 	MaxOrderNotionalKRW int64 = 1_000_000
 
-	ErrorInvalidCommand     = "invalid_command"
-	ErrorTickMismatch       = "tick_mismatch"
-	ErrorPlaceDisabled      = "place_disabled"
-	ErrorOrderLimitExceeded = "order_limit_exceeded"
-	ErrorSendPending        = "send_pending"
-	ErrorStorageFailure     = "storage_failure"
-	ErrorBrokerTimeout      = "broker_timeout"
-	ErrorBroker5xx          = "broker_5xx"
-	ErrorBrokerUnknown      = "broker_unknown"
+	// MaxAlpacaPaperCryptoNotionalUSD is the immutable paper-crypto smoke cap.
+	// It is deliberately an integer constant rather than an environment setting.
+	MaxAlpacaPaperCryptoNotionalUSD int64 = 10
+
+	ErrorInvalidCommand       = "invalid_command"
+	ErrorTickMismatch         = "tick_mismatch"
+	ErrorPlaceDisabled        = "place_disabled"
+	ErrorOrderLimitExceeded   = "order_limit_exceeded"
+	ErrorSendPending          = "send_pending"
+	ErrorStorageFailure       = "storage_failure"
+	ErrorConfigurationMissing = "configuration_missing"
+	ErrorBrokerTimeout        = "broker_timeout"
+	ErrorBroker5xx            = "broker_5xx"
+	ErrorBrokerUnknown        = "broker_unknown"
 )
 
 // ValidateCommand checks the closed command vocabulary before a broker request
-// can be prepared. It never changes Price or Quantity.
+// can be prepared. Scope-specific validation never changes Price or Quantity.
 func ValidateCommand(command executioncontracts.ExecutionCommandV1) string {
 	if command.SchemaVersion != executioncontracts.ExecutionCommandV1SchemaVersion ||
 		!validCommandID(command.CommandID) ||
-		command.AccountScope != executioncontracts.AccountScopeKISMock ||
-		(command.Side != "buy" && command.Side != "sell") ||
-		!allDigits(command.StockCode, 6) ||
 		command.OrderType != "limit" ||
 		!validIssuedAt(command.IssuedAt) {
 		return ErrorInvalidCommand
 	}
 
+	switch command.AccountScope {
+	case executioncontracts.AccountScopeKISMock:
+		return validateKISMockCommand(command)
+	case executioncontracts.AccountScopeAlpacaPaperCrypto:
+		return validateAlpacaPaperCryptoCommand(command)
+	default:
+		return ErrorInvalidCommand
+	}
+}
+
+func validateKISMockCommand(command executioncontracts.ExecutionCommandV1) string {
+	if command.AccountScope != executioncontracts.AccountScopeKISMock ||
+		(command.Side != "buy" && command.Side != "sell") || !allDigits(command.StockCode, 6) {
+		return ErrorInvalidCommand
+	}
 	_, validQuantity := positiveInteger(command.Quantity)
 	price, validPrice := positiveInteger(command.Price)
 	if !validQuantity || !validPrice {
@@ -50,10 +67,34 @@ func ValidateCommand(command executioncontracts.ExecutionCommandV1) string {
 	return ""
 }
 
-// ValidateOrderCaps applies fixed limits after structural validation. It does
-// not return normalized values, so the originally supplied decimal strings are
-// the exact values that reach the broker body.
+func validateAlpacaPaperCryptoCommand(command executioncontracts.ExecutionCommandV1) string {
+	if command.AccountScope != executioncontracts.AccountScopeAlpacaPaperCrypto ||
+		command.Side != "buy" || command.StockCode != AlpacaPaperCryptoSymbolBTCUSD {
+		return ErrorInvalidCommand
+	}
+	_, validQuantity := positiveDecimal(command.Quantity)
+	_, validPrice := positiveDecimal(command.Price)
+	if !validQuantity || !validPrice {
+		return ErrorInvalidCommand
+	}
+	return ""
+}
+
+// ValidateOrderCaps applies scope-specific immutable limits after structural
+// validation. It never returns normalized values, so the originally supplied
+// decimal strings are the exact values that reach the broker body.
 func ValidateOrderCaps(command executioncontracts.ExecutionCommandV1) string {
+	switch command.AccountScope {
+	case executioncontracts.AccountScopeKISMock:
+		return validateKISMockOrderCaps(command)
+	case executioncontracts.AccountScopeAlpacaPaperCrypto:
+		return validateAlpacaPaperCryptoOrderCaps(command)
+	default:
+		return ErrorInvalidCommand
+	}
+}
+
+func validateKISMockOrderCaps(command executioncontracts.ExecutionCommandV1) string {
 	quantity, validQuantity := positiveInteger(command.Quantity)
 	price, validPrice := positiveInteger(command.Price)
 	if !validQuantity || !validPrice {
@@ -64,6 +105,19 @@ func ValidateOrderCaps(command executioncontracts.ExecutionCommandV1) string {
 	}
 	notional := new(big.Int).Mul(price, quantity)
 	if notional.Cmp(big.NewInt(MaxOrderNotionalKRW)) > 0 {
+		return ErrorOrderLimitExceeded
+	}
+	return ""
+}
+
+func validateAlpacaPaperCryptoOrderCaps(command executioncontracts.ExecutionCommandV1) string {
+	quantity, validQuantity := positiveDecimal(command.Quantity)
+	price, validPrice := positiveDecimal(command.Price)
+	if !validQuantity || !validPrice {
+		return ErrorInvalidCommand
+	}
+	notional := new(big.Rat).Mul(quantity, price)
+	if notional.Cmp(new(big.Rat).SetInt64(MaxAlpacaPaperCryptoNotionalUSD)) > 0 {
 		return ErrorOrderLimitExceeded
 	}
 	return ""
@@ -151,6 +205,31 @@ func positiveInteger(value string) (*big.Int, bool) {
 		}
 	}
 	parsed, valid := new(big.Int).SetString(value, 10)
+	return parsed, valid && parsed.Sign() > 0
+}
+
+// positiveDecimal accepts a strict, positive base-10 decimal representation.
+// It deliberately rejects signs, exponent notation, whitespace, and incomplete
+// fractions so the exact caller-provided string can be forwarded unchanged.
+func positiveDecimal(value string) (*big.Rat, bool) {
+	if value == "" || len(value) > 128 {
+		return nil, false
+	}
+	dot := -1
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch {
+		case character >= '0' && character <= '9':
+		case character == '.' && dot == -1:
+			dot = index
+		default:
+			return nil, false
+		}
+	}
+	if dot == 0 || dot == len(value)-1 {
+		return nil, false
+	}
+	parsed, valid := new(big.Rat).SetString(value)
 	return parsed, valid && parsed.Sign() > 0
 }
 

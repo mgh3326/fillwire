@@ -2,10 +2,11 @@
 
 ## Approved scope
 
-`kis-mock-edge` is a deliberately narrow, local HTTP receiver for one Korean
-equity **mock VTS** placement command. It is the separately approved evolution
-of the formerly reserved command name; it does not change Python ownership of
-`order_send_intents`, redirect Python traffic, or modify `auto_trader`.
+`kis-mock-edge` is a deliberately narrow, local HTTP receiver for a closed set
+of paper-only placement commands: Korean equity **mock VTS** and Alpaca paper
+crypto. It is the separately approved evolution of the formerly reserved
+command name; it does not change Python ownership of `order_send_intents`,
+redirect Python traffic, or modify `auto_trader`.
 
 The receiver exposes only `POST /v1/commands` and binds to `127.0.0.1:8080` by
 default. `BROKER_EDGE_LISTEN_ADDR` may select another loopback address (for
@@ -17,15 +18,18 @@ separate design.
 
 `execution_contracts.ExecutionCommandV1` has only these fields:
 `schema_version`, `command_id`, `account_scope`, `side`, `stock_code`,
-`quantity`, `price`, `order_type`, and `issued_at`. The only account scope is
-`kis_mock`; sides are `buy` or `sell`; this first edge accepts only `limit`
-orders so its fixed notional cap can be proven before sending.
+`quantity`, `price`, `order_type`, and `issued_at`. Account scope is closed to
+`kis_mock` and `alpaca_paper_crypto`; both accept only `limit` orders so their
+fixed notional caps can be proven before sending. The wire shape is unchanged:
+for `alpaca_paper_crypto`, `stock_code` carries the Alpaca symbol.
 
-Price and quantity are decimal strings and are sent unchanged. Quantity must
-be a positive integer string. The KRX tick table and buy-floor/sell-ceiling
-logic are ported as pure validation functions from `auto_trader`; a nonmatching
-limit price receives `NOT_CREATED` with `tick_mismatch`. The edge never adjusts
-or re-prices a command.
+Price and quantity are decimal strings and are sent unchanged. For `kis_mock`,
+quantity and price must be positive integer strings; the KRX tick table and
+buy-floor/sell-ceiling logic are ported as pure validation functions from
+`auto_trader`, and a nonmatching limit price receives `NOT_CREATED` with
+`tick_mismatch`. For `alpaca_paper_crypto`, both values must be positive strict
+decimal strings and no KRX tick check is applied. The edge never adjusts or
+re-prices a command.
 
 `ExecutionReceiptV1` is the only successful command response shape. Its
 `disposition` is a closed vocabulary:
@@ -46,8 +50,8 @@ does not POST to the broker again.
 
 Immediately before the single broker POST, the edge commits an `UNKNOWN`
 pending receipt. If the process dies after that commit, including while the
-HTTP operation may have reached KIS, a restart returns that `UNKNOWN` receipt
-and never resends. Broker timeouts, 5xx responses, redirects, malformed
+HTTP operation may have reached a broker, a restart returns that `UNKNOWN`
+receipt and never resends. Broker timeouts, 5xx responses, redirects, malformed
 responses, and non-accepted responses after this point remain `UNKNOWN`; they
 are never relabeled `NOT_CREATED`.
 
@@ -69,9 +73,9 @@ Placement is disabled unless `BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit.
 When disabled, no configuration load, Redis access, or broker transport call
 is attempted and the receipt is `NOT_CREATED/place_disabled`.
 
-Even when enabled, immutable process constants cap a command at 100 shares and
-KRW 1,000,000 notional. There is no environment override that can raise either
-cap. The only broker URL is the pinned HTTPS VTS authority
+For `kis_mock`, immutable process constants cap a command at 100 shares and KRW
+1,000,000 notional. There is no environment override that can raise either cap.
+The only KIS broker URL is the pinned HTTPS VTS authority
 `openapivts.koreainvestment.com:29443`; redirects are refused and the final URL
 is rechecked inside the transport.
 
@@ -79,12 +83,38 @@ The edge reuses `kis-mock-read`'s strict cached-token loader. It can only issue
 Redis `GET` and validate the existing Python-written token payload. It has no
 token issuance, refresh, clear, migration, write, or lock capability.
 
+## Alpaca paper crypto scope
+
+`alpaca_paper_crypto` is a separate `Broker` implementation selected only when
+`account_scope` exactly matches that value. It has no Redis or KIS-token
+dependency. It reads only `ALPACA_PAPER_CRYPTO_API_KEY` and
+`ALPACA_PAPER_CRYPTO_API_SECRET`; these static values are used only as the
+`APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` request headers and are never
+returned, logged, or placed in a receipt.
+
+The scope allows only `buy` `BTC/USD` orders. `quantity` and `price` are
+positive decimal strings; their exact product may not exceed USD 10. There is
+no environment override for the allowlist, side, or cap. The request is one
+`POST /v2/orders` body with `symbol`, `qty`, `side`, `type="limit"`,
+`limit_price`, and `time_in_force="gtc"`. A 2xx response is accepted only when
+it contains a nonempty string `id` and a `status` field.
+
+The only permitted authority is `https://paper-api.alpaca.markets`. HTTP,
+userinfo, fragments, ports, redirects, and every other host are refused. The
+live `https://api.alpaca.markets` authority is a compile-time forbidden value in
+the same spirit as `auto_trader`'s `FORBIDDEN_TRADING_BASE_URLS`; it cannot be
+set through the environment. The pin is checked when constructing the request
+and again inside the RoundTripper immediately before any transport call.
+
 ## Explicit exclusions
 
 - No live KIS host, live credentials, or live place route exists here.
+- No live Alpaca host, live credential name, or host override exists here.
 - No modification, cancellation, market order, or other mutation endpoint is
   exposed.
+- Alpaca cancellation is deliberately external to this service; no cancel
+  client or route is implemented.
 - No retry or replay path can issue a second broker POST for a command ID.
 - No account, order, or token values are emitted as metrics or response data.
 - This repository's tests use fake transports only; they do not execute a real
-  VTS placement.
+  KIS VTS or Alpaca paper placement.

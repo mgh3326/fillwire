@@ -144,12 +144,16 @@ func TestGateOffCapsAndTickMismatchDoNotReachBroker(t *testing.T) {
 		service := &Service{
 			Store:        store,
 			PlaceEnabled: false,
-			LoadConfig: func() (config kismockread.Config, code string) {
-				t.Fatal("disabled gate loaded broker configuration")
-				return config, code
+			Brokers: map[string]Broker{
+				executioncontracts.AccountScopeKISMock: KISMockBroker{
+					Transport: transport,
+					LoadConfig: func() (config kismockread.Config, code string) {
+						t.Fatal("disabled gate loaded broker configuration")
+						return config, code
+					},
+					Tokens: loader,
+				},
 			},
-			Tokens: loader,
-			Broker: KISMockBroker{Transport: transport},
 		}
 		receipt, err := service.Process(context.Background(), testCommand("gate-off"))
 		if err != nil {

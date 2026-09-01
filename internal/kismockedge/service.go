@@ -20,14 +20,13 @@ type TokenLoader interface {
 	Load(context.Context, kismockread.Config) (string, string)
 }
 
-// Service coordinates validation, durable idempotency, and the single broker
-// send boundary. Its dependencies are deliberately narrow for failure tests.
+// Service coordinates scope validation, durable idempotency, and the single
+// broker send boundary. Brokers own their backend-specific credential lookup;
+// this type owns the one shared fail-honest lifecycle for every scope.
 type Service struct {
 	Store        *Store
 	PlaceEnabled bool
-	LoadConfig   ConfigLoader
-	Tokens       TokenLoader
-	Broker       Broker
+	Brokers      map[string]Broker
 	Now          func() time.Time
 }
 
@@ -40,15 +39,25 @@ func NewEnvironmentService(store *Store, lookup func(string) string, transport h
 	return &Service{
 		Store:        store,
 		PlaceEnabled: strings.TrimSpace(lookup("BROKER_EDGE_MOCK_PLACE_ENABLED")) == "true",
-		LoadConfig: func() (kismockread.Config, string) {
-			config, err := kismockread.ConfigFromEnv(lookup)
-			if err != nil {
-				return kismockread.Config{}, string(err.Code)
-			}
-			return config, ""
+		Brokers: map[string]Broker{
+			executioncontracts.AccountScopeKISMock: KISMockBroker{
+				Transport: transport,
+				LoadConfig: func() (kismockread.Config, string) {
+					config, err := kismockread.ConfigFromEnv(lookup)
+					if err != nil {
+						return kismockread.Config{}, string(err.Code)
+					}
+					return config, ""
+				},
+				Tokens: RedisCachedTokenLoader{},
+			},
+			executioncontracts.AccountScopeAlpacaPaperCrypto: AlpacaPaperCryptoBroker{
+				Transport: transport,
+				LoadConfig: func() (AlpacaPaperCryptoConfig, string) {
+					return AlpacaPaperCryptoConfigFromEnv(lookup)
+				},
+			},
 		},
-		Tokens: RedisCachedTokenLoader{},
-		Broker: KISMockBroker{Transport: transport},
 	}
 }
 
@@ -76,18 +85,11 @@ func (service *Service) Process(ctx context.Context, command executioncontracts.
 	if code := ValidateOrderCaps(command); code != "" {
 		return service.storeFinal(ctx, command.CommandID, executioncontracts.DispositionNotCreated, code)
 	}
-	if service.LoadConfig == nil || service.Tokens == nil || service.Broker == nil {
+	broker := service.brokerForScope(command.AccountScope)
+	if broker == nil {
 		return service.storeFinal(ctx, command.CommandID, executioncontracts.DispositionNotCreated, ErrorStorageFailure)
 	}
-	config, configCode := service.LoadConfig()
-	if configCode != "" {
-		return service.storeFinal(ctx, command.CommandID, executioncontracts.DispositionNotCreated, configCode)
-	}
-	token, tokenCode := service.Tokens.Load(ctx, config)
-	if tokenCode != "" {
-		return service.storeFinal(ctx, command.CommandID, executioncontracts.DispositionNotCreated, tokenCode)
-	}
-	prepared, prepareCode := service.Broker.Prepare(ctx, config, command, token)
+	prepared, prepareCode := broker.Prepare(ctx, command)
 	if prepareCode != "" || prepared == nil {
 		if prepareCode == "" {
 			prepareCode = ErrorInvalidCommand
@@ -114,6 +116,13 @@ func (service *Service) Process(ctx context.Context, command executioncontracts.
 		result.ErrorCode = ErrorBrokerUnknown
 	}
 	return service.finalize(ctx, command.CommandID, executioncontracts.DispositionUnknown, "", result.ErrorCode)
+}
+
+func (service *Service) brokerForScope(scope string) Broker {
+	if service == nil || service.Brokers == nil {
+		return nil
+	}
+	return service.Brokers[scope]
 }
 
 func (service *Service) storeFinal(ctx context.Context, commandID string, disposition executioncontracts.ExecutionDisposition, code string) (executioncontracts.ExecutionReceiptV1, error) {

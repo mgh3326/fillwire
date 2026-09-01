@@ -37,7 +37,7 @@ func TestBroker5xxAndTimeoutPersistUnknown(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
 			transport := &countingTransport{respond: test.respond}
-			service := newTestService(store, KISMockBroker{Transport: transport}, true)
+			service := newTestService(store, testKISMockBroker(transport), true)
 			receipt, err := service.Process(context.Background(), testCommand("unknown-"+test.name))
 			if err != nil {
 				t.Fatal(err)
@@ -70,7 +70,7 @@ func TestBrokerUsesMockPinAndPreservesOriginalPriceAndQuantityStrings(t *testing
 		}
 		return testHTTPResponse(http.StatusOK, `{"rt_cd":"0","output":{"ODNO":"mock-42"}}`), nil
 	}}
-	service := newTestService(store, KISMockBroker{Transport: transport}, true)
+	service := newTestService(store, testKISMockBroker(transport), true)
 	command := testCommand("original-strings")
 	command.Quantity = "001"
 	command.Price = "070000"
@@ -89,9 +89,14 @@ func TestPinnedBrokerRejectsNonVTSBeforeTransport(t *testing.T) {
 	}}
 	config := testBrokerConfig()
 	config.BaseURL = "https://example.invalid"
-	prepared, code := (KISMockBroker{Transport: transport}).Prepare(
-		context.Background(), config, testCommand("not-vts"), "cached-token-for-test",
-	)
+	broker := KISMockBroker{
+		Transport: transport,
+		LoadConfig: func() (kismockread.Config, string) {
+			return config, ""
+		},
+		Tokens: &fakeTokenLoader{token: "cached-token-for-test"},
+	}
+	prepared, code := broker.Prepare(context.Background(), testCommand("not-vts"))
 	if prepared != nil || code == "" {
 		t.Fatalf("prepare=%v code=%q", prepared, code)
 	}
