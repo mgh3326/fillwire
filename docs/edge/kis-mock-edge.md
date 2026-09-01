@@ -8,7 +8,8 @@ crypto. It is the separately approved evolution of the formerly reserved
 command name; it does not change Python ownership of `order_send_intents`,
 redirect Python traffic, or modify `auto_trader`.
 
-The receiver exposes only `POST /v1/commands` and binds to `127.0.0.1:8080` by
+The receiver exposes `POST /v1/commands` and
+`POST /v1/commands/{command_id}/cancel`, and binds to `127.0.0.1:8080` by
 default. `BROKER_EDGE_LISTEN_ADDR` may select another loopback address (for
 example `127.0.0.1:0` in tests), but cannot expose the unauthenticated receiver
 on a non-loopback interface. Authentication and authorization remain a later,
@@ -54,6 +55,24 @@ HTTP operation may have reached a broker, a restart returns that `UNKNOWN`
 receipt and never resends. Broker timeouts, 5xx responses, redirects, malformed
 responses, and non-accepted responses after this point remain `UNKNOWN`; they
 are never relabeled `NOT_CREATED`.
+
+## Cancellation boundary
+
+Cancellation is not a new order command: the path parameter must identify an
+effective `ACCEPTED` receipt with a stored broker order id. Missing,
+`NOT_CREATED`, and `UNKNOWN` commands are rejected before broker preparation
+or network activity. The additive `cancel_attempts` table has a unique command
+id and records one closed cancellation state. It commits `UNKNOWN` immediately
+before the cancellation request; duplicate calls replay it and never send
+again. A completed cancellation is `CANCELLED`, a provider 404 is
+`NOT_FOUND/cancel_not_found`, and every ambiguous post-send outcome remains
+`UNKNOWN`.
+
+Alpaca paper cancellation is `DELETE /v2/orders/{broker_order_id}` and only a
+204 result is `CANCELLED`. KIS mock cancellation uses the VTS-pinned
+`VTTC0013U` `order-rvsecncl` TR with its domestic cancellation body, including
+the stored order number as `ORGN_ODNO`, `RVSE_CNCL_DVSN_CD="02"`, and KRX
+routing. It does not introduce a live KIS authority or credential path.
 
 `kis-mock-edge resolve` is the only later conclusion path. It queries the
 already allowlisted, GET-only VTS domestic daily-order history endpoint
@@ -110,10 +129,11 @@ and again inside the RoundTripper immediately before any transport call.
 
 - No live KIS host, live credentials, or live place route exists here.
 - No live Alpaca host, live credential name, or host override exists here.
-- No modification, cancellation, market order, or other mutation endpoint is
-  exposed.
-- Alpaca cancellation is deliberately external to this service; no cancel
-  client or route is implemented.
+- No modification, market order, or other mutation endpoint is exposed.
+- `POST /v1/commands/{command_id}/cancel` may cancel only a durably
+  `ACCEPTED` command with a broker order id. It persists one closed result:
+  `CANCELLED`, `NOT_FOUND` (`cancel_not_found`), or `UNKNOWN`; duplicate POSTs
+  replay that result and never resend the broker request.
 - No retry or replay path can issue a second broker POST for a command ID.
 - No account, order, or token values are emitted as metrics or response data.
 - This repository's tests use fake transports only; they do not execute a real

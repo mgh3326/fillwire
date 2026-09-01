@@ -29,6 +29,9 @@ const (
 	ErrorBrokerTimeout        = "broker_timeout"
 	ErrorBroker5xx            = "broker_5xx"
 	ErrorBrokerUnknown        = "broker_unknown"
+	ErrorCancelNotEligible    = "cancel_not_eligible"
+	ErrorCancelNotFound       = "cancel_not_found"
+	ErrorCancelSendPending    = "cancel_send_pending"
 )
 
 // ValidateCommand checks the closed command vocabulary before a broker request

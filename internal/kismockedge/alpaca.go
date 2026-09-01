@@ -98,6 +98,75 @@ func (broker AlpacaPaperCryptoBroker) Prepare(
 	return broker.prepareWithConfig(ctx, config, command)
 }
 
+// PrepareCancel uses the same pinned paper authority and static paper
+// credentials as placement, but creates a DELETE for one stored order id.
+func (broker AlpacaPaperCryptoBroker) PrepareCancel(ctx context.Context, target CancelTarget) (PreparedCancelBroker, string) {
+	if target.AccountScope != executioncontracts.AccountScopeAlpacaPaperCrypto || target.BrokerOrderID == "" || broker.LoadConfig == nil {
+		return nil, ErrorInvalidCommand
+	}
+	config, code := broker.LoadConfig()
+	if code != "" {
+		return nil, code
+	}
+	baseURL, err := url.Parse(config.BaseURL)
+	if err != nil || !validAlpacaPaperCryptoURL(baseURL) || config.APIKey == "" || config.APISecret == "" || !safeHeaderText(config.APIKey) || !safeHeaderText(config.APISecret) {
+		return nil, ErrorInvalidCommand
+	}
+	requestURL := &url.URL{Scheme: baseURL.Scheme, Host: baseURL.Host, Path: AlpacaPaperCryptoOrderPath + "/" + url.PathEscape(target.BrokerOrderID)}
+	if !validAlpacaPaperCryptoURL(requestURL) {
+		return nil, ErrorInvalidCommand
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL.String(), nil)
+	if err != nil {
+		return nil, ErrorInvalidCommand
+	}
+	request.Header.Set("APCA-API-KEY-ID", config.APIKey)
+	request.Header.Set("APCA-API-SECRET-KEY", config.APISecret)
+	return &preparedAlpacaPaperCryptoCancel{client: newAlpacaPaperCryptoPinnedHTTPClient(broker.Transport, config.Timeout), request: request}, ""
+}
+
+type preparedAlpacaPaperCryptoCancel struct {
+	client  *http.Client
+	request *http.Request
+	mu      sync.Mutex
+	sent    bool
+}
+
+func (prepared *preparedAlpacaPaperCryptoCancel) SendCancel(ctx context.Context) CancelBrokerResult {
+	if prepared == nil || prepared.client == nil || prepared.request == nil {
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+	}
+	prepared.mu.Lock()
+	if prepared.sent {
+		prepared.mu.Unlock()
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+	}
+	prepared.sent = true
+	prepared.mu.Unlock()
+	response, err := prepared.client.Do(prepared.request.Clone(ctx))
+	if err != nil {
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerTimeout}
+		}
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+	}
+	if response == nil {
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNoContent {
+		return CancelBrokerResult{State: CancelStateCancelled}
+	}
+	if response.StatusCode == http.StatusNotFound {
+		return CancelBrokerResult{State: CancelStateNotFound, ErrorCode: ErrorCancelNotFound}
+	}
+	if response.StatusCode >= http.StatusInternalServerError {
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBroker5xx}
+	}
+	return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+}
+
 func (broker AlpacaPaperCryptoBroker) prepareWithConfig(
 	ctx context.Context,
 	config AlpacaPaperCryptoConfig,

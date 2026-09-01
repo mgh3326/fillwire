@@ -2,6 +2,7 @@ package kismockedge
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
@@ -31,6 +32,18 @@ func NewHandler(service *Service) http.Handler {
 		}
 		writeReceipt(writer, http.StatusOK, receipt)
 	})
+	mux.HandleFunc("POST /v1/commands/{command_id}/cancel", func(writer http.ResponseWriter, request *http.Request) {
+		receipt, err := service.Cancel(request.Context(), request.PathValue("command_id"))
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, errCancelNotEligible) {
+				status = http.StatusConflict
+			}
+			writeCancelReceipt(writer, status, receipt)
+			return
+		}
+		writeCancelReceipt(writer, http.StatusOK, receipt)
+	})
 	return mux
 }
 
@@ -57,6 +70,12 @@ func receiptForInvalidHTTP(service *Service) executioncontracts.ExecutionReceipt
 }
 
 func writeReceipt(writer http.ResponseWriter, status int, receipt executioncontracts.ExecutionReceiptV1) {
+	writer.Header().Set("content-type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(receipt)
+}
+
+func writeCancelReceipt(writer http.ResponseWriter, status int, receipt CancelReceipt) {
 	writer.Header().Set("content-type", "application/json")
 	writer.WriteHeader(status)
 	_ = json.NewEncoder(writer).Encode(receipt)

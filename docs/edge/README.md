@@ -99,8 +99,9 @@ cache contracts are separately pinned:
 
 ## Mock placement edge: `kis-mock-edge`
 
-`kis-mock-edge` accepts only `POST /v1/commands` on `127.0.0.1:8080` by
-default. The listener rejects non-loopback overrides. `account_scope` is closed
+`kis-mock-edge` accepts `POST /v1/commands` and
+`POST /v1/commands/{command_id}/cancel` on `127.0.0.1:8080` by default. The
+listener rejects non-loopback overrides. `account_scope` is closed
 to `kis_mock` and `alpaca_paper_crypto`; both use the same SQLite receipt store,
 where `command_id UNIQUE` means a repeated ID returns the saved receipt and
 makes zero additional broker POSTs.
@@ -172,10 +173,11 @@ place real VTS orders.
 This repository does **not** contain Go PG intents, gRPC, proto, or an
 `auto_trader` modification/dependency. Its only live authorities are the
 provider-pinned OAuth token endpoints documented above; it does not place live
-orders or support order modification, cancellation, market orders, Binance, or
-any paper mutation beyond the specifically gated KIS domestic limit and Alpaca
-BTC/USD limit placement boundaries. Alpaca cancellation remains an external
-operator action and has no endpoint or client method here.
+orders or support order modification, market orders, Binance, or any paper
+mutation beyond the specifically gated KIS domestic limit and Alpaca BTC/USD
+limit placement boundaries plus cancellation of a durably ACCEPTED order.
+Cancellation is available only through `POST /v1/commands/{command_id}/cancel`;
+it is durably idempotent and cannot issue a second broker request.
 
 Do not cite or integrate the orphan `auto_trader kis_websocket` Redis pub/sub
 legacy path. OPSP8996 때문에 live WS shadow는 금지하며,

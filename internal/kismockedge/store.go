@@ -56,6 +56,10 @@ func OpenStore(path string) (*Store, error) {
 		_ = database.Close()
 		return nil, err
 	}
+	if err := ensureColumn(database, "commands", "krx_fwdg_ord_orgno", "TEXT"); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
 	if _, err := database.Exec(`
 		CREATE TABLE IF NOT EXISTS command_contexts (
 			command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
@@ -72,11 +76,177 @@ func OpenStore(path string) (*Store, error) {
 			error_code TEXT,
 			resolved_at TEXT NOT NULL
 		)
+		;
+		CREATE TABLE IF NOT EXISTS cancel_attempts (
+			command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
+			state TEXT NOT NULL CHECK (state IN ('CANCELLED', 'NOT_FOUND', 'UNKNOWN')),
+			error_code TEXT,
+			recorded_at TEXT NOT NULL
+		)
 	`); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
 	return &Store{db: database}, nil
+}
+
+// CancelState is the closed durable outcome vocabulary for cancellation.
+type CancelState string
+
+const (
+	CancelStateCancelled CancelState = "CANCELLED"
+	CancelStateNotFound  CancelState = "NOT_FOUND"
+	CancelStateUnknown   CancelState = "UNKNOWN"
+)
+
+func (state CancelState) Valid() bool {
+	return state == CancelStateCancelled || state == CancelStateNotFound || state == CancelStateUnknown
+}
+
+// CancelReceipt is the replayable result of cancelling an accepted command.
+type CancelReceipt struct {
+	CommandID  string      `json:"command_id"`
+	State      CancelState `json:"state"`
+	ErrorCode  string      `json:"error_code,omitempty"`
+	RecordedAt string      `json:"recorded_at"`
+}
+
+// CancelTarget carries only the immutable facts needed to construct a cancel
+// request. It is not a second command representation.
+type CancelTarget struct {
+	CommandID            string
+	AccountScope         string
+	BrokerOrderID        string
+	KRXForwardOrderOrgNo string
+	Side                 string
+	StockCode            string
+	Quantity             string
+	Price                string
+}
+
+func (store *Store) FindCancelAttempt(ctx context.Context, commandID string) (CancelReceipt, bool, error) {
+	if store == nil || store.db == nil {
+		return CancelReceipt{}, false, errors.New("store unavailable")
+	}
+	var receipt CancelReceipt
+	err := store.db.QueryRowContext(ctx, `SELECT command_id, state, COALESCE(error_code, ''), recorded_at FROM cancel_attempts WHERE command_id = ?`, commandID).
+		Scan(&receipt.CommandID, &receipt.State, &receipt.ErrorCode, &receipt.RecordedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CancelReceipt{}, false, nil
+	}
+	if err != nil || !validCancelReceipt(receipt) {
+		if err == nil {
+			err = errors.New("invalid stored cancel receipt")
+		}
+		return CancelReceipt{}, false, err
+	}
+	return receipt, true, nil
+}
+
+// FindCancelTarget returns only orders whose effective disposition is
+// ACCEPTED and whose broker order id is known. UNKNOWN and NOT_CREATED are
+// deliberately indistinguishable to callers: neither can safely be cancelled.
+func (store *Store) FindCancelTarget(ctx context.Context, commandID string) (CancelTarget, bool, error) {
+	if store == nil || store.db == nil {
+		return CancelTarget{}, false, errors.New("store unavailable")
+	}
+	var target CancelTarget
+	var krxForwardOrderOrgNo, side, stockCode, quantity, price sql.NullString
+	err := store.db.QueryRowContext(ctx, `
+		SELECT c.command_id, c.account_scope,
+			CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END,
+			c.krx_fwdg_ord_orgno, x.side, x.stock_code, x.quantity, x.price
+		FROM commands c
+		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
+		LEFT JOIN command_contexts x ON x.command_id = c.command_id
+		WHERE c.command_id = ? AND COALESCE(r.disposition, c.disposition) = 'ACCEPTED'
+			AND COALESCE(CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END, '') <> ''
+	`, commandID).Scan(&target.CommandID, &target.AccountScope, &target.BrokerOrderID, &krxForwardOrderOrgNo, &side, &stockCode, &quantity, &price)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CancelTarget{}, false, nil
+	}
+	if err != nil {
+		return CancelTarget{}, false, err
+	}
+	if krxForwardOrderOrgNo.Valid {
+		target.KRXForwardOrderOrgNo = krxForwardOrderOrgNo.String
+	}
+	if side.Valid {
+		target.Side = side.String
+	}
+	if stockCode.Valid {
+		target.StockCode = stockCode.String
+	}
+	if quantity.Valid {
+		target.Quantity = quantity.String
+	}
+	if price.Valid {
+		target.Price = price.String
+	}
+	return target, true, nil
+}
+
+// ReserveCancel commits the UNKNOWN pre-send marker. A conflicting marker is
+// returned unchanged, so duplicate callers cannot send a second request.
+func (store *Store) ReserveCancel(ctx context.Context, receipt CancelReceipt) (CancelReceipt, bool, error) {
+	if store == nil || store.db == nil || !validCancelReceipt(receipt) || receipt.State != CancelStateUnknown {
+		return CancelReceipt{}, false, errors.New("invalid cancel receipt")
+	}
+	result, err := store.db.ExecContext(ctx, `
+		INSERT INTO cancel_attempts (command_id, state, error_code, recorded_at)
+		SELECT c.command_id, ?, NULLIF(?, ''), ? FROM commands c
+		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
+		WHERE c.command_id = ? AND COALESCE(r.disposition, c.disposition) = 'ACCEPTED'
+			AND COALESCE(CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END, '') <> ''
+		ON CONFLICT(command_id) DO NOTHING
+	`, receipt.State, receipt.ErrorCode, receipt.RecordedAt, receipt.CommandID)
+	if err != nil {
+		return CancelReceipt{}, false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return CancelReceipt{}, false, err
+	}
+	if inserted == 1 {
+		return receipt, true, nil
+	}
+	existing, found, err := store.FindCancelAttempt(ctx, receipt.CommandID)
+	if err != nil {
+		return CancelReceipt{}, false, err
+	}
+	if !found {
+		return CancelReceipt{}, false, errors.New("cancel target disappeared")
+	}
+	return existing, false, nil
+}
+
+func (store *Store) FinalizeCancel(ctx context.Context, receipt CancelReceipt) (CancelReceipt, error) {
+	if store == nil || store.db == nil || !validCancelReceipt(receipt) {
+		return CancelReceipt{}, errors.New("invalid cancel receipt")
+	}
+	result, err := store.db.ExecContext(ctx, `UPDATE cancel_attempts SET state = ?, error_code = NULLIF(?, ''), recorded_at = ? WHERE command_id = ? AND state = 'UNKNOWN'`, receipt.State, receipt.ErrorCode, receipt.RecordedAt, receipt.CommandID)
+	if err != nil {
+		return CancelReceipt{}, err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return CancelReceipt{}, err
+	}
+	if updated == 1 {
+		return receipt, nil
+	}
+	existing, found, err := store.FindCancelAttempt(ctx, receipt.CommandID)
+	if err != nil {
+		return CancelReceipt{}, err
+	}
+	if !found {
+		return CancelReceipt{}, errors.New("cancel receipt missing")
+	}
+	return existing, nil
+}
+
+func validCancelReceipt(receipt CancelReceipt) bool {
+	return validCommandID(receipt.CommandID) && receipt.State.Valid() && receipt.RecordedAt != ""
 }
 
 func ensureColumn(database *sql.DB, table, column, definition string) error {
@@ -336,7 +506,7 @@ func (store *Store) ResolveUnknown(ctx context.Context, commandID string, dispos
 
 // Finalize replaces only the process owner's pending marker. It cannot create
 // a new command after the send boundary.
-func (store *Store) Finalize(ctx context.Context, receipt executioncontracts.ExecutionReceiptV1) (executioncontracts.ExecutionReceiptV1, error) {
+func (store *Store) Finalize(ctx context.Context, receipt executioncontracts.ExecutionReceiptV1, krxForwardOrderOrgNo string) (executioncontracts.ExecutionReceiptV1, error) {
 	if store == nil || store.db == nil {
 		return executioncontracts.ExecutionReceiptV1{}, errors.New("store unavailable")
 	}
@@ -346,9 +516,10 @@ func (store *Store) Finalize(ctx context.Context, receipt executioncontracts.Exe
 	result, err := store.db.ExecContext(ctx, `
 		UPDATE commands
 		SET schema_version = ?, disposition = ?, broker_order_id = NULLIF(?, ''),
-			error_code = NULLIF(?, ''), recorded_at = ?, phase = 'final'
+			error_code = NULLIF(?, ''), recorded_at = ?, phase = 'final',
+			krx_fwdg_ord_orgno = NULLIF(?, '')
 		WHERE command_id = ? AND phase = 'pending'
-	`, receipt.SchemaVersion, receipt.Disposition, receipt.BrokerOrderID, receipt.ErrorCode, receipt.RecordedAt, receipt.CommandID)
+	`, receipt.SchemaVersion, receipt.Disposition, receipt.BrokerOrderID, receipt.ErrorCode, receipt.RecordedAt, krxForwardOrderOrgNo, receipt.CommandID)
 	if err != nil {
 		return executioncontracts.ExecutionReceiptV1{}, err
 	}
