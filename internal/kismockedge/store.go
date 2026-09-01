@@ -149,7 +149,9 @@ func (store *Store) ReservePending(ctx context.Context, receipt executioncontrac
 		return executioncontracts.ExecutionReceiptV1{}, false, errors.New("store unavailable")
 	}
 	if !validReceipt(receipt) || receipt.Disposition != executioncontracts.DispositionUnknown ||
-		command.CommandID != receipt.CommandID || command.AccountScope != executioncontracts.AccountScopeKISMock {
+		command.CommandID != receipt.CommandID ||
+		(command.AccountScope != executioncontracts.AccountScopeKISMock &&
+			command.AccountScope != executioncontracts.AccountScopeAlpacaPaperCrypto) {
 		return executioncontracts.ExecutionReceiptV1{}, false, errors.New("invalid pending receipt")
 	}
 	tx, err := store.db.BeginTx(ctx, nil)

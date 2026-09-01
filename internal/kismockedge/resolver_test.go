@@ -216,3 +216,36 @@ func TestResolverKeepsUnknownBeforeGraceAndOnAmbiguousNonemptyDay(t *testing.T) 
 		t.Fatalf("legacy nonempty ambiguous day must stay UNKNOWN: %+v (result=%+v)", got, result2)
 	}
 }
+
+func TestResolverIgnoresAlpacaScopeReceipts(t *testing.T) {
+	// The resolver's evidence source is the KIS VTS daily-order read; an
+	// Alpaca-scope UNKNOWN must never be resolved by KIS evidence.
+	store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
+	service := newTestServiceWithBrokers(store, map[string]Broker{
+		executioncontracts.AccountScopeKISMock:           &fakeBroker{result: BrokerResult{ErrorCode: ErrorBrokerTimeout}},
+		executioncontracts.AccountScopeAlpacaPaperCrypto: &fakeBroker{result: BrokerResult{ErrorCode: ErrorBrokerTimeout}},
+	}, true)
+	command := testCommand("resolve-alpaca-hold")
+	command.AccountScope = executioncontracts.AccountScopeAlpacaPaperCrypto
+	command.StockCode = "BTC/USD"
+	command.Quantity = "0.0001"
+	command.Price = "50000"
+	if _, err := service.Process(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (Resolver{
+		Store:  store,
+		Reader: fakeOrderHistoryReader{},
+		Now:    func() time.Time { return time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC) },
+	}).Resolve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := store.Find(context.Background(), "resolve-alpaca-hold")
+	if err != nil || !found {
+		t.Fatal(err)
+	}
+	if got.Disposition != executioncontracts.DispositionUnknown {
+		t.Fatalf("alpaca receipt must not be resolved by KIS evidence: %+v (result=%+v)", got, result)
+	}
+}
