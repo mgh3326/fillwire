@@ -154,6 +154,118 @@ func (reader fakeOrderHistoryReader) DomesticOrderHistory(context.Context, strin
 	return reader.orders, reader.err
 }
 
+type fakeAlpacaOrderReader struct {
+	evidence       AlpacaOrderEvidence
+	found          bool
+	err            error
+	clientOrderIDs []string
+}
+
+func (reader *fakeAlpacaOrderReader) OrderByClientOrderID(_ context.Context, clientOrderID string) (AlpacaOrderEvidence, bool, error) {
+	reader.clientOrderIDs = append(reader.clientOrderIDs, clientOrderID)
+	return reader.evidence, reader.found, reader.err
+}
+
+func TestAlpacaResolverEvidenceBranches(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 20, 0, 0, time.UTC)
+	tests := []struct {
+		name            string
+		evidence        AlpacaOrderEvidence
+		found           bool
+		readErr         error
+		wantDisposition executioncontracts.ExecutionDisposition
+		wantError       string
+		wantOrderID     string
+	}{
+		{
+			name:            "matching client order id accepts",
+			evidence:        AlpacaOrderEvidence{BrokerOrderID: "alpaca-evidence-accepted"},
+			found:           true,
+			wantDisposition: executioncontracts.DispositionAccepted,
+			wantOrderID:     "alpaca-evidence-accepted",
+		},
+		{
+			name:            "completed absence after grace is not created",
+			wantDisposition: executioncontracts.DispositionNotCreated,
+			wantError:       ErrorResolvedAbsent,
+		},
+		{
+			name:            "evidence call failure remains unknown",
+			readErr:         errors.New("alpaca evidence unavailable"),
+			wantDisposition: executioncontracts.DispositionUnknown,
+			wantError:       ErrorBrokerTimeout,
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
+			service := newTestServiceWithBrokers(store, map[string]Broker{
+				executioncontracts.AccountScopeAlpacaPaperCrypto: &fakeBroker{result: BrokerResult{ErrorCode: ErrorBrokerTimeout}},
+			}, true)
+			command := testAlpacaCommand("resolve-alpaca-branch-" + string(rune('a'+index)))
+			initial, err := service.Process(context.Background(), command)
+			if err != nil || initial.Disposition != executioncontracts.DispositionUnknown {
+				t.Fatalf("initial receipt = %+v err=%v", initial, err)
+			}
+			reader := &fakeAlpacaOrderReader{evidence: test.evidence, found: test.found, err: test.readErr}
+			result, err := (Resolver{
+				Store:        store,
+				AlpacaReader: reader,
+				Now:          func() time.Time { return now },
+			}).Resolve(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(reader.clientOrderIDs) != 1 || reader.clientOrderIDs[0] != command.CommandID {
+				t.Fatalf("client order id evidence queries = %#v, want %q", reader.clientOrderIDs, command.CommandID)
+			}
+			got, found, err := store.Find(context.Background(), command.CommandID)
+			if err != nil || !found {
+				t.Fatalf("resolved receipt lookup: %+v found=%t err=%v", got, found, err)
+			}
+			if got.Disposition != test.wantDisposition || got.ErrorCode != test.wantError || got.BrokerOrderID != test.wantOrderID {
+				t.Fatalf("resolved receipt = %+v", got)
+			}
+			if test.readErr != nil && (result.ReadFailures != 1 || result.Unresolved != 1 || len(result.Resolved) != 0) {
+				t.Fatalf("failed evidence must retain UNKNOWN: %+v", result)
+			}
+		})
+	}
+}
+
+func TestAlpacaResolverNeverConcludesWithoutPersistedClientOrderIDEvidence(t *testing.T) {
+	// Mutant witness: treating a command ID from a legacy row as if it had
+	// already been sent as Alpaca's client_order_id would turn a 404 into an
+	// unjustified NOT_CREATED conclusion.
+	store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
+	service := newTestServiceWithBrokers(store, map[string]Broker{
+		executioncontracts.AccountScopeAlpacaPaperCrypto: &fakeBroker{result: BrokerResult{ErrorCode: ErrorBrokerTimeout}},
+	}, true)
+	command := testAlpacaCommand("resolve-alpaca-legacy-no-client-id")
+	if _, err := service.Process(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE command_contexts SET client_order_id = NULL WHERE command_id = ?`, command.CommandID); err != nil {
+		t.Fatal(err)
+	}
+	reader := &fakeAlpacaOrderReader{}
+	result, err := (Resolver{
+		Store:        store,
+		AlpacaReader: reader,
+		Now:          func() time.Time { return time.Date(2026, 9, 1, 12, 20, 0, 0, time.UTC) },
+	}).Resolve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := store.Find(context.Background(), command.CommandID)
+	if err != nil || !found || got.Disposition != executioncontracts.DispositionUnknown {
+		t.Fatalf("legacy Alpaca receipt = %+v found=%t err=%v", got, found, err)
+	}
+	if len(reader.clientOrderIDs) != 0 || result.Unresolved != 1 || len(result.Resolved) != 0 {
+		t.Fatalf("missing mapping must not be queried or concluded: reader=%#v result=%+v", reader.clientOrderIDs, result)
+	}
+}
+
 func TestResolverKeepsUnknownBeforeGraceAndOnAmbiguousNonemptyDay(t *testing.T) {
 	// Mutant witness (2026-09-01): replacing the resolution predicate with
 	// bare len(matches)==0 survived the original table — neither the

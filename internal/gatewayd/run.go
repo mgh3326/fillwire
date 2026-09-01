@@ -93,8 +93,9 @@ func Run(ctx context.Context, args []string, lookup func(string) string, stderr 
 		return 1
 	}
 	logger := log.New(stderr, "", 0)
+	metrics := NewMetrics()
 	server := &http.Server{
-		Handler:           NewHandler(ensurers, logger),
+		Handler:           newHandler(ensurers, logger, metrics),
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,
@@ -102,7 +103,7 @@ func Run(ctx context.Context, args []string, lookup func(string) string, stderr 
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- server.Serve(listener) }()
 	if options.EnsureInterval > 0 {
-		go runPeriodicEnsure(ctx, ensurers, options.EnsureInterval, logger)
+		go runPeriodicEnsureWithMetrics(ctx, ensurers, options.EnsureInterval, logger, metrics)
 	}
 	select {
 	case serveErr := <-serveResult:
@@ -134,7 +135,11 @@ func oauthIssuerFor(config ProviderConfig, timeout time.Duration) OAuthIssuer {
 }
 
 func runPeriodicEnsure(ctx context.Context, ensurers ProviderEnsurers, interval time.Duration, logger EventLogger) {
-	ensureConfiguredProviders(ctx, ensurers, logger)
+	runPeriodicEnsureWithMetrics(ctx, ensurers, interval, logger, nil)
+}
+
+func runPeriodicEnsureWithMetrics(ctx context.Context, ensurers ProviderEnsurers, interval time.Duration, logger EventLogger, metrics *Metrics) {
+	ensureConfiguredProvidersWithMetrics(ctx, ensurers, logger, metrics)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -142,34 +147,46 @@ func runPeriodicEnsure(ctx context.Context, ensurers ProviderEnsurers, interval 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ensureConfiguredProviders(ctx, ensurers, logger)
+			ensureConfiguredProvidersWithMetrics(ctx, ensurers, logger, metrics)
 		}
 	}
 }
 
 func ensureConfiguredProviders(ctx context.Context, ensurers ProviderEnsurers, logger EventLogger) {
+	ensureConfiguredProvidersWithMetrics(ctx, ensurers, logger, nil)
+}
+
+func ensureConfiguredProvidersWithMetrics(ctx context.Context, ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics) {
 	// Ordered iteration makes periodic behavior deterministic and, more
 	// importantly, limits it to the selected map entries.
 	for _, provider := range orderedProviders() {
 		if ensurer, configured := ensurers[provider]; configured && ensurer != nil {
-			ensureAndLog(ctx, ensurer, logger)
+			ensureAndLogForProvider(ctx, provider, ensurer, logger, metrics)
 		}
 	}
 }
 
 func ensureAndLog(ctx context.Context, ensurer Ensurer, logger EventLogger) {
+	ensureAndLogForProvider(ctx, "", ensurer, logger, nil)
+}
+
+func ensureAndLogForProvider(ctx context.Context, provider TokenProvider, ensurer Ensurer, logger EventLogger, metrics *Metrics) {
 	state, err := ensurer.Ensure(ctx)
 	if err != nil {
 		logEvent(logger, "gatewayd: periodic token ensure failed")
+		metrics.recordEnsure(provider, "", true)
 		return
 	}
 	switch state {
 	case EnsureStateFresh:
 		logEvent(logger, "gatewayd: periodic token ensure fresh")
+		metrics.recordEnsure(provider, state, false)
 	case EnsureStateIssued:
 		logEvent(logger, "gatewayd: periodic token ensure issued")
+		metrics.recordEnsure(provider, state, false)
 	default:
 		logEvent(logger, "gatewayd: periodic token ensure failed")
+		metrics.recordEnsure(provider, "", true)
 	}
 }
 

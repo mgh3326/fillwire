@@ -17,10 +17,19 @@ type EventLogger interface {
 // reached merely because a credential exists in the process environment.
 type ProviderEnsurers map[TokenProvider]Ensurer
 
-// NewHandler exposes only loopback-safe health and the closed token ensure
-// route. The provider segment is parsed as a closed enum before it is used.
+// NewHandler exposes loopback-safe health, Prometheus metrics, and the closed
+// token ensure route. The provider segment is parsed as a closed enum before
+// it is used.
 func NewHandler(ensurers ProviderEnsurers, logger EventLogger) http.Handler {
+	return newHandler(ensurers, logger, NewMetrics())
+}
+
+func newHandler(ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics) http.Handler {
+	if metrics == nil {
+		metrics = NewMetrics()
+	}
 	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.handler())
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, `{"status":"ok"}`)
 	})
@@ -34,24 +43,29 @@ func NewHandler(ensurers ProviderEnsurers, logger EventLogger) http.Handler {
 		ensurer, configured := ensurers[provider]
 		if !configured || ensurer == nil {
 			logEvent(logger, "gatewayd: token ensure unavailable")
+			metrics.recordEnsure(provider, "", true)
 			writeJSON(writer, http.StatusNotFound, `{"error":"not_found"}`)
 			return
 		}
 		state, err := ensurer.Ensure(request.Context())
 		if err != nil {
 			logEvent(logger, "gatewayd: token ensure failed")
+			metrics.recordEnsure(provider, "", true)
 			writeJSON(writer, http.StatusServiceUnavailable, `{"error":"ensure_failed"}`)
 			return
 		}
 		switch state {
 		case EnsureStateFresh:
 			logEvent(logger, "gatewayd: token ensure fresh")
+			metrics.recordEnsure(provider, state, false)
 			writeJSON(writer, http.StatusOK, `{"state":"fresh"}`)
 		case EnsureStateIssued:
 			logEvent(logger, "gatewayd: token ensure issued")
+			metrics.recordEnsure(provider, state, false)
 			writeJSON(writer, http.StatusOK, `{"state":"issued"}`)
 		default:
 			logEvent(logger, "gatewayd: token ensure unavailable")
+			metrics.recordEnsure(provider, "", true)
 			writeJSON(writer, http.StatusServiceUnavailable, `{"error":"ensure_failed"}`)
 		}
 	})

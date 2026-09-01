@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
@@ -67,7 +68,8 @@ func OpenStore(path string) (*Store, error) {
 			stock_code TEXT NOT NULL,
 			quantity TEXT NOT NULL,
 			price TEXT NOT NULL,
-			sent_at TEXT NOT NULL
+			sent_at TEXT NOT NULL,
+			client_order_id TEXT
 		);
 		CREATE TABLE IF NOT EXISTS command_resolutions (
 			command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
@@ -84,6 +86,10 @@ func OpenStore(path string) (*Store, error) {
 			recorded_at TEXT NOT NULL
 		)
 	`); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	if err := ensureColumn(database, "command_contexts", "client_order_id", "TEXT"); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
@@ -325,6 +331,13 @@ func (store *Store) ReservePending(ctx context.Context, receipt executioncontrac
 			command.AccountScope != executioncontracts.AccountScopeAlpacaPaperCrypto) {
 		return executioncontracts.ExecutionReceiptV1{}, false, errors.New("invalid pending receipt")
 	}
+	clientOrderID := ""
+	if command.AccountScope == executioncontracts.AccountScopeAlpacaPaperCrypto {
+		// Persist the mapping before the send boundary. This marks records whose
+		// client_order_id is actually known to have been sent to Alpaca; legacy
+		// rows without it must remain unresolved rather than be guessed absent.
+		clientOrderID = command.CommandID
+	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return executioncontracts.ExecutionReceiptV1{}, false, err
@@ -344,9 +357,9 @@ func (store *Store) ReservePending(ctx context.Context, receipt executioncontrac
 	}
 	if inserted == 1 {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO command_contexts (command_id, side, stock_code, quantity, price, sent_at)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, command.CommandID, command.Side, command.StockCode, command.Quantity, command.Price, receipt.RecordedAt); err != nil {
+			INSERT INTO command_contexts (command_id, side, stock_code, quantity, price, sent_at, client_order_id)
+			VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''))
+		`, command.CommandID, command.Side, command.StockCode, command.Quantity, command.Price, receipt.RecordedAt, clientOrderID); err != nil {
 			return executioncontracts.ExecutionReceiptV1{}, false, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -411,23 +424,49 @@ type PendingResolution struct {
 	Price          string
 	SentAt         time.Time
 	ContextPresent bool
+	// ClientOrderID is populated only for Alpaca records written after the
+	// backend began sending it. Its absence is intentionally not evidence of
+	// broker absence for historical rows.
+	ClientOrderID string
 }
 
 // PendingKISMockResolutions returns only unresolved UNKNOWN records for the
 // domestic and US KIS mock scopes. It never changes a receipt.
 func (store *Store) PendingKISMockResolutions(ctx context.Context) ([]PendingResolution, error) {
+	return store.pendingResolutions(ctx,
+		executioncontracts.AccountScopeKISMock,
+		executioncontracts.AccountScopeKISMockUS,
+	)
+}
+
+// PendingAlpacaPaperCryptoResolutions returns only UNKNOWN Alpaca receipts
+// whose final evidence, if any, must come from Alpaca's client-order-id read.
+func (store *Store) PendingAlpacaPaperCryptoResolutions(ctx context.Context) ([]PendingResolution, error) {
+	return store.pendingResolutions(ctx, executioncontracts.AccountScopeAlpacaPaperCrypto)
+}
+
+func (store *Store) pendingResolutions(ctx context.Context, scopes ...string) ([]PendingResolution, error) {
 	if store == nil || store.db == nil {
 		return nil, errors.New("store unavailable")
 	}
+	if len(scopes) == 0 {
+		return nil, errors.New("resolution scope missing")
+	}
+	placeholders := make([]string, len(scopes))
+	arguments := make([]any, len(scopes))
+	for index, scope := range scopes {
+		placeholders[index] = "?"
+		arguments[index] = scope
+	}
 	rows, err := store.db.QueryContext(ctx, `
 		SELECT c.schema_version, c.command_id, c.disposition, c.broker_order_id, c.error_code, c.recorded_at,
-			c.account_scope, x.side, x.stock_code, x.quantity, x.price, x.sent_at
+			c.account_scope, x.side, x.stock_code, x.quantity, x.price, x.sent_at, x.client_order_id
 		FROM commands c
 		LEFT JOIN command_contexts x ON x.command_id = c.command_id
 		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
-		WHERE c.disposition = 'UNKNOWN' AND c.account_scope IN (?, ?) AND r.command_id IS NULL
+		WHERE c.disposition = 'UNKNOWN' AND c.account_scope IN (`+strings.Join(placeholders, ", ")+`) AND r.command_id IS NULL
 		ORDER BY c.id
-	`, executioncontracts.AccountScopeKISMock, executioncontracts.AccountScopeKISMockUS)
+	`, arguments...)
 	if err != nil {
 		return nil, err
 	}
@@ -435,10 +474,10 @@ func (store *Store) PendingKISMockResolutions(ctx context.Context) ([]PendingRes
 	var pending []PendingResolution
 	for rows.Next() {
 		var item PendingResolution
-		var brokerOrderID, errorCode, side, stockCode, quantity, price, sentAt sql.NullString
+		var brokerOrderID, errorCode, side, stockCode, quantity, price, sentAt, clientOrderID sql.NullString
 		if err := rows.Scan(&item.Receipt.SchemaVersion, &item.Receipt.CommandID, &item.Receipt.Disposition,
 			&brokerOrderID, &errorCode, &item.Receipt.RecordedAt, &item.AccountScope,
-			&side, &stockCode, &quantity, &price, &sentAt); err != nil {
+			&side, &stockCode, &quantity, &price, &sentAt, &clientOrderID); err != nil {
 			return nil, err
 		}
 		if brokerOrderID.Valid {
@@ -446,6 +485,9 @@ func (store *Store) PendingKISMockResolutions(ctx context.Context) ([]PendingRes
 		}
 		if errorCode.Valid {
 			item.Receipt.ErrorCode = errorCode.String
+		}
+		if clientOrderID.Valid {
+			item.ClientOrderID = clientOrderID.String
 		}
 		if !validReceipt(item.Receipt) {
 			return nil, errors.New("invalid stored receipt")

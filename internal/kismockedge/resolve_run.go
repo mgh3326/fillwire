@@ -34,9 +34,10 @@ func RunResolve(ctx context.Context, args []string, lookup func(string) string, 
 	}
 	defer store.Close()
 	result, err := (Resolver{
-		Store:  store,
-		Reader: environmentOrderHistoryReader{lookup: lookup},
-		Grace:  *grace,
+		Store:        store,
+		Reader:       environmentOrderHistoryReader{lookup: lookup},
+		AlpacaReader: environmentAlpacaOrderReader{lookup: lookup},
+		Grace:        *grace,
 	}).Resolve(ctx)
 	if err != nil {
 		writeResolveFailure(stderr, "storage_failure")
@@ -63,6 +64,18 @@ func writeResolveFailure(stderr io.Writer, code string) {
 
 type environmentOrderHistoryReader struct {
 	lookup func(string) string
+}
+
+type environmentAlpacaOrderReader struct {
+	lookup func(string) string
+}
+
+func (reader environmentAlpacaOrderReader) OrderByClientOrderID(ctx context.Context, clientOrderID string) (AlpacaOrderEvidence, bool, error) {
+	return (AlpacaPaperCryptoOrderReader{
+		LoadConfig: func() (AlpacaPaperCryptoConfig, string) {
+			return AlpacaPaperCryptoConfigFromEnv(reader.lookup)
+		},
+	}).OrderByClientOrderID(ctx, clientOrderID)
 }
 
 func (reader environmentOrderHistoryReader) DomesticOrderHistory(ctx context.Context, day string) ([]kismockread.DomesticOrder, error) {

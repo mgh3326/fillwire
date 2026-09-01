@@ -33,15 +33,29 @@ type OverseasOrderHistoryReader interface {
 	OverseasOrderHistory(context.Context, string) ([]kismockread.OverseasOrder, error)
 }
 
-// Resolver turns only proven KIS mock UNKNOWN receipts into a conclusion.
-// Read errors, ambiguous evidence, and records still inside the grace window
-// are all deliberately retained as UNKNOWN.
+// AlpacaOrderEvidence is the minimal fact needed to promote an UNKNOWN Alpaca
+// receipt. It carries no order payload, price, quantity, or credentials.
+type AlpacaOrderEvidence struct {
+	BrokerOrderID string
+}
+
+// AlpacaOrderReader is read-only, client-order-id evidence. A false found
+// value means Alpaca completed the lookup and returned no such order; errors
+// leave the original receipt UNKNOWN.
+type AlpacaOrderReader interface {
+	OrderByClientOrderID(context.Context, string) (AlpacaOrderEvidence, bool, error)
+}
+
+// Resolver turns only proven KIS mock or Alpaca paper UNKNOWN receipts into a
+// conclusion. Read errors, ambiguous evidence, and records still inside the
+// grace window are all deliberately retained as UNKNOWN.
 type Resolver struct {
-	Store       *Store
-	Reader      OrderHistoryReader
-	Now         func() time.Time
-	Grace       time.Duration
-	MatchWindow time.Duration
+	Store        *Store
+	Reader       OrderHistoryReader
+	AlpacaReader AlpacaOrderReader
+	Now          func() time.Time
+	Grace        time.Duration
+	MatchWindow  time.Duration
 }
 
 // ResolutionResult reports every receipt that obtained a durable additive
@@ -60,15 +74,16 @@ func (resolver Resolver) Resolve(ctx context.Context) (ResolutionResult, error) 
 	if resolver.Store == nil {
 		return ResolutionResult{}, errResolverUnavailable
 	}
-	pending, err := resolver.Store.PendingKISMockResolutions(ctx)
+	kisPending, err := resolver.Store.PendingKISMockResolutions(ctx)
 	if err != nil {
 		return ResolutionResult{}, err
 	}
-	if len(pending) == 0 {
-		return ResolutionResult{}, nil
+	alpacaPending, err := resolver.Store.PendingAlpacaPaperCryptoResolutions(ctx)
+	if err != nil {
+		return ResolutionResult{}, err
 	}
-	if resolver.Reader == nil {
-		return ResolutionResult{Unresolved: len(pending), ReadFailures: 1}, nil
+	if len(kisPending) == 0 && len(alpacaPending) == 0 {
+		return ResolutionResult{}, nil
 	}
 	now := time.Now
 	if resolver.Now != nil {
@@ -81,6 +96,26 @@ func (resolver Resolver) Resolve(ctx context.Context) (ResolutionResult, error) 
 	window := resolver.MatchWindow
 	if window == 0 {
 		window = defaultMatchWindow
+	}
+	result, err := resolver.resolveKIS(ctx, kisPending, now, grace, window)
+	if err != nil {
+		return result, err
+	}
+	return resolver.resolveAlpaca(ctx, alpacaPending, now, grace, result)
+}
+
+func (resolver Resolver) resolveKIS(
+	ctx context.Context,
+	pending []PendingResolution,
+	now func() time.Time,
+	grace, window time.Duration,
+) (ResolutionResult, error) {
+	result := ResolutionResult{}
+	if len(pending) == 0 {
+		return result, nil
+	}
+	if resolver.Reader == nil {
+		return ResolutionResult{Unresolved: len(pending), ReadFailures: 1}, nil
 	}
 	type evidenceDay struct {
 		Scope string
@@ -101,7 +136,6 @@ func (resolver Resolver) Resolve(ctx context.Context) (ResolutionResult, error) 
 		}
 		return days[left].Scope < days[right].Scope
 	})
-	result := ResolutionResult{}
 	for _, day := range days {
 		items := byDay[day]
 		switch day.Scope {
@@ -189,6 +223,68 @@ func (resolver Resolver) resolveEvidence(
 	return resolved, unresolved, nil
 }
 
+func (resolver Resolver) resolveAlpaca(
+	ctx context.Context,
+	pending []PendingResolution,
+	now func() time.Time,
+	grace time.Duration,
+	result ResolutionResult,
+) (ResolutionResult, error) {
+	if len(pending) == 0 {
+		return result, nil
+	}
+	withClientOrderID := make([]PendingResolution, 0, len(pending))
+	for _, item := range pending {
+		// A prior release did not write client_order_id. Its command ID alone
+		// does not prove that Alpaca received that value, so it must not be
+		// declared absent by this new evidence source.
+		if !item.ContextPresent || item.ClientOrderID != item.Receipt.CommandID || !validCommandID(item.ClientOrderID) {
+			result.Unresolved++
+			continue
+		}
+		withClientOrderID = append(withClientOrderID, item)
+	}
+	if len(withClientOrderID) == 0 {
+		return result, nil
+	}
+	if resolver.AlpacaReader == nil {
+		result.ReadFailures++
+		result.Unresolved += len(withClientOrderID)
+		return result, nil
+	}
+	for _, item := range withClientOrderID {
+		evidence, found, readErr := resolver.AlpacaReader.OrderByClientOrderID(ctx, item.ClientOrderID)
+		if readErr != nil {
+			result.ReadFailures++
+			result.Unresolved++
+			continue
+		}
+		if found {
+			if evidence.BrokerOrderID == "" {
+				result.ReadFailures++
+				result.Unresolved++
+				continue
+			}
+			receipt, resolveErr := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, executioncontracts.DispositionAccepted, evidence.BrokerOrderID, "", now())
+			if resolveErr != nil {
+				return result, resolveErr
+			}
+			result.Resolved = append(result.Resolved, receipt)
+			continue
+		}
+		if !now().Before(item.SentAt.Add(grace)) {
+			receipt, resolveErr := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, executioncontracts.DispositionNotCreated, "", ErrorResolvedAbsent, now())
+			if resolveErr != nil {
+				return result, resolveErr
+			}
+			result.Resolved = append(result.Resolved, receipt)
+			continue
+		}
+		result.Unresolved++
+	}
+	return result, nil
+}
+
 var errResolverUnavailable = &resolverError{}
 
 type resolverError struct{}
@@ -214,7 +310,6 @@ func matchingOrders(pending PendingResolution, orders []kismockread.DomesticOrde
 	}
 	return matches
 }
-
 
 func domesticMatchIDs(matches []kismockread.DomesticOrder) []string {
 	result := make([]string, 0, len(matches))
@@ -257,7 +352,6 @@ func samePositiveInteger(left, right string) bool {
 	rightValue, rightOK := new(big.Int).SetString(right, 10)
 	return leftOK && rightOK && leftValue.Sign() > 0 && rightValue.Sign() > 0 && leftValue.Cmp(rightValue) == 0
 }
-
 
 func samePositiveDecimal(left, right string) bool {
 	leftValue, leftOK := positiveDecimal(left)

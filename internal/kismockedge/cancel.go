@@ -27,7 +27,13 @@ type CancelBrokerResult struct {
 // Cancel returns a durable cancellation result. A committed UNKNOWN marker is
 // the send boundary: a process loss after it cannot cause a later retry to
 // retransmit the broker request.
-func (service *Service) Cancel(ctx context.Context, commandID string) (CancelReceipt, error) {
+func (service *Service) Cancel(ctx context.Context, commandID string) (receipt CancelReceipt, err error) {
+	scope := metricScopeUnknown
+	defer func() {
+		if metrics := service.metricsSink(); metrics != nil {
+			metrics.recordCancel(scope, receipt.State)
+		}
+	}()
 	if !validCommandID(commandID) {
 		return service.cancelReceipt(commandID, CancelStateUnknown, ErrorCancelNotEligible), errCancelNotEligible
 	}
@@ -46,6 +52,7 @@ func (service *Service) Cancel(ctx context.Context, commandID string) (CancelRec
 	if !found {
 		return service.cancelReceipt(commandID, CancelStateUnknown, ErrorCancelNotEligible), errCancelNotEligible
 	}
+	scope = target.AccountScope
 	broker, ok := service.brokerForScope(target.AccountScope).(CancelBroker)
 	if !ok || broker == nil {
 		return service.cancelReceipt(commandID, CancelStateUnknown, ErrorCancelNotEligible), errCancelNotEligible
@@ -67,6 +74,9 @@ func (service *Service) Cancel(ctx context.Context, commandID string) (CancelRec
 	}
 
 	// Nothing may occur between this committed marker and the broker send.
+	if metrics := service.metricsSink(); metrics != nil {
+		metrics.recordBrokerRequest(scope, metricKindCancel)
+	}
 	result := prepared.SendCancel(ctx)
 	if !result.State.Valid() {
 		result.State = CancelStateUnknown

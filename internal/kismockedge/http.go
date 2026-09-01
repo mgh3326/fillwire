@@ -11,11 +11,14 @@ import (
 
 const commandBodyLimit = 16 * 1024
 
-// NewHandler exposes the one approved local HTTP boundary. Authentication is
-// intentionally not implied by this handler; the command itself binds only to
-// loopback until a separately approved authentication design exists.
+// NewHandler exposes the approved local command, cancellation, and metrics
+// boundaries. Authentication is intentionally not implied by this handler;
+// the command listener binds only to loopback until a separately approved
+// authentication design exists.
 func NewHandler(service *Service) http.Handler {
+	metrics := service.installMetrics()
 	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.handler())
 	mux.HandleFunc("POST /v1/commands", func(writer http.ResponseWriter, request *http.Request) {
 		command, valid := decodeCommand(writer, request)
 		if !valid {
@@ -44,7 +47,7 @@ func NewHandler(service *Service) http.Handler {
 		}
 		writeCancelReceipt(writer, http.StatusOK, receipt)
 	})
-	return mux
+	return metrics.instrument(mux)
 }
 
 func decodeCommand(writer http.ResponseWriter, request *http.Request) (executioncontracts.ExecutionCommandV1, bool) {

@@ -303,6 +303,68 @@ func TestAlpacaBrokerUsesPaperPinAndPreservesDecimalStrings(t *testing.T) {
 	}
 }
 
+func TestAlpacaClientOrderIDIdempotencyRoundTripWithFake(t *testing.T) {
+	command := testAlpacaCommand("alpaca-client-order-id-round-trip")
+	orders := make(map[string]string)
+	var seenClientOrderIDs []string
+	var mutex sync.Mutex
+	transport := &countingTransport{respond: func(request *http.Request) (*http.Response, error) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		switch request.Method {
+		case http.MethodPost:
+			var body map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+			clientOrderID := body["client_order_id"]
+			if clientOrderID != command.CommandID {
+				t.Fatalf("client_order_id = %q, want command_id %q", clientOrderID, command.CommandID)
+			}
+			seenClientOrderIDs = append(seenClientOrderIDs, clientOrderID)
+			orderID := orders[clientOrderID]
+			if orderID == "" {
+				orderID = "alpaca-client-order-idempotent-order"
+				orders[clientOrderID] = orderID
+			}
+			return testHTTPResponse(http.StatusOK, `{"id":"`+orderID+`","status":"accepted","client_order_id":"`+clientOrderID+`"}`), nil
+		case http.MethodGet:
+			if request.URL.Path != AlpacaPaperCryptoOrderByClientOrderIDPath {
+				t.Fatalf("evidence path = %q", request.URL.Path)
+			}
+			clientOrderID := request.URL.Query().Get("client_order_id")
+			orderID := orders[clientOrderID]
+			if orderID == "" {
+				return testHTTPResponse(http.StatusNotFound, ""), nil
+			}
+			return testHTTPResponse(http.StatusOK, `{"id":"`+orderID+`","client_order_id":"`+clientOrderID+`"}`), nil
+		default:
+			return nil, errors.New("unexpected Alpaca fake method")
+		}
+	}}
+	broker := testAlpacaPaperCryptoBroker(transport)
+	for range 2 {
+		prepared, code := broker.Prepare(context.Background(), command)
+		if code != "" || prepared == nil {
+			t.Fatalf("prepare = %v, code = %q", prepared, code)
+		}
+		result := prepared.Send(context.Background())
+		if !result.Accepted || result.BrokerOrderID != "alpaca-client-order-idempotent-order" {
+			t.Fatalf("place result = %+v", result)
+		}
+	}
+	evidence, found, err := (AlpacaPaperCryptoOrderReader{
+		Transport:  transport,
+		LoadConfig: broker.LoadConfig,
+	}).OrderByClientOrderID(context.Background(), command.CommandID)
+	if err != nil || !found || evidence.BrokerOrderID != "alpaca-client-order-idempotent-order" {
+		t.Fatalf("evidence = %+v found=%t err=%v", evidence, found, err)
+	}
+	if len(seenClientOrderIDs) != 2 || seenClientOrderIDs[0] != command.CommandID || seenClientOrderIDs[1] != command.CommandID {
+		t.Fatalf("client order IDs = %#v", seenClientOrderIDs)
+	}
+}
+
 func TestAlpacaTransportRevalidatesPinnedHostImmediatelyBeforeSend(t *testing.T) {
 	transport := &countingTransport{respond: func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("mutated request must not reach transport")
@@ -490,7 +552,7 @@ func TestAlpacaAllowsAAPLWithinCapAndRejectsOtherStocks(t *testing.T) {
 	base := executioncontracts.ExecutionCommandV1{
 		SchemaVersion: "execution-command/v1", CommandID: "us-1",
 		AccountScope: executioncontracts.AccountScopeAlpacaPaperCrypto,
-		Side: "buy", StockCode: "AAPL", Quantity: "1", Price: "5",
+		Side:         "buy", StockCode: "AAPL", Quantity: "1", Price: "5",
 		OrderType: "limit", IssuedAt: "2026-09-01T12:00:00Z",
 	}
 	if code := ValidateCommand(base); code != "" {

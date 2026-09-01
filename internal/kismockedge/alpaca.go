@@ -20,6 +20,9 @@ const (
 	AlpacaPaperCryptoHost      = "paper-api.alpaca.markets"
 	AlpacaPaperCryptoBaseURL   = "https://paper-api.alpaca.markets"
 	AlpacaPaperCryptoOrderPath = "/v2/orders"
+	// AlpacaPaperCryptoOrderByClientOrderIDPath is the GET-only evidence
+	// endpoint used to reconcile a receipt that has no broker order id.
+	AlpacaPaperCryptoOrderByClientOrderIDPath = "/v2/orders:by_client_order_id"
 
 	// AlpacaLiveTradingHost and AlpacaLiveTradingBaseURL are intentionally
 	// compile-time forbidden values, mirroring auto_trader's
@@ -185,12 +188,13 @@ func (broker AlpacaPaperCryptoBroker) prepareWithConfig(
 		return nil, ErrorInvalidCommand
 	}
 	body, err := json.Marshal(alpacaPaperCryptoOrderRequest{
-		Symbol:      command.StockCode,
-		Quantity:    command.Quantity,
-		Side:        command.Side,
-		Type:        "limit",
-		LimitPrice:  command.Price,
-		TimeInForce: "gtc",
+		Symbol:        command.StockCode,
+		Quantity:      command.Quantity,
+		Side:          command.Side,
+		Type:          "limit",
+		LimitPrice:    command.Price,
+		TimeInForce:   "gtc",
+		ClientOrderID: command.CommandID,
 	})
 	if err != nil {
 		return nil, ErrorInvalidCommand
@@ -217,12 +221,97 @@ func (broker AlpacaPaperCryptoBroker) prepareWithConfig(
 }
 
 type alpacaPaperCryptoOrderRequest struct {
-	Symbol      string `json:"symbol"`
-	Quantity    string `json:"qty"`
-	Side        string `json:"side"`
-	Type        string `json:"type"`
-	LimitPrice  string `json:"limit_price"`
-	TimeInForce string `json:"time_in_force"`
+	Symbol        string `json:"symbol"`
+	Quantity      string `json:"qty"`
+	Side          string `json:"side"`
+	Type          string `json:"type"`
+	LimitPrice    string `json:"limit_price"`
+	TimeInForce   string `json:"time_in_force"`
+	ClientOrderID string `json:"client_order_id"`
+}
+
+// AlpacaPaperCryptoOrderReader is a GET-only, paper-pinned evidence reader.
+// It intentionally shares only static paper credentials with placement and
+// cannot issue, refresh, or persist token material.
+type AlpacaPaperCryptoOrderReader struct {
+	Transport  http.RoundTripper
+	LoadConfig AlpacaPaperCryptoConfigLoader
+}
+
+// OrderByClientOrderID returns an order only when Alpaca's response repeats
+// the client order id that was queried. A 404 is a completed absence read;
+// every transport, status, or response-shape failure is returned as an error
+// so Resolver can retain UNKNOWN.
+func (reader AlpacaPaperCryptoOrderReader) OrderByClientOrderID(
+	ctx context.Context,
+	clientOrderID string,
+) (AlpacaOrderEvidence, bool, error) {
+	if !validCommandID(clientOrderID) || reader.LoadConfig == nil {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	config, code := reader.LoadConfig()
+	if code != "" {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	baseURL, err := url.Parse(config.BaseURL)
+	if err != nil || !validAlpacaPaperCryptoURL(baseURL) || config.APIKey == "" || config.APISecret == "" ||
+		!safeHeaderText(config.APIKey) || !safeHeaderText(config.APISecret) {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	requestURL := &url.URL{
+		Scheme: baseURL.Scheme,
+		Host:   baseURL.Host,
+		Path:   AlpacaPaperCryptoOrderByClientOrderIDPath,
+	}
+	query := requestURL.Query()
+	query.Set("client_order_id", clientOrderID)
+	requestURL.RawQuery = query.Encode()
+	if !validAlpacaPaperCryptoURL(requestURL) {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
+	if err != nil {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	request.Header.Set("APCA-API-KEY-ID", config.APIKey)
+	request.Header.Set("APCA-API-SECRET-KEY", config.APISecret)
+	response, err := newAlpacaPaperCryptoPinnedHTTPClient(reader.Transport, config.Timeout).Do(request)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	if response == nil {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound {
+		return AlpacaOrderEvidence{}, false, nil
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	body, err := readBrokerBody(response.Body)
+	if err != nil {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	orderID, clientID := alpacaOrderEvidenceFields(body)
+	if orderID == "" || clientID != clientOrderID {
+		return AlpacaOrderEvidence{}, false, errors.New("alpaca evidence unavailable")
+	}
+	return AlpacaOrderEvidence{BrokerOrderID: orderID}, true, nil
+}
+
+func alpacaOrderEvidenceFields(body map[string]json.RawMessage) (string, string) {
+	var orderID, clientOrderID string
+	rawID, hasID := body["id"]
+	rawClientOrderID, hasClientOrderID := body["client_order_id"]
+	if !hasID || !hasClientOrderID || json.Unmarshal(rawID, &orderID) != nil ||
+		json.Unmarshal(rawClientOrderID, &clientOrderID) != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(orderID), clientOrderID
 }
 
 type preparedAlpacaPaperCryptoBroker struct {

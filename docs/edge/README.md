@@ -97,16 +97,26 @@ cache contracts are separately pinned:
   JSON payload. Toss permits one valid token per client, so a replacement is
   written to Redis before the shared lock is released.
 
-`gatewayd` has no order, command, intent, or execution endpoint.
+`gatewayd` has no order, command, intent, or execution endpoint. It exposes
+loopback `GET /metrics` with standard Go/process collectors and a bounded
+`gatewayd_ensure_results_total{provider,state}` counter.
 
 ## Mock placement edge: `kis-mock-edge`
 
-`kis-mock-edge` accepts `POST /v1/commands` and
-`POST /v1/commands/{command_id}/cancel` on `127.0.0.1:8080` by default. The
-listener rejects non-loopback overrides. `account_scope` is closed
+`kis-mock-edge` accepts `POST /v1/commands`,
+`POST /v1/commands/{command_id}/cancel`, and Prometheus-format `GET /metrics`
+on `127.0.0.1:8080` by default. The listener rejects non-loopback overrides.
+`account_scope` is closed
 to `kis_mock`, `kis_mock_us`, and `alpaca_paper_crypto`; all use the same SQLite receipt store,
 where `command_id UNIQUE` means a repeated ID returns the saved receipt and
 makes zero additional broker POSTs.
+
+The edge metric registry includes standard Go/process collectors plus bounded
+`broker_edge_commands_total{scope,disposition}`,
+`broker_edge_cancels_total{scope,state}`,
+`broker_edge_broker_requests_total{scope,kind}`, and an HTTP duration
+histogram. Command IDs, symbols, prices, and quantities are never metric
+labels.
 
 Placement is disabled by default. It is allowed only when
 `BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit. A pending `UNKNOWN` receipt
@@ -125,8 +135,9 @@ It accepts only a `buy` limit order for `BTC/USD` (carried in the existing
 `stock_code` field), with positive decimal `quantity` and `price` strings and a
 non-configurable USD 10 notional cap. It sends those strings unchanged to only
 `https://paper-api.alpaca.markets/v2/orders`, authenticating with static paper
-key headers. The live `https://api.alpaca.markets` authority, HTTP, host
-overrides, and redirects are all refused before a second transfer can occur.
+key headers, and sends the durable command ID as Alpaca's `client_order_id`.
+The live `https://api.alpaca.markets` authority, HTTP, host overrides, and
+redirects are all refused before a second transfer can occur.
 
 Local settings:
 
@@ -165,6 +176,13 @@ the broker order number. A successful complete read with no match appends
 Read errors, multiple matches, and young receipts remain `UNKNOWN`. The
 original receipt row is preserved; resolution is an additive SQLite record and
 the command's JSON output contains the resulting receipt(s).
+
+For a newer stored `UNKNOWN/alpaca_paper_crypto` receipt, the resolver performs
+only a pinned `GET /v2/orders:by_client_order_id?client_order_id=...` evidence
+read. A matching echoed client order ID appends `ACCEPTED`; a completed 404
+after grace appends `NOT_CREATED/resolved_absent`; failures remain `UNKNOWN`.
+Historical Alpaca rows without a persisted client-order-id mapping remain
+`UNKNOWN`, because absence cannot be proven for them.
 
 See [the edge boundary](docs/kis-mock-edge.md) for the command, receipt, and
 failure contract. Repository tests use fake transport responses and do not

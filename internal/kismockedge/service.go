@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
@@ -28,6 +29,11 @@ type Service struct {
 	PlaceEnabled bool
 	Brokers      map[string]Broker
 	Now          func() time.Time
+	// Metrics is optional for direct library callers. NewHandler installs one
+	// when needed, and the daemon constructor installs one up front.
+	Metrics *Metrics
+
+	metricsMu sync.Mutex
 }
 
 // NewEnvironmentService wires only the existing GET-only token loader and the
@@ -39,6 +45,7 @@ func NewEnvironmentService(store *Store, lookup func(string) string, transport h
 	return &Service{
 		Store:        store,
 		PlaceEnabled: strings.TrimSpace(lookup("BROKER_EDGE_MOCK_PLACE_ENABLED")) == "true",
+		Metrics:      NewMetrics(),
 		Brokers: map[string]Broker{
 			executioncontracts.AccountScopeKISMock: KISMockBroker{
 				Transport: transport,
@@ -72,9 +79,35 @@ func NewEnvironmentService(store *Store, lookup func(string) string, transport h
 	}
 }
 
+func (service *Service) installMetrics() *Metrics {
+	if service == nil {
+		return NewMetrics()
+	}
+	service.metricsMu.Lock()
+	defer service.metricsMu.Unlock()
+	if service.Metrics == nil {
+		service.Metrics = NewMetrics()
+	}
+	return service.Metrics
+}
+
+func (service *Service) metricsSink() *Metrics {
+	if service == nil {
+		return nil
+	}
+	service.metricsMu.Lock()
+	defer service.metricsMu.Unlock()
+	return service.Metrics
+}
+
 // Process returns a durable receipt. A matching command_id always wins before
 // validation or token loading, so duplicate delivery cannot send again.
-func (service *Service) Process(ctx context.Context, command executioncontracts.ExecutionCommandV1) (executioncontracts.ExecutionReceiptV1, error) {
+func (service *Service) Process(ctx context.Context, command executioncontracts.ExecutionCommandV1) (receipt executioncontracts.ExecutionReceiptV1, err error) {
+	defer func() {
+		if metrics := service.metricsSink(); metrics != nil {
+			metrics.recordCommand(command.AccountScope, receipt.Disposition)
+		}
+	}()
 	if !validCommandID(command.CommandID) {
 		return service.receipt(command.CommandID, executioncontracts.DispositionNotCreated, ErrorInvalidCommand), nil
 	}
@@ -119,6 +152,9 @@ func (service *Service) Process(ctx context.Context, command executioncontracts.
 
 	// No local work belongs between ReservePending's commit and this Send call.
 	// From this exact point, every non-accepted outcome is UNKNOWN.
+	if metrics := service.metricsSink(); metrics != nil {
+		metrics.recordBrokerRequest(command.AccountScope, metricKindPlace)
+	}
 	result := prepared.Send(ctx)
 	if result.Accepted && result.BrokerOrderID != "" {
 		return service.finalize(ctx, command.CommandID, executioncontracts.DispositionAccepted, result.BrokerOrderID, "", result.KRXForwardOrderOrgNo)
