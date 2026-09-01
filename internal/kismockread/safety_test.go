@@ -2,6 +2,7 @@ package kismockread
 
 import (
 	"bytes"
+	"fmt"
 	"context"
 	"encoding/json"
 	"errors"
@@ -374,5 +375,27 @@ func TestValidatePinnedURLRejectsHTTPAndAlternateHost(t *testing.T) {
 		if ValidatePinnedURL(parsed) == nil {
 			t.Fatalf("accepted %s", rawURL)
 		}
+	}
+}
+
+func TestCachedTokenAcceptsPythonWriterShapeAndRejectsUnknownKeys(t *testing.T) {
+	// The live Python writer stores three fields; the first live witness
+	// failed with token_invalid because the parser demanded exactly two.
+	future := float64(time.Now().Unix() + 3600)
+	pythonShaped := fmt.Sprintf(
+		`{"access_token":"tok-abc","expires_at":%f,"created_at":%f}`,
+		future, future-3600,
+	)
+	getter := &staticGetter{value: pythonShaped, present: true}
+	token, err := LoadCachedToken(context.Background(), getter, "k", time.Now())
+	if err != nil || token != "tok-abc" {
+		t.Fatalf("python-shaped cache must parse: token=%q err=%v", token, err)
+	}
+	unknown := fmt.Sprintf(
+		`{"access_token":"tok-abc","expires_at":%f,"refresh_token":"x"}`, future,
+	)
+	getter2 := &staticGetter{value: unknown, present: true}
+	if _, err := LoadCachedToken(context.Background(), getter2, "k", time.Now()); err == nil {
+		t.Fatal("unknown key must stay rejected")
 	}
 }

@@ -35,8 +35,9 @@ func TokenCacheKey(baseURL, appKey string) (string, *SafeError) {
 	), nil
 }
 
-// LoadCachedToken accepts only the exact two-field JSON cache payload and never
-// falls back to issuance when it is absent, malformed, or near expiry.
+// LoadCachedToken accepts only the Python writer's JSON cache payload
+// (access_token, expires_at, optional created_at) and never falls back to
+// issuance when it is absent, malformed, or near expiry.
 func LoadCachedToken(ctx context.Context, getter RedisGetter, key string, now time.Time) (string, *SafeError) {
 	if getter == nil {
 		return "", safeError(CodeTokenCacheUnavailable)
@@ -50,8 +51,17 @@ func LoadCachedToken(ctx context.Context, getter RedisGetter, key string, now ti
 	}
 
 	fields, valid := strictTokenFields(raw)
-	if !valid || len(fields) != 2 {
+	if !valid {
 		return "", safeError(CodeTokenInvalid)
+	}
+	// The Python writer (auto_trader redis_token_manager.save_token) stores
+	// exactly access_token, expires_at, and created_at. Stay strict via an
+	// allowlist rather than a field count: unknown keys are still rejected,
+	// created_at is tolerated metadata.
+	for key := range fields {
+		if key != "access_token" && key != "expires_at" && key != "created_at" {
+			return "", safeError(CodeTokenInvalid)
+		}
 	}
 	accessTokenRaw, hasAccessToken := fields["access_token"]
 	expiresAtRaw, hasExpiresAt := fields["expires_at"]
