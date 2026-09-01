@@ -39,7 +39,20 @@ func ConfigFromEnv(lookup func(string) string) (Config, *SafeError) {
 }
 
 func splitAccountNo(accountNo string) (string, string, *SafeError) {
-	cleaned := strings.ReplaceAll(strings.TrimSpace(accountNo), "-", "")
+	cleaned := strings.TrimSpace(accountNo)
+	if len(cleaned) == 8 {
+		for _, character := range cleaned {
+			if character < '0' || character > '9' {
+				return "", "", safeError(CodeInvalidInput)
+			}
+		}
+		// VTS credentials commonly provide CANO alone. The documented default
+		// account product code for that canonical eight-digit form is 01.
+		return cleaned, "01", nil
+	}
+	if len(cleaned) == 11 && cleaned[8] == '-' {
+		cleaned = cleaned[:8] + cleaned[9:]
+	}
 	if len(cleaned) != 10 {
 		return "", "", safeError(CodeInvalidInput)
 	}

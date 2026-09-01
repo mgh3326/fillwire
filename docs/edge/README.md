@@ -48,6 +48,9 @@ Only these environment variable names are read or documented:
 - `KIS_MOCK_ACCOUNT_NO`
 - `REDIS_URL`
 
+`KIS_MOCK_ACCOUNT_NO` accepts either an eight-digit CANO (which uses product
+code `01`) or an explicit ten-digit / `12345678-01` account form.
+
 [.env.example](.env.example) has placeholders only. Keep populated env files
 out of this public repository.
 
