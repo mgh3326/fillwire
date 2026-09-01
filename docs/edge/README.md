@@ -62,6 +62,32 @@ go run ./cmd/kis-mock-read domestic-balance --json
 go run ./cmd/kis-mock-read domestic-order-history --from 20260901 --to 20260901 --json
 ```
 
+## KIS mock token gateway: `gatewayd`
+
+`gatewayd` is a separate, loopback-only daemon that owns the KIS **mock**
+token issuance path. It exposes `GET /healthz` and
+`POST /v1/tokens/kis-mock/ensure` on `127.0.0.1:8791` by default. The ensure
+response is only `{"state":"fresh"}` or `{"state":"issued"}`; it never includes a
+token.
+
+The daemon uses the same Redis namespace and JSON cache payload as the Python
+manager and `kis-mock-read`: `kis_mock:{host}:{fp16}:access_token` with
+`access_token`, `expires_at`, and `created_at`. A reader-valid cache entry is a
+no-op. For a missing, malformed, or near-expiry entry, it first obtains the
+shared `{namespace}:token:lock` via `SET NX EX 30`, checks the cache again, and
+only then posts to the pinned VTS `/oauth2/tokenP` endpoint. A failed lock
+acquisition follows the Python wait/poll pattern and rechecks Redis; it never
+bypasses that cooperating lock.
+
+It reads only `KIS_MOCK_APP_KEY`, `KIS_MOCK_APP_SECRET`, `REDIS_URL`, and the
+optional `GATEWAYD_LISTEN_ADDR`. It has no order, command, intent, or live
+credential configuration. To keep an edge runtime GET-only without managing a
+refresh timer itself, add the optional autonomous mode:
+
+```sh
+go run ./cmd/gatewayd --ensure-interval=5m
+```
+
 ## Mock placement edge: `kis-mock-edge`
 
 `kis-mock-edge` accepts only `POST /v1/commands` on `127.0.0.1:8080` by
