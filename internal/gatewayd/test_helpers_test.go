@@ -3,6 +3,7 @@ package gatewayd
 import (
 	"context"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/mgh3326/broker-edge/internal/kismockread"
@@ -30,9 +31,10 @@ type fakeRedisStore struct {
 	setErr   error
 	setNXErr error
 
-	sets       []setRecord
-	setNXCalls int
-	setNXHit   chan struct{}
+	sets             []setRecord
+	setWhileLockHeld []bool
+	setNXCalls       int
+	setNXHit         chan struct{}
 }
 
 func newFakeRedisStore(now func() time.Time) *fakeRedisStore {
@@ -65,7 +67,17 @@ func (store *fakeRedisStore) Set(_ context.Context, key, value string, ttl time.
 	}
 	store.values[key] = storedValue{value: value, expiresAt: store.now().Add(ttl)}
 	store.sets = append(store.sets, setRecord{key: key, value: value, ttl: ttl})
+	store.setWhileLockHeld = append(store.setWhileLockHeld, store.hasActiveLockLocked())
 	return nil
+}
+
+func (store *fakeRedisStore) hasActiveLockLocked() bool {
+	for _, lock := range store.locks {
+		if lock.expiresAt.IsZero() || store.now().Before(lock.expiresAt) {
+			return true
+		}
+	}
+	return false
 }
 
 func (store *fakeRedisStore) SetNX(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
@@ -106,6 +118,14 @@ func (store *fakeRedisStore) savedRecords() []setRecord {
 	defer store.mu.Unlock()
 	output := make([]setRecord, len(store.sets))
 	copy(output, store.sets)
+	return output
+}
+
+func (store *fakeRedisStore) savedWhileLocked() []bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	output := make([]bool, len(store.setWhileLockHeld))
+	copy(output, store.setWhileLockHeld)
 	return output
 }
 
@@ -163,6 +183,44 @@ func testGatewayConfig() Config {
 		RedisURL:  "redis://127.0.0.1:6379/0",
 		Timeout:   time.Second,
 	}
+}
+
+func testProviderConfig(provider TokenProvider) ProviderConfig {
+	baseURL, found := providerBaseURL(provider)
+	if !found {
+		panic("unknown test provider")
+	}
+	config := ProviderConfig{
+		Provider:  provider,
+		BaseURL:   baseURL,
+		AppKey:    "app-key-for-test",
+		AppSecret: "app-secret-for-test",
+	}
+	if provider == ProviderToss {
+		config.AppKey = "toss-client-id-for-test"
+		config.AppSecret = "toss-client-secret-for-test"
+	}
+	return config
+}
+
+func newTestEnsureService(t *testing.T, store RedisStore, issuer OAuthIssuer, now time.Time) *EnsureService {
+	t.Helper()
+	service, err := NewEnsureService(store, issuer, testGatewayConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Now = func() time.Time { return now }
+	return service
+}
+
+func newTestEnsureServiceForProvider(t *testing.T, store RedisStore, issuer OAuthIssuer, now time.Time, provider TokenProvider) *EnsureService {
+	t.Helper()
+	service, err := NewEnsureServiceForProvider(store, issuer, testProviderConfig(provider))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Now = func() time.Time { return now }
+	return service
 }
 
 func testGatewayNow() time.Time {

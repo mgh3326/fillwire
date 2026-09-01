@@ -1,4 +1,4 @@
-// gatewayd is the loopback-only KIS mock token issuer.
+// gatewayd is the loopback-only, provider-scoped OAuth token issuer.
 package main
 
 import (

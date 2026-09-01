@@ -3,10 +3,12 @@ package gatewayd
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net/url"
+	"io"
+	"math"
 	"strings"
 	"time"
 
@@ -41,8 +43,9 @@ type Ensurer interface {
 }
 
 // EnsureService coordinates Redis cache reuse, cooperative distributed locking,
-// and the single VTS OAuth issuance path.
+// and one provider's OAuth issuance path.
 type EnsureService struct {
+	Provider  TokenProvider
 	Store     RedisStore
 	OAuth     OAuthIssuer
 	CacheKey  string
@@ -56,43 +59,72 @@ type EnsureService struct {
 	LockWaitTimeout time.Duration
 }
 
-// NewEnsureService derives the same token namespace as the existing Python
-// writer and the Go reader. The lock key is therefore {namespace}:token:lock.
+// NewEnsureService preserves the existing kis-mock-only constructor. New
+// multi-provider code should use NewEnsureServiceForProvider explicitly.
 func NewEnsureService(store RedisStore, oauth OAuthIssuer, config Config) (*EnsureService, error) {
-	if store == nil || oauth == nil || config.AppKey == "" || config.AppSecret == "" {
+	providerConfig, found := config.providerConfig(ProviderKISMock)
+	if !found {
 		return nil, errEnsureUnavailable
 	}
-	baseURL, parseErr := url.Parse(config.BaseURL)
-	if parseErr != nil || kismockread.ValidatePinnedURL(baseURL) != nil {
+	return NewEnsureServiceForProvider(store, oauth, providerConfig)
+}
+
+// NewEnsureServiceForProvider derives the Redis namespace used by that
+// provider's existing Python consumer before constructing an issuer service.
+func NewEnsureServiceForProvider(store RedisStore, oauth OAuthIssuer, config ProviderConfig) (*EnsureService, error) {
+	if store == nil || oauth == nil || !validProviderConfig(config) {
 		return nil, errEnsureUnavailable
 	}
-	cacheKey, keyErr := kismockread.TokenCacheKey(config.BaseURL, config.AppKey)
-	if keyErr != nil {
-		return nil, errEnsureUnavailable
-	}
-	namespace, found := strings.CutSuffix(cacheKey, ":access_token")
-	if !found || namespace == "" {
+	cacheKey, lockKey, err := providerTokenKeys(config)
+	if err != nil {
 		return nil, errEnsureUnavailable
 	}
 	return &EnsureService{
+		Provider:        config.Provider,
 		Store:           store,
 		OAuth:           oauth,
 		CacheKey:        cacheKey,
-		LockKey:         namespace + ":token:lock",
+		LockKey:         lockKey,
 		AppKey:          config.AppKey,
 		AppSecret:       config.AppSecret,
 		Now:             time.Now,
-		InitialLockWait: lockInitialWait,
-		LockPollEvery:   lockPollInterval,
-		LockWaitTimeout: lockWaitTimeout,
+		InitialLockWait: providerInitialLockWait(config.Provider),
+		LockPollEvery:   providerLockPollInterval(config.Provider),
+		LockWaitTimeout: providerLockWaitTimeout(config.Provider),
 	}, nil
 }
 
+func providerTokenKeys(config ProviderConfig) (string, string, error) {
+	switch config.Provider {
+	case ProviderKISMock:
+		cacheKey, err := kismockread.TokenCacheKey(config.BaseURL, config.AppKey)
+		if err != nil {
+			return "", "", errEnsureUnavailable
+		}
+		namespace, found := strings.CutSuffix(cacheKey, ":access_token")
+		if !found || namespace == "" {
+			return "", "", errEnsureUnavailable
+		}
+		return cacheKey, namespace + ":token:lock", nil
+	case ProviderKISLive:
+		// This exactly mirrors the default RedisTokenManager() namespace in
+		// auto_trader: live KIS has no credential fingerprint in its key.
+		return "kis:access_token", "kis:token:lock", nil
+	case ProviderToss:
+		fingerprint := sha256.Sum256([]byte(config.AppKey))
+		namespace := "toss:oauth:" + hex.EncodeToString(fingerprint[:8])
+		return namespace + ":access_token", namespace + ":lock", nil
+	default:
+		return "", "", errEnsureUnavailable
+	}
+}
+
 // Ensure returns fresh if the shared cache already contains a reader-valid
-// token, otherwise it takes the Python-compatible distributed lock and issues
-// exactly one replacement token.
+// token, otherwise it takes the provider's cooperative distributed lock and
+// issues exactly one replacement token.
 func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
-	if service == nil || service.Store == nil || service.OAuth == nil || service.CacheKey == "" || service.LockKey == "" {
+	if service == nil || !knownProvider(service.Provider) || service.Store == nil || service.OAuth == nil ||
+		service.CacheKey == "" || service.LockKey == "" || service.AppKey == "" || service.AppSecret == "" {
 		return "", errEnsureUnavailable
 	}
 	fresh, err := service.hasFreshToken(ctx)
@@ -116,7 +148,7 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 	defer service.releaseLock(lockValue)
 
 	// A peer can populate the cache between the initial GET and SET NX. Check
-	// again while owning the lock before contacting VTS.
+	// again while owning the lock before contacting the provider.
 	fresh, err = service.hasFreshToken(ctx)
 	if err != nil {
 		return "", err
@@ -125,36 +157,55 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 		return EnsureStateFresh, nil
 	}
 	issued, err := service.OAuth.Issue(ctx, service.AppKey, service.AppSecret)
+	if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
+		return "", errEnsureUnavailable
+	}
+	payload, err := service.payload(issued.AccessToken, issued.ExpiresIn, service.now())
 	if err != nil {
 		return "", errEnsureUnavailable
 	}
-	if issued.AccessToken == "" || !safeHeaderText(issued.AccessToken) ||
-		issued.ExpiresIn <= int64(tokenExpiryBuffer/time.Second) || issued.ExpiresIn > maximumTokenSeconds {
-		return "", errEnsureUnavailable
-	}
-	now := service.now()
-	payload, err := tokenPayload(issued.AccessToken, issued.ExpiresIn, now)
-	if err != nil {
-		return "", errEnsureUnavailable
-	}
-	ttl := time.Duration(issued.ExpiresIn)*time.Second + tokenExpiryBuffer
-	if err := service.Store.Set(ctx, service.CacheKey, payload, ttl); err != nil {
+	// Toss permits one valid token per client. A successful reissue invalidates
+	// the previous token, so publish the replacement while still owning this
+	// shared lock before any Python consumer can observe an unlocked stale key.
+	if err := service.Store.Set(ctx, service.CacheKey, payload, providerCacheTTL(service.Provider, issued.ExpiresIn)); err != nil {
 		return "", errEnsureUnavailable
 	}
 	return EnsureStateIssued, nil
 }
 
-func (service *EnsureService) hasFreshToken(ctx context.Context) (bool, error) {
-	_, loadErr := kismockread.LoadCachedToken(ctx, service.Store, service.CacheKey, service.now())
-	if loadErr == nil {
-		return true, nil
+func (service *EnsureService) payload(accessToken string, expiresIn int64, now time.Time) (string, error) {
+	switch service.Provider {
+	case ProviderKISMock, ProviderKISLive:
+		return tokenPayload(accessToken, expiresIn, now)
+	case ProviderToss:
+		return tossTokenPayload(accessToken, expiresIn, now)
+	default:
+		return "", errEnsureUnavailable
 	}
-	if loadErr.Code == kismockread.CodeTokenCacheUnavailable {
+}
+
+func (service *EnsureService) hasFreshToken(ctx context.Context) (bool, error) {
+	switch service.Provider {
+	case ProviderKISMock, ProviderKISLive:
+		_, loadErr := kismockread.LoadCachedToken(ctx, service.Store, service.CacheKey, service.now())
+		if loadErr == nil {
+			return true, nil
+		}
+		if loadErr.Code == kismockread.CodeTokenCacheUnavailable {
+			return false, errEnsureUnavailable
+		}
+		// Missing, malformed, and near-expiry payloads are all replaced under
+		// the distributed lock. The reader remains fail-closed until SET wins.
+		return false, nil
+	case ProviderToss:
+		_, fresh, err := loadTossCachedToken(ctx, service.Store, service.CacheKey, service.now())
+		if err != nil {
+			return false, errEnsureUnavailable
+		}
+		return fresh, nil
+	default:
 		return false, errEnsureUnavailable
 	}
-	// Missing, malformed, and near-expiry payloads are all replaced under the
-	// distributed lock. The reader remains fail-closed until that SET succeeds.
-	return false, nil
 }
 
 func (service *EnsureService) waitForFreshToken(ctx context.Context) (EnsureState, error) {
@@ -203,21 +254,21 @@ func (service *EnsureService) now() time.Time {
 
 func (service *EnsureService) initialLockWait() time.Duration {
 	if service.InitialLockWait <= 0 {
-		return lockInitialWait
+		return providerInitialLockWait(service.Provider)
 	}
 	return service.InitialLockWait
 }
 
 func (service *EnsureService) lockPollEvery() time.Duration {
 	if service.LockPollEvery <= 0 {
-		return lockPollInterval
+		return providerLockPollInterval(service.Provider)
 	}
 	return service.LockPollEvery
 }
 
 func (service *EnsureService) lockWaitTimeout() time.Duration {
 	if service.LockWaitTimeout <= 0 {
-		return lockWaitTimeout
+		return providerLockWaitTimeout(service.Provider)
 	}
 	return service.LockWaitTimeout
 }
@@ -248,7 +299,7 @@ type cachedTokenPayload struct {
 }
 
 // tokenPayload deliberately uses a struct rather than a map: its three Python
-// field names and their byte order are stable and covered by a fixed-byte test.
+// KIS field names and byte order are stable and covered by a fixed-byte test.
 func tokenPayload(accessToken string, expiresIn int64, now time.Time) (string, error) {
 	createdAt := float64(now.UnixNano()) / float64(time.Second)
 	payload, err := json.Marshal(cachedTokenPayload{
@@ -260,4 +311,93 @@ func tokenPayload(accessToken string, expiresIn int64, now time.Time) (string, e
 		return "", err
 	}
 	return string(payload), nil
+}
+
+type tossCachedTokenPayload struct {
+	AccessToken string  `json:"access_token"`
+	ExpiresAt   float64 `json:"expires_at"`
+}
+
+// tossTokenPayload deliberately has no created_at field. This is the exact
+// two-field shape written by TossOAuthTokenManager._cache_token in Python.
+func tossTokenPayload(accessToken string, expiresIn int64, now time.Time) (string, error) {
+	nowSeconds := float64(now.UnixNano()) / float64(time.Second)
+	payload, err := json.Marshal(tossCachedTokenPayload{
+		AccessToken: accessToken,
+		ExpiresAt:   nowSeconds + float64(expiresIn),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(payload), nil
+}
+
+func loadTossCachedToken(ctx context.Context, store RedisStore, key string, now time.Time) (string, bool, error) {
+	if store == nil {
+		return "", false, errEnsureUnavailable
+	}
+	raw, present, err := store.Get(ctx, key)
+	if err != nil {
+		return "", false, errEnsureUnavailable
+	}
+	if !present {
+		return "", false, nil
+	}
+	fields, valid := strictJSONFields(raw)
+	if !valid || len(fields) != 2 {
+		return "", false, nil
+	}
+	accessTokenRaw, hasAccessToken := fields["access_token"]
+	expiresAtRaw, hasExpiresAt := fields["expires_at"]
+	if !hasAccessToken || !hasExpiresAt {
+		return "", false, nil
+	}
+	var accessToken string
+	var expiresAt float64
+	if json.Unmarshal(accessTokenRaw, &accessToken) != nil ||
+		json.Unmarshal(expiresAtRaw, &expiresAt) != nil ||
+		accessToken == "" || !safeHeaderText(accessToken) ||
+		math.IsNaN(expiresAt) || math.IsInf(expiresAt, 0) {
+		return "", false, nil
+	}
+	nowSeconds := float64(now.UnixNano()) / float64(time.Second)
+	if !(nowSeconds < expiresAt-tossTokenExpiryBuffer.Seconds()) {
+		return "", false, nil
+	}
+	return accessToken, true, nil
+}
+
+// strictJSONFields rejects duplicate keys and trailing JSON so the cache
+// protocol stays deterministic even if an untrusted Redis value is malformed.
+func strictJSONFields(raw string) (map[string]json.RawMessage, bool) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return nil, false
+	}
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		key, isString := keyToken.(string)
+		if err != nil || !isString {
+			return nil, false
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil, false
+		}
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return nil, false
+		}
+		fields[key] = value
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return nil, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
+	}
+	return fields, true
 }

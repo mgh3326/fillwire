@@ -62,31 +62,40 @@ go run ./cmd/kis-mock-read domestic-balance --json
 go run ./cmd/kis-mock-read domestic-order-history --from 20260901 --to 20260901 --json
 ```
 
-## KIS mock token gateway: `gatewayd`
+## Provider-scoped token gateway: `gatewayd`
 
-`gatewayd` is a separate, loopback-only daemon that owns the KIS **mock**
-token issuance path. It exposes `GET /healthz` and
-`POST /v1/tokens/kis-mock/ensure` on `127.0.0.1:8791` by default. The ensure
-response is only `{"state":"fresh"}` or `{"state":"issued"}`; it never includes a
-token.
+`gatewayd` is a separate, loopback-only OAuth token issuer. It exposes
+`GET /healthz` and `POST /v1/tokens/{provider}/ensure`, where `provider` is the
+closed set `kis-mock`, `kis-live`, or `toss`. The ensure response is only
+`{"state":"fresh"}` or `{"state":"issued"}`; it never includes a token.
 
-The daemon uses the same Redis namespace and JSON cache payload as the Python
-manager and `kis-mock-read`: `kis_mock:{host}:{fp16}:access_token` with
-`access_token`, `expires_at`, and `created_at`. A reader-valid cache entry is a
-no-op. For a missing, malformed, or near-expiry entry, it first obtains the
-shared `{namespace}:token:lock` via `SET NX EX 30`, checks the cache again, and
-only then posts to the pinned VTS `/oauth2/tokenP` endpoint. A failed lock
-acquisition follows the Python wait/poll pattern and rechecks Redis; it never
-bypasses that cooperating lock.
-
-It reads only `KIS_MOCK_APP_KEY`, `KIS_MOCK_APP_SECRET`, `REDIS_URL`, and the
-optional `GATEWAYD_LISTEN_ADDR`. It has no order, command, intent, or live
-credential configuration. To keep an edge runtime GET-only without managing a
-refresh timer itself, add the optional autonomous mode:
+The daemon defaults to `--providers=kis-mock`. A deployment must explicitly
+select `kis-live` and/or `toss`; merely placing their credentials in the
+environment cannot activate their issuance paths. The optional autonomous mode
+also refreshes only that selected provider set:
 
 ```sh
 go run ./cmd/gatewayd --ensure-interval=5m
+go run ./cmd/gatewayd --providers=kis-mock,toss --ensure-interval=5m
 ```
+
+All providers use Redis `SET NX EX 30`, recheck the cache under the lock, and
+return a fixed error rather than bypass a contended lock. Their authority and
+cache contracts are separately pinned:
+
+- `kis-mock` uses the existing VTS authority and
+  `kis_mock:{host}:{fp16}:access_token` three-field KIS JSON payload.
+- `kis-live` posts only to `https://openapi.koreainvestment.com:9443/oauth2/tokenP`,
+  uses `KIS_APP_KEY`/`KIS_APP_SECRET`, and mirrors the default Python namespace
+  exactly: `kis:access_token` and `kis:token:lock`.
+- `toss` posts only form-encoded client credentials to
+  `https://openapi.tossinvest.com/oauth2/token`, uses
+  `TOSS_API_CLIENT_ID`/`TOSS_API_CLIENT_SECRET`, and mirrors its Python cache
+  key `toss:oauth:{sha256(client_id)[:16]}:access_token` plus its **two-field**
+  JSON payload. Toss permits one valid token per client, so a replacement is
+  written to Redis before the shared lock is released.
+
+`gatewayd` has no order, command, intent, or execution endpoint.
 
 ## Mock placement edge: `kis-mock-edge`
 
@@ -160,12 +169,13 @@ place real VTS orders.
 
 ## What it does not do
 
-This repository does **not** contain Go PG intents, gRPC, proto, a live host,
-or an `auto_trader` modification/dependency. It does not place live orders or
-support order modification, cancellation, market orders, Binance, or any paper
-mutation beyond the specifically gated KIS domestic limit and Alpaca BTC/USD
-limit placement boundaries. Alpaca cancellation remains an external operator
-action and has no endpoint or client method here.
+This repository does **not** contain Go PG intents, gRPC, proto, or an
+`auto_trader` modification/dependency. Its only live authorities are the
+provider-pinned OAuth token endpoints documented above; it does not place live
+orders or support order modification, cancellation, market orders, Binance, or
+any paper mutation beyond the specifically gated KIS domestic limit and Alpaca
+BTC/USD limit placement boundaries. Alpaca cancellation remains an external
+operator action and has no endpoint or client method here.
 
 Do not cite or integrate the orphan `auto_trader kis_websocket` Redis pub/sub
 legacy path. OPSP8996 때문에 live WS shadow는 금지하며,

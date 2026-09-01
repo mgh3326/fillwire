@@ -6,21 +6,35 @@ import (
 )
 
 // EventLogger receives fixed event text only. The handler never passes an
-// upstream error, token, credential, Redis URL, or request body to it.
+// upstream error, token, credential, Redis URL, request body, or path value to
+// it.
 type EventLogger interface {
 	Print(...any)
 }
 
-// NewHandler exposes only the local health and KIS mock token ensure routes.
-func NewHandler(ensurer Ensurer, logger EventLogger) http.Handler {
+// ProviderEnsurers contains only explicitly configured providers. It is kept
+// separate from provider parsing so an unconfigured live provider cannot be
+// reached merely because a credential exists in the process environment.
+type ProviderEnsurers map[TokenProvider]Ensurer
+
+// NewHandler exposes only loopback-safe health and the closed token ensure
+// route. The provider segment is parsed as a closed enum before it is used.
+func NewHandler(ensurers ProviderEnsurers, logger EventLogger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, `{"status":"ok"}`)
 	})
-	mux.HandleFunc("POST /v1/tokens/kis-mock/ensure", func(writer http.ResponseWriter, request *http.Request) {
-		if ensurer == nil {
+	mux.HandleFunc("POST /v1/tokens/{provider}/ensure", func(writer http.ResponseWriter, request *http.Request) {
+		provider := TokenProvider(request.PathValue("provider"))
+		if !knownProvider(provider) {
 			logEvent(logger, "gatewayd: token ensure unavailable")
-			writeJSON(writer, http.StatusServiceUnavailable, `{"error":"ensure_failed"}`)
+			writeJSON(writer, http.StatusNotFound, `{"error":"not_found"}`)
+			return
+		}
+		ensurer, configured := ensurers[provider]
+		if !configured || ensurer == nil {
+			logEvent(logger, "gatewayd: token ensure unavailable")
+			writeJSON(writer, http.StatusNotFound, `{"error":"not_found"}`)
 			return
 		}
 		state, err := ensurer.Ensure(request.Context())
