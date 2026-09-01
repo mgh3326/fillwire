@@ -94,6 +94,26 @@ Run it only after the explicit gate is intentionally armed:
 BROKER_EDGE_MOCK_PLACE_ENABLED=true go run ./cmd/kis-mock-edge
 ```
 
+### Resolving an UNKNOWN receipt
+
+`kis-mock-edge resolve` is a bounded, read-only reconciliation command. It
+uses the existing GET-only domestic order-history route (`VTTC8001R`) for the
+KIS mock account and never performs a placement, token issue, refresh, or
+cache write.
+
+```sh
+go run ./cmd/kis-mock-edge resolve
+go run ./cmd/kis-mock-edge resolve --grace=10m
+```
+
+For a stored `UNKNOWN/kis_mock` receipt, one matching order (side, stock,
+quantity, price, and send-time window) appends an `ACCEPTED` resolution with
+the broker order number. A successful complete read with no match appends
+`NOT_CREATED/resolved_absent` only after the ten-minute default grace period.
+Read errors, multiple matches, and young receipts remain `UNKNOWN`. The
+original receipt row is preserved; resolution is an additive SQLite record and
+the command's JSON output contains the resulting receipt(s).
+
 See [the edge boundary](docs/kis-mock-edge.md) for the command, receipt, and
 failure contract. Repository tests use fake transport responses and do not
 place real VTS orders.

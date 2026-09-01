@@ -96,7 +96,7 @@ func (service *Service) Process(ctx context.Context, command executioncontracts.
 	}
 
 	pending := service.receipt(command.CommandID, executioncontracts.DispositionUnknown, ErrorSendPending)
-	existing, reserved, err := service.Store.ReservePending(ctx, pending)
+	existing, reserved, err := service.Store.ReservePending(ctx, pending, command)
 	if err != nil {
 		return service.receipt(command.CommandID, executioncontracts.DispositionNotCreated, ErrorStorageFailure), err
 	}

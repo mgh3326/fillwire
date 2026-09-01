@@ -51,6 +51,18 @@ and never resends. Broker timeouts, 5xx responses, redirects, malformed
 responses, and non-accepted responses after this point remain `UNKNOWN`; they
 are never relabeled `NOT_CREATED`.
 
+`kis-mock-edge resolve` is the only later conclusion path. It queries the
+already allowlisted, GET-only VTS domestic daily-order history endpoint
+(`VTTC8001R`) and appends a resolution record; it does not alter the original
+receipt. A single order matching side, stock, quantity, price, and the pending
+send timestamp within its fixed five-minute match window yields `ACCEPTED` and
+the broker order number. A successful complete query with no corresponding
+order may yield `NOT_CREATED/resolved_absent` only after a ten-minute grace
+period. Query failure, ambiguous matches, and an unexpired grace period remain
+`UNKNOWN` without a resolution record. Legacy receipt rows that predate stored
+command facts are resolved absent only when the successful day query contains
+zero orders.
+
 ## Mock-only placement gates
 
 Placement is disabled unless `BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit.
