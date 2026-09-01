@@ -1,10 +1,11 @@
 # broker-edge
 
-`broker-edge` is a small Go bootstrap for a bounded KIS VTS read CLI. Today it
-contains only `kis-mock-read`; Python will connect later over an approved HTTPS
-boundary. `cmd/` follows Go convention only—Python does not import it.
+`broker-edge` contains two deliberately bounded KIS VTS paths:
+`kis-mock-read` is GET-only, and `kis-mock-edge` is a separately approved,
+loopback-only mock placement edge. `cmd/` follows Go convention only—Python
+does not import it, and Python retains ownership of `order_send_intents`.
 
-## What it does
+## Read path: `kis-mock-read`
 
 `kis-mock-read` reads an already-issued VTS token from Redis and makes a small,
 GET-only allowlist of KIS mock account reads. It is fail-closed:
@@ -39,7 +40,7 @@ Human output is a count-only summary. `--json` emits this closed schema only:
 `records`. It never emits a raw broker response, credential, Redis URL, or token
 value.
 
-## Configuration and use
+## Read configuration and use
 
 Only these environment variable names are read or documented:
 
@@ -60,18 +61,55 @@ go run ./cmd/kis-mock-read domestic-balance --json
 go run ./cmd/kis-mock-read domestic-order-history --from 20260901 --to 20260901 --json
 ```
 
+## Mock placement edge: `kis-mock-edge`
+
+`kis-mock-edge` accepts only `POST /v1/commands` on `127.0.0.1:8080` by
+default. The listener rejects non-loopback overrides. Its SQLite receipt store
+has `command_id UNIQUE`; a repeated ID returns the saved receipt and makes zero
+additional broker POSTs.
+
+Placement is disabled by default. It is allowed only when
+`BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit, and then only to the pinned
+HTTPS VTS host. A pending `UNKNOWN` receipt is committed immediately before the
+one possible broker POST. Therefore a kill, timeout, 5xx, redirect, or ambiguous
+provider response cannot be retried as `NOT_CREATED`.
+
+The first edge supports Korean limit orders only. It preserves price and
+quantity strings verbatim, rejects invalid KRX ticks rather than adjusting them,
+and has non-configurable caps of 100 shares and KRW 1,000,000 notional. It
+reuses the read path's GET-only cached token loader; it cannot issue or mutate a
+token.
+
+Local settings:
+
+- `BROKER_EDGE_MOCK_PLACE_ENABLED` — must be exactly `true` to permit a place.
+- `BROKER_EDGE_LISTEN_ADDR` — optional loopback address; default
+  `127.0.0.1:8080`.
+- `BROKER_EDGE_SQLITE_PATH` — optional local receipt database; default
+  `kis-mock-edge.sqlite`.
+
+Run it only after the explicit gate is intentionally armed:
+
+```sh
+BROKER_EDGE_MOCK_PLACE_ENABLED=true go run ./cmd/kis-mock-edge
+```
+
+See [the edge boundary](docs/kis-mock-edge.md) for the command, receipt, and
+failure contract. Repository tests use fake transport responses and do not
+place real VTS orders.
+
 ## What it does not do
 
-This repository does **not** contain Go PG intents, a broker-gateway, gRPC,
-proto, a live host, or an `auto_trader` modification/dependency. It does not
-place, modify, cancel, or otherwise mutate orders; mutation TRs are absent from
-the allowlist.
+This repository does **not** contain Go PG intents, gRPC, proto, a live host,
+or an `auto_trader` modification/dependency. It does not place live orders or
+support order modification, cancellation, market orders, or any mock mutation
+other than the specifically gated domestic limit placement boundary.
 
 Do not cite or integrate the orphan `auto_trader kis_websocket` Redis pub/sub
 legacy path. OPSP8996 때문에 live WS shadow는 금지하며,
 [fixtures/](fixtures/) is only a placeholder directory.
 
-`execution_contracts/` provides only the minimal future schema names. Python은
+`execution_contracts/` provides the minimal command and receipt schema. Python은
 지금 이 스키마로 호출하지 않는다.
 
 ## Verification

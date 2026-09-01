@@ -1,3 +1,13 @@
-// Package main reserves the kis-mock-edge command name for a later, separately
-// approved boundary. It intentionally contains no implementation.
+// kis-mock-edge accepts one loopback-only, mock-VTS order command boundary.
 package main
+
+import (
+	"context"
+	"os"
+
+	"github.com/mgh3326/broker-edge/internal/kismockedge"
+)
+
+func main() {
+	os.Exit(kismockedge.Run(context.Background(), os.Getenv, os.Stderr))
+}

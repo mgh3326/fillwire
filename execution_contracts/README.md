@@ -1,8 +1,16 @@
 # execution_contracts
 
 `ExecutionCommandV1`, `ExecutionReceiptV1`, and `TokenLeaseView` are small named
-JSON shapes for future HTTPS integration. They are not a ledger, broker gateway,
-or token transport.
+JSON shapes. They are not a ledger or token transport.
 
-Python은 지금 이 스키마로 호출하지 않는다. 현재 구현은 `kis-mock-read` CLI뿐이며,
-향후 Python 연결은 별도 승인된 HTTPS 경계에서만 검토한다.
+`ExecutionCommandV1` is the mock-only input for the separately approved local
+`kis-mock-edge` boundary. `quantity` and `price` are strings, intentionally
+preserved exactly through validation and the broker request. Its fixed account
+scope is `kis_mock`.
+
+`ExecutionReceiptV1.disposition` is closed to `NOT_CREATED`, `ACCEPTED`, and
+`UNKNOWN`. `UNKNOWN` is intentional after the broker HTTP boundary: it prevents
+a retry from asserting that a potentially sent order was never created.
+
+Python remains the owner of `order_send_intents`; it is not redirected to this
+Go service by these contracts.
