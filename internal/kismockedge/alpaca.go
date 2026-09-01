@@ -28,8 +28,11 @@ const (
 	AlpacaLiveTradingHost    = "api.alpaca.markets"
 	AlpacaLiveTradingBaseURL = "https://api.alpaca.markets"
 
-	// AlpacaPaperCryptoSymbolBTCUSD is the complete smoke-contract allowlist.
+	// AlpacaPaperCryptoSymbolBTCUSD and AlpacaPaperUSStockSymbolAAPL are the
+	// complete smoke-contract allowlist (contract v1.2: one US-stock paper
+	// order added; same paper account, same $10 notional cap).
 	AlpacaPaperCryptoSymbolBTCUSD = "BTC/USD"
+	AlpacaPaperUSStockSymbolAAPL  = "AAPL"
 )
 
 var (

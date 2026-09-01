@@ -484,3 +484,21 @@ func TestAlpacaSecretValuesNeverEnterReceipts(t *testing.T) {
 		t.Fatalf("receipt = %+v", receipt)
 	}
 }
+
+func TestAlpacaAllowsAAPLWithinCapAndRejectsOtherStocks(t *testing.T) {
+	// Contract v1.2: one US-stock paper order (AAPL) joins the allowlist.
+	base := executioncontracts.ExecutionCommandV1{
+		SchemaVersion: "execution-command/v1", CommandID: "us-1",
+		AccountScope: executioncontracts.AccountScopeAlpacaPaperCrypto,
+		Side: "buy", StockCode: "AAPL", Quantity: "1", Price: "5",
+		OrderType: "limit", IssuedAt: "2026-09-01T12:00:00Z",
+	}
+	if code := ValidateCommand(base); code != "" {
+		t.Fatalf("AAPL within cap must validate: %s", code)
+	}
+	other := base
+	other.StockCode = "TSLA"
+	if code := ValidateCommand(other); code == "" {
+		t.Fatal("non-allowlisted stock must be rejected")
+	}
+}

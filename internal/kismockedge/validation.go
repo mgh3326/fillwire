@@ -69,7 +69,8 @@ func validateKISMockCommand(command executioncontracts.ExecutionCommandV1) strin
 
 func validateAlpacaPaperCryptoCommand(command executioncontracts.ExecutionCommandV1) string {
 	if command.AccountScope != executioncontracts.AccountScopeAlpacaPaperCrypto ||
-		command.Side != "buy" || command.StockCode != AlpacaPaperCryptoSymbolBTCUSD {
+		command.Side != "buy" ||
+		(command.StockCode != AlpacaPaperCryptoSymbolBTCUSD && command.StockCode != AlpacaPaperUSStockSymbolAAPL) {
 		return ErrorInvalidCommand
 	}
 	_, validQuantity := positiveDecimal(command.Quantity)
