@@ -25,6 +25,8 @@ type Metrics struct {
 	commands       *prometheus.CounterVec
 	cancels        *prometheus.CounterVec
 	brokerRequests *prometheus.CounterVec
+	liveCommands   *prometheus.CounterVec
+	missingEcho    prometheus.Gauge
 	httpDuration   *prometheus.HistogramVec
 }
 
@@ -45,6 +47,15 @@ func NewMetrics() *Metrics {
 			Name: "broker_edge_broker_requests_total",
 			Help: "Total broker requests that crossed a durable send boundary.",
 		}, []string{"scope", "kind"}),
+		liveCommands: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "edge_commands_total",
+			Help: "Total kis_live shadow witness command outcomes.",
+		}, []string{"scope", "phase", "outcome"}),
+		missingEcho: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "edge_witness_missing_echo",
+			Help:        "Current kis_live shadow witnesses without an attached broker echo.",
+			ConstLabels: prometheus.Labels{"scope": executioncontracts.AccountScopeKISLive},
+		}),
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "broker_edge_http_request_duration_seconds",
 			Help: "HTTP handler latency in seconds.",
@@ -56,6 +67,8 @@ func NewMetrics() *Metrics {
 		metrics.commands,
 		metrics.cancels,
 		metrics.brokerRequests,
+		metrics.liveCommands,
+		metrics.missingEcho,
 		metrics.httpDuration,
 	)
 
@@ -72,7 +85,28 @@ func NewMetrics() *Metrics {
 			metrics.brokerRequests.WithLabelValues(scope, kind)
 		}
 	}
+	for _, outcome := range []string{"recorded", ErrorScopeDisabled, ErrorInvalidCommand, ErrorStorageFailure} {
+		metrics.liveCommands.WithLabelValues(executioncontracts.AccountScopeKISLive, shadowWitnessMode, outcome)
+	}
 	return metrics
+}
+
+func (metrics *Metrics) recordLiveCommand(outcome string) {
+	if metrics == nil || metrics.liveCommands == nil {
+		return
+	}
+	switch outcome {
+	case "recorded", ErrorScopeDisabled, ErrorInvalidCommand, ErrorStorageFailure:
+	default:
+		outcome = ErrorInvalidCommand
+	}
+	metrics.liveCommands.WithLabelValues(executioncontracts.AccountScopeKISLive, shadowWitnessMode, outcome).Inc()
+}
+
+func (metrics *Metrics) setMissingWitnesses(count int) {
+	if metrics != nil && metrics.missingEcho != nil {
+		metrics.missingEcho.Set(float64(count))
+	}
 }
 
 func (metrics *Metrics) handler() http.Handler {
@@ -110,6 +144,7 @@ func (metrics *Metrics) recordBrokerRequest(scope, kind string) {
 func metricScopes() []string {
 	return []string{
 		executioncontracts.AccountScopeKISMock,
+		executioncontracts.AccountScopeKISMockUS,
 		executioncontracts.AccountScopeAlpacaPaperCrypto,
 		metricScopeUnknown,
 	}
@@ -117,7 +152,7 @@ func metricScopes() []string {
 
 func metricScope(scope string) string {
 	switch scope {
-	case executioncontracts.AccountScopeKISMock, executioncontracts.AccountScopeAlpacaPaperCrypto:
+	case executioncontracts.AccountScopeKISMock, executioncontracts.AccountScopeKISMockUS, executioncontracts.AccountScopeAlpacaPaperCrypto:
 		return scope
 	default:
 		return metricScopeUnknown

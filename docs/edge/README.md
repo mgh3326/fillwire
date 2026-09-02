@@ -1,6 +1,7 @@
 # broker-edge
 
-`broker-edge` contains deliberately bounded paper-trading paths:
+`broker-edge` contains deliberately bounded paper-trading paths plus a
+non-executing live-order audit witness:
 `kis-mock-read` is KIS VTS GET-only, and `kis-mock-edge` is a separately
 approved, loopback-only placement edge that routes a closed account scope to
 either KIS VTS or Alpaca paper crypto. `cmd/` follows Go convention only—Python
@@ -107,7 +108,8 @@ loopback `GET /metrics` with standard Go/process collectors and a bounded
 `POST /v1/commands/{command_id}/cancel`, and Prometheus-format `GET /metrics`
 on `127.0.0.1:8080` by default. The listener rejects non-loopback overrides.
 `account_scope` is closed
-to `kis_mock`, `kis_mock_us`, and `alpaca_paper_crypto`; all use the same SQLite receipt store,
+to `kis_mock`, `kis_mock_us`, `alpaca_paper_crypto`, and `kis_live`. The mock
+scopes use the SQLite receipt store,
 where `command_id UNIQUE` means a repeated ID returns the saved receipt and
 makes zero additional broker POSTs.
 
@@ -123,6 +125,21 @@ Placement is disabled by default. It is allowed only when
 is committed immediately before the one possible broker POST. Therefore a kill,
 timeout, 5xx, redirect, or ambiguous provider response cannot be retried as
 `NOT_CREATED`.
+
+### KIS live boundary — shadow witness only (2026-09-02)
+
+`kis_live` is a **shadow witness only** in Phase 1. With
+`EDGE_KIS_LIVE_SHADOW_ENABLED=true`, `POST /v1/commands` validates and records
+Python's immutable live-order intent in SQLite, but sends **zero broker HTTP
+requests**. It returns a replayable `{witness_id, command_id, recorded_at,
+mode:"shadow"}` receipt. Python may attach the actual broker response through
+`POST /v1/commands/{command_id}/echo`; missing echoes are available at
+`GET /v1/commands?scope=kis_live&missing_echo=true`.
+
+`EDGE_KIS_LIVE_MODE` may only be `shadow` (or omitted, which defaults to it);
+any other value makes startup fail. No live host pin, live token lookup, token
+write, or live request builder exists in this edge. Phase 2 egress requires a
+separate approval.
 
 The `kis_mock` path supports Korean limit orders only. It preserves price and
 quantity strings verbatim, rejects invalid KRX ticks rather than adjusting them,
@@ -146,6 +163,9 @@ Local settings:
   `127.0.0.1:8080`.
 - `BROKER_EDGE_SQLITE_PATH` — optional local receipt database; default
   `kis-mock-edge.sqlite`.
+- `EDGE_KIS_LIVE_SHADOW_ENABLED` — must be exactly `true` to accept `kis_live`
+  intent witnesses; otherwise the scope returns `403 scope_disabled`.
+- `EDGE_KIS_LIVE_MODE` — optional; only `shadow` is accepted.
 - `ALPACA_PAPER_CRYPTO_API_KEY` — static paper API key, used only for
   `alpaca_paper_crypto`.
 - `ALPACA_PAPER_CRYPTO_API_SECRET` — static paper API secret, used only for

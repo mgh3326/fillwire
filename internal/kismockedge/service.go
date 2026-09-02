@@ -27,8 +27,11 @@ type TokenLoader interface {
 type Service struct {
 	Store        *Store
 	PlaceEnabled bool
-	Brokers      map[string]Broker
-	Now          func() time.Time
+	// KISLiveShadowEnabled is a separate fail-closed admission gate. It does
+	// not enable live placement: kis_live is witness-only in this release.
+	KISLiveShadowEnabled bool
+	Brokers              map[string]Broker
+	Now                  func() time.Time
 	// Metrics is optional for direct library callers. NewHandler installs one
 	// when needed, and the daemon constructor installs one up front.
 	Metrics *Metrics
@@ -43,9 +46,10 @@ func NewEnvironmentService(store *Store, lookup func(string) string, transport h
 		lookup = func(string) string { return "" }
 	}
 	return &Service{
-		Store:        store,
-		PlaceEnabled: strings.TrimSpace(lookup("BROKER_EDGE_MOCK_PLACE_ENABLED")) == "true",
-		Metrics:      NewMetrics(),
+		Store:                store,
+		PlaceEnabled:         strings.TrimSpace(lookup("BROKER_EDGE_MOCK_PLACE_ENABLED")) == "true",
+		KISLiveShadowEnabled: strings.TrimSpace(lookup("EDGE_KIS_LIVE_SHADOW_ENABLED")) == "true",
+		Metrics:              NewMetrics(),
 		Brokers: map[string]Broker{
 			executioncontracts.AccountScopeKISMock: KISMockBroker{
 				Transport: transport,
@@ -103,6 +107,12 @@ func (service *Service) metricsSink() *Metrics {
 // Process returns a durable receipt. A matching command_id always wins before
 // validation or token loading, so duplicate delivery cannot send again.
 func (service *Service) Process(ctx context.Context, command executioncontracts.ExecutionCommandV1) (receipt executioncontracts.ExecutionReceiptV1, err error) {
+	if command.AccountScope == executioncontracts.AccountScopeKISLive {
+		// A live command has a distinct witness receipt and must be handled by
+		// ProcessWitness. Keeping it out of this broker lifecycle means no
+		// Broker, token loader, HTTP client, or TR table is reachable here.
+		return service.receipt(command.CommandID, executioncontracts.DispositionNotCreated, ErrorInvalidCommand), nil
+	}
 	defer func() {
 		if metrics := service.metricsSink(); metrics != nil {
 			metrics.recordCommand(command.AccountScope, receipt.Disposition)

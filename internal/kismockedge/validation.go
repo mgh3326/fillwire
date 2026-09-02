@@ -34,6 +34,7 @@ const (
 	ErrorCancelNotEligible    = "cancel_not_eligible"
 	ErrorCancelNotFound       = "cancel_not_found"
 	ErrorCancelSendPending    = "cancel_send_pending"
+	ErrorScopeDisabled        = "scope_disabled"
 )
 
 // ValidateCommand checks the closed command vocabulary before a broker request
@@ -283,7 +284,6 @@ func allDigits(value string, length int) bool {
 	}
 	return true
 }
-
 
 // validKISMockUSSymbol retains auto_trader's database convention: a class
 // share is expressed with a period (BRK.B), which request construction mirrors

@@ -51,6 +51,33 @@ func OpenStore(path string) (*Store, error) {
 		_ = database.Close()
 		return nil, err
 	}
+	// Live intents are witnesses, not command receipts. A separate table keeps
+	// them structurally unable to enter the mock send/cancel lifecycle.
+	if _, err := database.Exec(`
+		CREATE TABLE IF NOT EXISTS kis_live_witnesses (
+			command_id TEXT PRIMARY KEY,
+			witness_id TEXT NOT NULL UNIQUE,
+			schema_version TEXT NOT NULL,
+			account_scope TEXT NOT NULL CHECK (account_scope = 'kis_live'),
+			side TEXT NOT NULL,
+			stock_code TEXT NOT NULL,
+			quantity TEXT NOT NULL,
+			price TEXT NOT NULL,
+			order_type TEXT NOT NULL,
+			issued_at TEXT NOT NULL,
+			phase TEXT NOT NULL CHECK (phase = 'shadow'),
+			received_at TEXT NOT NULL,
+			echo_at TEXT,
+			broker_order_id TEXT,
+			broker_rt_cd TEXT,
+			broker_msg_cd TEXT,
+			broker_msg1 TEXT,
+			broker_received_at TEXT
+		)
+	`); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
 	// account_scope was added after the initial edge release. The edge has
 	// always been mock-only, so the default safely classifies legacy rows.
 	if err := ensureColumn(database, "commands", "account_scope", "TEXT NOT NULL DEFAULT 'kis_mock'"); err != nil {
@@ -287,6 +314,129 @@ func (store *Store) Close() error {
 		return nil
 	}
 	return store.db.Close()
+}
+
+// StoreWitness persists an immutable live intent without ever constructing a
+// broker request. command_id is the durable idempotency key and witness id.
+func (store *Store) StoreWitness(ctx context.Context, receipt WitnessReceipt, command executioncontracts.ExecutionCommandV1) (WitnessReceipt, bool, error) {
+	if store == nil || store.db == nil || receipt.Mode != shadowWitnessMode ||
+		receipt.WitnessID != command.CommandID || receipt.CommandID != command.CommandID ||
+		receipt.RecordedAt == "" || ValidateKISLiveWitness(command) != "" {
+		return WitnessReceipt{}, false, errors.New("invalid witness")
+	}
+	result, err := store.db.ExecContext(ctx, `
+		INSERT INTO kis_live_witnesses (
+			command_id, witness_id, schema_version, account_scope, side, stock_code,
+			quantity, price, order_type, issued_at, phase, received_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'shadow', ?)
+		ON CONFLICT(command_id) DO NOTHING
+	`, command.CommandID, receipt.WitnessID, command.SchemaVersion, command.AccountScope,
+		command.Side, command.StockCode, command.Quantity, command.Price, command.OrderType,
+		command.IssuedAt, receipt.RecordedAt)
+	if err != nil {
+		return WitnessReceipt{}, false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return WitnessReceipt{}, false, err
+	}
+	if inserted == 1 {
+		return receipt, true, nil
+	}
+	existing, found, err := store.FindWitness(ctx, command.CommandID)
+	if err != nil || !found {
+		if err == nil {
+			err = errors.New("witness disappeared after command_id conflict")
+		}
+		return WitnessReceipt{}, false, err
+	}
+	return existing, false, nil
+}
+
+func (store *Store) FindWitness(ctx context.Context, commandID string) (WitnessReceipt, bool, error) {
+	if store == nil || store.db == nil {
+		return WitnessReceipt{}, false, errors.New("store unavailable")
+	}
+	var receipt WitnessReceipt
+	err := store.db.QueryRowContext(ctx, `
+		SELECT witness_id, command_id, received_at, phase
+		FROM kis_live_witnesses WHERE command_id = ?
+	`, commandID).Scan(&receipt.WitnessID, &receipt.CommandID, &receipt.RecordedAt, &receipt.Mode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WitnessReceipt{}, false, nil
+	}
+	if err != nil || receipt.Mode != shadowWitnessMode || receipt.CommandID != commandID || receipt.WitnessID == "" || receipt.RecordedAt == "" {
+		if err == nil {
+			err = errors.New("invalid stored witness")
+		}
+		return WitnessReceipt{}, false, err
+	}
+	return receipt, true, nil
+}
+
+// AttachWitnessEcho is one-shot. Python's replay safety remains its own
+// ledger; the edge rejects a duplicate so audit evidence cannot be rewritten.
+func (store *Store) AttachWitnessEcho(ctx context.Context, commandID string, echo WitnessEcho, echoAt string) (WitnessReceipt, string, error) {
+	if store == nil || store.db == nil {
+		return WitnessReceipt{}, "", errors.New("store unavailable")
+	}
+	if !validCommandID(commandID) || !validWitnessEcho(echo) || echoAt == "" {
+		return WitnessReceipt{}, ErrorInvalidCommand, nil
+	}
+	result, err := store.db.ExecContext(ctx, `
+		UPDATE kis_live_witnesses
+		SET echo_at = ?, broker_order_id = ?, broker_rt_cd = ?, broker_msg_cd = ?, broker_msg1 = ?, broker_received_at = ?
+		WHERE command_id = ? AND echo_at IS NULL
+	`, echoAt, echo.ODNO, echo.RTCode, echo.MessageCode, echo.Message, echo.ReceivedAt, commandID)
+	if err != nil {
+		return WitnessReceipt{}, "", err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return WitnessReceipt{}, "", err
+	}
+	if updated == 1 {
+		receipt, found, err := store.FindWitness(ctx, commandID)
+		if err != nil || !found {
+			if err == nil {
+				err = errors.New("witness disappeared after echo")
+			}
+			return WitnessReceipt{}, "", err
+		}
+		return receipt, "", nil
+	}
+	var echoPresent sql.NullString
+	err = store.db.QueryRowContext(ctx, `SELECT echo_at FROM kis_live_witnesses WHERE command_id = ?`, commandID).Scan(&echoPresent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WitnessReceipt{}, "witness_not_found", nil
+	}
+	if err != nil {
+		return WitnessReceipt{}, "", err
+	}
+	return WitnessReceipt{}, "echo_already_recorded", nil
+}
+
+func (store *Store) MissingWitnesses(ctx context.Context) ([]WitnessReceipt, error) {
+	if store == nil || store.db == nil {
+		return nil, errors.New("store unavailable")
+	}
+	rows, err := store.db.QueryContext(ctx, `
+		SELECT witness_id, command_id, received_at, phase
+		FROM kis_live_witnesses WHERE echo_at IS NULL ORDER BY received_at, command_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var witnesses []WitnessReceipt
+	for rows.Next() {
+		var witness WitnessReceipt
+		if err := rows.Scan(&witness.WitnessID, &witness.CommandID, &witness.RecordedAt, &witness.Mode); err != nil {
+			return nil, err
+		}
+		witnesses = append(witnesses, witness)
+	}
+	return witnesses, rows.Err()
 }
 
 // Find returns the already-durable receipt, including an UNKNOWN pending
