@@ -134,7 +134,11 @@ func Run(ctx context.Context, options Options) int {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	config := ConfigFromEnv(options.Lookup)
+	lookup := options.Lookup
+	if lookup == nil {
+		lookup = os.Getenv
+	}
+	config := ConfigFromEnv(lookup)
 	result := execute(ctx, config, now, options.Client)
 	_ = json.NewEncoder(stdout).Encode(result)
 	if err := WriteTextfile(config.TextfileDir, result, now().UTC()); err != nil {
