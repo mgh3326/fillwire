@@ -19,8 +19,10 @@ const (
 // ServerConfig contains only local listener and SQLite settings. KIS
 // credentials are loaded lazily after the mock placement gate is enabled.
 type ServerConfig struct {
-	ListenAddress string
-	SQLitePath    string
+	ListenAddress        string
+	SQLitePath           string
+	KISLiveShadowEnabled bool
+	KISLiveMode          string
 }
 
 // ServerConfigFromEnv permits only loopback listener addresses. It does not
@@ -31,14 +33,22 @@ func ServerConfigFromEnv(lookup func(string) string) (ServerConfig, error) {
 		lookup = func(string) string { return "" }
 	}
 	config := ServerConfig{
-		ListenAddress: strings.TrimSpace(lookup("BROKER_EDGE_LISTEN_ADDR")),
-		SQLitePath:    strings.TrimSpace(lookup("BROKER_EDGE_SQLITE_PATH")),
+		ListenAddress:        strings.TrimSpace(lookup("BROKER_EDGE_LISTEN_ADDR")),
+		SQLitePath:           strings.TrimSpace(lookup("BROKER_EDGE_SQLITE_PATH")),
+		KISLiveShadowEnabled: strings.TrimSpace(lookup("EDGE_KIS_LIVE_SHADOW_ENABLED")) == "true",
+		KISLiveMode:          strings.TrimSpace(lookup("EDGE_KIS_LIVE_MODE")),
 	}
 	if config.ListenAddress == "" {
 		config.ListenAddress = defaultListenAddress
 	}
 	if config.SQLitePath == "" {
 		config.SQLitePath = defaultSQLitePath
+	}
+	if config.KISLiveMode == "" {
+		config.KISLiveMode = "shadow"
+	}
+	if config.KISLiveMode != "shadow" {
+		return ServerConfig{}, errors.New("kis live mode must be shadow")
 	}
 	if !loopbackAddress(config.ListenAddress) {
 		return ServerConfig{}, errors.New("listener must be loopback")

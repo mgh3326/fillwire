@@ -16,3 +16,12 @@ a retry from asserting that a potentially sent order was never created.
 
 Python remains the owner of `order_send_intents`; it is not redirected to this
 Go service by these contracts.
+
+## KIS live shadow witness v1 (2026-09-02)
+
+`kis_live` reuses the command field shape solely to preserve Python's intent.
+It is accepted only by the Phase 1 shadow witness and never becomes a broker
+request. The response and echo wire schema are in
+[`kis_live_shadow_witness_v1.schema.json`](kis_live_shadow_witness_v1.schema.json).
+Python continues to own approvals, idempotency reservation, live submission,
+accepted-only ledger entries, reconciliation, and loss-sale protection.

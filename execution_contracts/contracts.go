@@ -21,6 +21,9 @@ const (
 	// AccountScopeAlpacaPaperCrypto routes a command to the Alpaca paper
 	// crypto backend. It never represents Alpaca's live trading authority.
 	AccountScopeAlpacaPaperCrypto = "alpaca_paper_crypto"
+	// AccountScopeKISLive is accepted only by the edge's shadow witness. It
+	// never authorizes an edge-to-broker request.
+	AccountScopeKISLive = "kis_live"
 )
 
 // ExecutionCommandV1 is the narrow, mock-only request accepted by
