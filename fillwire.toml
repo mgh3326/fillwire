@@ -13,7 +13,7 @@ event_buffer = 256
 dup_track_max = 10000
 
 [redis]
-url = "redis://redis.example.invalid:6379/0"
+url = "rediss://redis.example.invalid:6380/0"
 
 [stream]
 key = "fills:kis"
@@ -31,6 +31,7 @@ timeout = "10s"
 
 [channel]
 buffer = 256
+drain_timeout = "5s"
 
 [retry]
 min = "1s"

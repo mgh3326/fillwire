@@ -3,10 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -40,7 +43,8 @@ type fileConfig struct {
 		Timeout  string `toml:"timeout"`
 	} `toml:"ingest"`
 	Channel struct {
-		Buffer int `toml:"buffer"`
+		Buffer       int    `toml:"buffer"`
+		DrainTimeout string `toml:"drain_timeout"`
 	} `toml:"channel"`
 	Retry struct {
 		Min    string  `toml:"min"`
@@ -56,6 +60,7 @@ type runtimeConfig struct {
 	timeout      time.Duration
 	retryMin     time.Duration
 	retryMax     time.Duration
+	drainTimeout time.Duration
 	ingestToken  string
 	appKey       string
 	appSecret    string
@@ -73,6 +78,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if strings.TrimSpace(cfg.KIS.Venue) == "" {
 		cfg.KIS.Venue = "krx"
 	}
+	if strings.TrimSpace(cfg.Channel.DrainTimeout) == "" {
+		cfg.Channel.DrainTimeout = "5s"
+	}
 	if err := cfg.validateStatic(); err != nil {
 		return runtimeConfig{}, err
 	}
@@ -84,6 +92,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 	}
 	if cfg.timeout, err = time.ParseDuration(cfg.Ingest.Timeout); err != nil || cfg.timeout <= 0 {
 		return runtimeConfig{}, errors.New("config: invalid ingest timeout")
+	}
+	if cfg.drainTimeout, err = time.ParseDuration(cfg.Channel.DrainTimeout); err != nil || cfg.drainTimeout <= 0 {
+		return runtimeConfig{}, errors.New("config: invalid channel drain_timeout")
 	}
 	if cfg.retryMin, err = time.ParseDuration(cfg.Retry.Min); err != nil || cfg.retryMin <= 0 {
 		return runtimeConfig{}, errors.New("config: invalid retry min")
@@ -129,11 +140,48 @@ func (cfg runtimeConfig) validateStatic() error {
 	if strings.TrimSpace(cfg.Redis.URL) == "" || strings.TrimSpace(cfg.Stream.Key) == "" || strings.TrimSpace(cfg.Stream.Group) == "" || strings.TrimSpace(cfg.Stream.Consumer) == "" {
 		return errors.New("config: Redis and stream fields are required")
 	}
+	if err := validateRedisURL(cfg.Redis.URL); err != nil {
+		return err
+	}
 	if cfg.Stream.MaxLen <= 0 || cfg.Ingest.Batch < 1 || cfg.Ingest.Batch > 200 {
 		return errors.New("config: max_len and batch_size are out of range")
 	}
 	if strings.TrimSpace(cfg.Ingest.URL) == "" || strings.TrimSpace(cfg.Ingest.TokenEnv) == "" {
 		return errors.New("config: ingest URL and token environment name are required")
 	}
+	if err := sink.ValidateIngestURL(cfg.Ingest.URL); err != nil {
+		return errors.New("config: ingest URL rejected")
+	}
 	return nil
+}
+
+func validateRedisURL(raw string) error {
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Scheme == "" {
+		return errors.New("config: Redis URL is invalid")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "rediss":
+		if parsed.Host != "" {
+			return nil
+		}
+	case "redis":
+		if redisLoopbackHost(parsed.Hostname()) {
+			return nil
+		}
+	case "unix":
+		if parsed.Path != "" || parsed.Opaque != "" {
+			return nil
+		}
+	}
+	return errors.New("config: Redis URL scheme is not permitted")
+}
+
+func redisLoopbackHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

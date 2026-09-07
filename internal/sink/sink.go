@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,9 +38,8 @@ type Client struct {
 
 // NewClient creates a client with a finite timeout and redirects disabled.
 func NewClient(cfg HTTPConfig) (*Client, error) {
-	parsed, err := url.ParseRequestURI(cfg.URL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, errors.New("sink: ingest URL is invalid")
+	if err := ValidateIngestURL(cfg.URL); err != nil {
+		return nil, err
 	}
 	if cfg.Token == "" {
 		return nil, errors.New("sink: ingest token is required")
@@ -57,6 +57,34 @@ func NewClient(cfg HTTPConfig) (*Client, error) {
 			},
 		},
 	}, nil
+}
+
+// ValidateIngestURL rejects transport settings that could disclose the ingest
+// bearer token. Plain HTTP is safe only for an explicitly local test or
+// colocated endpoint; production endpoints must use HTTPS.
+func ValidateIngestURL(raw string) error {
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return errors.New("sink: ingest URL is invalid")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(parsed.Hostname()) {
+			return nil
+		}
+	}
+	return errors.New("sink: ingest URL scheme is not permitted")
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Envelope is the only HTTP request shape fillwire sends.

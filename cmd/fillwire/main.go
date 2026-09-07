@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/reader"
@@ -80,6 +82,7 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 		Block:        cfg.readBlock,
 		ClaimMinIdle: cfg.claimMinIdle,
 		Counters:     counters,
+		Logger:       logger,
 	})
 	if err != nil {
 		return err
@@ -99,73 +102,217 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 		return err
 	}
 
-	childCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	events := make(chan ws.Event, cfg.Channel.Buffer)
 	records := make(chan decode.Record, cfg.Channel.Buffer)
-	errs := make(chan error, 3)
-	var workers sync.WaitGroup
+	readerCtx, stopReader := context.WithCancel(context.Background())
+	defer stopReader()
+	runnerCtx, stopRunner := context.WithCancel(context.Background())
+	defer stopRunner()
+	pipeline := newIngressPipeline(ctx, events, records, decoder, queue)
+	readerDone := make(chan error, 1)
+	runnerDone := make(chan error, 1)
 
-	workers.Add(1)
 	go func() {
-		defer workers.Done()
 		defer close(events)
-		if err := reader.New(reader.Config{
+		readerDone <- reader.New(reader.Config{
 			Endpoint:    cfg.KIS.Endpoint,
 			HTSID:       cfg.KIS.HTSID,
 			Approval:    approval,
 			Dialer:      ws.NewDialer(),
 			EventBuffer: cfg.KIS.EventBuffer,
-		}).Run(childCtx, events); err != nil {
-			errs <- err
-		}
+		}).Run(readerCtx, events)
 	}()
-
-	workers.Add(1)
+	ingressDone := pipeline.start()
 	go func() {
-		defer workers.Done()
-		defer close(records)
-		for event := range events {
-			record, ok := decoder.Decode(event)
-			if !ok {
-				continue
-			}
-			select {
-			case records <- record:
-			case <-childCtx.Done():
-				return
-			}
-		}
+		runnerDone <- runner.Run(runnerCtx)
 	}()
 
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
-		for record := range records {
-			if _, err := queue.Enqueue(childCtx, record); err != nil {
-				errs <- err
-				return
-			}
-		}
-	}()
-
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
-		if err := runner.Run(childCtx); err != nil && !errors.Is(err, context.Canceled) {
-			errs <- err
-		}
-	}()
-
+	var (
+		stopErr         error
+		readerFinished  bool
+		ingressFinished bool
+		runnerFinished  bool
+	)
 	select {
 	case <-ctx.Done():
-		cancel()
-		workers.Wait()
-		return nil
-	case err := <-errs:
-		cancel()
-		workers.Wait()
-		return err
+	case stopErr = <-readerDone:
+		readerFinished = true
+		if stopErr == nil {
+			stopErr = reader.ErrEventsClosed
+		}
+	case stopErr = <-ingressDone:
+		ingressFinished = true
+	case stopErr = <-runnerDone:
+		runnerFinished = true
+	}
+
+	// Stop the socket first. The bounded events and records channels remain
+	// live until the separate drain context expires, so a received fill gets an
+	// XADD opportunity even after SIGTERM has canceled the parent context.
+	stopReader()
+	stopRunner()
+	if !readerFinished {
+		if err := <-readerDone; err != nil && stopErr == nil {
+			stopErr = err
+		}
+	}
+
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.drainTimeout)
+	pipeline.beginDrain(drainCtx)
+	stopAtDrainDeadline := context.AfterFunc(drainCtx, pipeline.stop)
+	if !ingressFinished {
+		select {
+		case err := <-ingressDone:
+			ingressFinished = true
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && stopErr == nil {
+				stopErr = err
+			}
+		case <-drainCtx.Done():
+			pipeline.stop()
+			remainingEvents, remainingRecords := len(events), len(records)
+			remaining := uint64(remainingEvents + remainingRecords)
+			counters.AddDrainDropped(remaining)
+			logger.Error("shutdown stream drain expired", "events_remaining", remainingEvents, "records_remaining", remainingRecords)
+		}
+	}
+	stopAtDrainDeadline()
+	cancelDrain()
+	pipeline.stop()
+
+	if !runnerFinished {
+		select {
+		case err := <-runnerDone:
+			if err != nil && !errors.Is(err, context.Canceled) && stopErr == nil {
+				stopErr = err
+			}
+		case <-time.After(cfg.timeout):
+			logger.Error("ingest runner did not stop before shutdown timeout")
+		}
+	}
+	return stopErr
+}
+
+// ingressPipeline owns decode-to-XADD work. Its worker context is rooted in
+// Background rather than the process signal context: shutdown swaps XADD to a
+// bounded drain context before it can be canceled.
+type ingressPipeline struct {
+	shutdownCtx context.Context
+	workerCtx   context.Context
+	stopWorker  context.CancelFunc
+
+	mu       sync.RWMutex
+	drainCtx context.Context
+
+	events  <-chan ws.Event
+	records chan decode.Record
+	decoder *decode.Decoder
+	queue   *stream.Queue
+}
+
+func newIngressPipeline(shutdownCtx context.Context, events <-chan ws.Event, records chan decode.Record, decoder *decode.Decoder, queue *stream.Queue) *ingressPipeline {
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	return &ingressPipeline{
+		shutdownCtx: shutdownCtx,
+		workerCtx:   workerCtx,
+		stopWorker:  stopWorker,
+		events:      events,
+		records:     records,
+		decoder:     decoder,
+		queue:       queue,
+	}
+}
+
+func (p *ingressPipeline) start() <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- p.run() }()
+	return done
+}
+
+func (p *ingressPipeline) beginDrain(ctx context.Context) {
+	p.mu.Lock()
+	p.drainCtx = ctx
+	p.mu.Unlock()
+}
+
+func (p *ingressPipeline) enqueueContext() context.Context {
+	p.mu.RLock()
+	ctx := p.drainCtx
+	p.mu.RUnlock()
+	if ctx != nil {
+		return ctx
+	}
+	return p.workerCtx
+}
+
+func (p *ingressPipeline) stop() { p.stopWorker() }
+
+func (p *ingressPipeline) run() error {
+	if p.shutdownCtx == nil || p.decoder == nil || p.queue == nil {
+		return errors.New("ingress: pipeline dependencies are required")
+	}
+	decoderDone := make(chan struct{})
+	go func() {
+		defer close(decoderDone)
+		defer close(p.records)
+		for {
+			if p.workerCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-p.workerCtx.Done():
+				return
+			case event, open := <-p.events:
+				if !open {
+					return
+				}
+				record, ok := p.decoder.Decode(event)
+				if !ok {
+					continue
+				}
+				if !sendRecord(p.workerCtx, p.records, record) {
+					return
+				}
+			}
+		}
+	}()
+
+	defer p.stop()
+	for {
+		if p.workerCtx.Err() != nil {
+			<-decoderDone
+			return p.workerCtx.Err()
+		}
+		select {
+		case <-p.workerCtx.Done():
+			<-decoderDone
+			return p.workerCtx.Err()
+		case record, open := <-p.records:
+			if !open {
+				<-decoderDone
+				return nil
+			}
+			enqueueCtx := p.enqueueContext()
+			if _, err := p.queue.Enqueue(enqueueCtx, record); err != nil {
+				p.stop()
+				<-decoderDone
+				if enqueueCtx.Err() != nil {
+					return enqueueCtx.Err()
+				}
+				return fmt.Errorf("ingress: XADD: %w", err)
+			}
+		}
+	}
+}
+
+func sendRecord(ctx context.Context, records chan<- decode.Record, record decode.Record) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case records <- record:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ type Config struct {
 	Block        time.Duration
 	ClaimMinIdle time.Duration
 	Counters     *decode.Counters
+	Logger       *slog.Logger
 }
 
 // Message is a decoded stream entry awaiting an ingest response.
@@ -137,13 +139,22 @@ func (q *Queue) Ack(ctx context.Context, ids ...string) error {
 		return nil
 	}
 	acked, err := q.client.XAck(ctx, q.cfg.Key, q.cfg.Group, ids...).Result()
-	if err == nil && acked > 0 {
+	if err != nil {
+		return err
+	}
+	if acked > 0 {
 		q.cfg.Counters.AddXAcked(uint64(acked))
 	}
-	if err == nil && acked != int64(len(ids)) {
-		return fmt.Errorf("stream: xack confirmed %d of %d entries", acked, len(ids))
+	if acked != int64(len(ids)) {
+		missing := int64(len(ids)) - acked
+		if missing > 0 {
+			q.cfg.Counters.AddXAckShortfall(uint64(missing))
+		}
+		if q.cfg.Logger != nil {
+			q.cfg.Logger.Warn("stream acknowledgements already absent from pending list", "confirmed", acked, "requested", len(ids))
+		}
 	}
-	return err
+	return nil
 }
 
 func (q *Queue) decodeStreams(streams []redis.XStream) ([]Message, error) {

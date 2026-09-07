@@ -9,7 +9,9 @@ type Counters struct {
 	dupSuspect     atomic.Uint64
 	xadded         atomic.Uint64
 	xacked         atomic.Uint64
+	xackShortfall  atomic.Uint64
 	ingestFailures atomic.Uint64
+	drainDropped   atomic.Uint64
 }
 
 // CounterSnapshot is a consistent-enough point-in-time view for diagnostics.
@@ -18,7 +20,9 @@ type CounterSnapshot struct {
 	DupSuspect     uint64
 	XAdded         uint64
 	XAcked         uint64
+	XAckShortfall  uint64
 	IngestFailures uint64
+	DrainDropped   uint64
 }
 
 // NewCounters allocates shared counters for the decoder, stream queue, and
@@ -35,7 +39,9 @@ func (c *Counters) Snapshot() CounterSnapshot {
 		DupSuspect:     c.dupSuspect.Load(),
 		XAdded:         c.xadded.Load(),
 		XAcked:         c.xacked.Load(),
+		XAckShortfall:  c.xackShortfall.Load(),
 		IngestFailures: c.ingestFailures.Load(),
+		DrainDropped:   c.drainDropped.Load(),
 	}
 }
 
@@ -67,9 +73,25 @@ func (c *Counters) AddXAcked(n uint64) {
 	}
 }
 
+// AddXAckShortfall records IDs that were already absent from the pending
+// entries list when Redis processed a repeated XACK request.
+func (c *Counters) AddXAckShortfall(n uint64) {
+	if c != nil && n > 0 {
+		c.xackShortfall.Add(n)
+	}
+}
+
 // IncIngestFailure records a failed or untrustworthy ingest attempt.
 func (c *Counters) IncIngestFailure() {
 	if c != nil {
 		c.ingestFailures.Add(1)
+	}
+}
+
+// AddDrainDropped records records left behind only after the bounded shutdown
+// drain expires. It is separate from validation drops.
+func (c *Counters) AddDrainDropped(n uint64) {
+	if c != nil && n > 0 {
+		c.drainDropped.Add(n)
 	}
 }

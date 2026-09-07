@@ -28,6 +28,9 @@ func TestT2Ingest5xxRetry(t *testing.T) {
 	}
 	first := make(chan struct{}, 1)
 	allowSuccess := make(chan struct{})
+	var releaseSuccessOnce sync.Once
+	releaseSuccess := func() { releaseSuccessOnce.Do(func() { close(allowSuccess) }) }
+	t.Cleanup(releaseSuccess)
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if calls.Add(1) == 1 {
@@ -50,7 +53,7 @@ func TestT2Ingest5xxRetry(t *testing.T) {
 		t.Fatal("first ingest attempt did not return 500")
 	}
 	waitPending(t, client, 1)
-	close(allowSuccess)
+	releaseSuccess()
 	waitPending(t, client, 0)
 	if got := calls.Load(); got < 2 {
 		t.Fatalf("ingest calls = %d, want retry", got)
@@ -89,13 +92,18 @@ func TestT3RestartAutoClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := make(chan struct{}, 1)
+	handlerFailure := &handlerFailure{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
-			t.Fatal(err)
+			handlerFailure.set(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if !strings.Contains(string(body), "ORDER-001") {
-			t.Fatalf("claimed request body does not contain pending order: %s", body)
+			handlerFailure.set(fmt.Errorf("claimed request body does not contain pending order"))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":1,"accepted":1,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null}]}`))
 		claimed <- struct{}{}
@@ -111,6 +119,7 @@ func TestT3RestartAutoClaim(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("consumer B did not auto-claim consumer A pending message")
 	}
+	handlerFailure.assert(t)
 	waitPending(t, client, 0)
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -138,6 +147,7 @@ func TestT4DuplicateRedeliveryIdempotency(t *testing.T) {
 		BrokerOrderID string `json:"broker_order_id"`
 	}
 	var call atomic.Int32
+	handlerFailure := &handlerFailure{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var envelope struct {
 			Fills []struct {
@@ -146,7 +156,9 @@ func TestT4DuplicateRedeliveryIdempotency(t *testing.T) {
 			} `json:"fills"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&envelope); err != nil {
-			t.Fatal(err)
+			handlerFailure.set(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		mu.Lock()
 		observed = append(observed, envelope.Fills[0])
@@ -177,6 +189,7 @@ func TestT4DuplicateRedeliveryIdempotency(t *testing.T) {
 	if len(got) != 2 || got[0] != got[1] {
 		t.Fatalf("idempotency fields = %#v, want identical two requests", got)
 	}
+	handlerFailure.assert(t)
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runner returned %v", err)
@@ -226,6 +239,9 @@ func TestT6ResponseLengthMismatchAcksNothing(t *testing.T) {
 	}
 	first := make(chan struct{}, 1)
 	allowCorrectResponse := make(chan struct{})
+	var releaseCorrectResponseOnce sync.Once
+	releaseCorrectResponse := func() { releaseCorrectResponseOnce.Do(func() { close(allowCorrectResponse) }) }
+	t.Cleanup(releaseCorrectResponse)
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if calls.Add(1) == 1 {
@@ -248,7 +264,7 @@ func TestT6ResponseLengthMismatchAcksNothing(t *testing.T) {
 		t.Fatal("mismatched response was not received")
 	}
 	waitPending(t, client, 3)
-	close(allowCorrectResponse)
+	releaseCorrectResponse()
 	waitPending(t, client, 0)
 	if got := counters.Snapshot().IngestFailures; got < 1 {
 		t.Fatalf("ingest failure counter = %d, want mismatch counted", got)
@@ -257,6 +273,47 @@ func TestT6ResponseLengthMismatchAcksNothing(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runner returned %v", err)
 	}
+}
+
+func TestT21PartialXAckIsIdempotent(t *testing.T) {
+	client, queue, counters := testQueue(t, "consumer", 2, 0)
+	if err := queue.EnsureGroup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 2; index++ {
+		if _, err := queue.Enqueue(context.Background(), fixtureRecord(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages, err := queue.ReadNew(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("group messages = %d, want 2", len(messages))
+	}
+	if acked, err := client.XAck(context.Background(), "fills:kis", "fillwire-ingest", messages[0].ID).Result(); err != nil || acked != 1 {
+		t.Fatalf("pre-ack = %d, %v; want 1, nil", acked, err)
+	}
+
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		posts.Add(1)
+		_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":2,"accepted":2,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null},{"status":"inserted","row_id":2,"reason":null}]}`))
+	}))
+	defer server.Close()
+	runner := testRunner(t, queue, server.URL, counters)
+	if err := runner.DeliverOnce(context.Background(), messages); err != nil {
+		t.Fatalf("DeliverOnce with one already-acknowledged ID = %v, want nil", err)
+	}
+	time.Sleep(3 * time.Millisecond)
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("POST count = %d, want 1 without retry loop", got)
+	}
+	if got := counters.Snapshot().XAckShortfall; got != 1 {
+		t.Fatalf("XACK shortfall counter = %d, want 1", got)
+	}
+	waitPending(t, client, 0)
 }
 
 func TestT12BatchNeverExceeds200(t *testing.T) {
@@ -268,12 +325,15 @@ func TestT12BatchNeverExceeds200(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var batchSizes []int
+	handlerFailure := &handlerFailure{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var envelope struct {
 			Fills []json.RawMessage `json:"fills"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&envelope); err != nil {
-			t.Fatal(err)
+			handlerFailure.set(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		mu.Lock()
 		batchSizes = append(batchSizes, len(envelope.Fills))
@@ -312,6 +372,7 @@ func TestT12BatchNeverExceeds200(t *testing.T) {
 			t.Fatalf("POST fills length = %d, exceeds 200", size)
 		}
 	}
+	handlerFailure.assert(t)
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runner returned %v", err)
@@ -329,19 +390,26 @@ func TestT16DupSuspectIsNotTopLevelIngestField(t *testing.T) {
 		t.Fatal(err)
 	}
 	checked := make(chan struct{}, 1)
+	handlerFailure := &handlerFailure{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var envelope struct {
 			Fills []map[string]json.RawMessage `json:"fills"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&envelope); err != nil {
-			t.Fatal(err)
+			handlerFailure.set(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if len(envelope.Fills) != 1 {
-			t.Fatalf("fills length = %d", len(envelope.Fills))
+			handlerFailure.set(fmt.Errorf("fills length = %d", len(envelope.Fills)))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		fill := envelope.Fills[0]
 		if _, exists := fill["dup_suspect"]; exists {
-			t.Fatal("dup_suspect was sent as forbidden top-level ingest field")
+			handlerFailure.set(errors.New("dup_suspect was sent as forbidden top-level ingest field"))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		allowed := map[string]bool{
 			"broker": true, "account_mode": true, "venue": true, "instrument_type": true, "symbol": true,
@@ -351,15 +419,21 @@ func TestT16DupSuspectIsNotTopLevelIngestField(t *testing.T) {
 		}
 		for key := range fill {
 			if !allowed[key] {
-				t.Fatalf("forbidden top-level field %q", key)
+				handlerFailure.set(fmt.Errorf("forbidden top-level field %q", key))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 		}
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(fill["raw_payload_json"], &raw); err != nil {
-			t.Fatal(err)
+			handlerFailure.set(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if _, exists := raw["dup_suspect"]; !exists {
-			t.Fatal("duplicate hint missing from raw_payload_json")
+			handlerFailure.set(errors.New("duplicate hint missing from raw_payload_json"))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":1,"accepted":1,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null}]}`))
 		checked <- struct{}{}
@@ -375,6 +449,7 @@ func TestT16DupSuspectIsNotTopLevelIngestField(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("ingest request was not checked")
 	}
+	handlerFailure.assert(t)
 	waitPending(t, client, 0)
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -446,4 +521,33 @@ func join(parts []string) string {
 		result += "," + part
 	}
 	return result
+}
+
+// handlerFailure moves assertions out of httptest handler goroutines. Calling
+// Fatal there invokes Goexit only in the handler and can leave Server.Close
+// waiting forever after an earlier assertion failure.
+type handlerFailure struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (f *handlerFailure) set(err error) {
+	if err == nil {
+		return
+	}
+	f.mu.Lock()
+	if f.err == nil {
+		f.err = err
+	}
+	f.mu.Unlock()
+}
+
+func (f *handlerFailure) assert(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	err := f.err
+	f.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
 }

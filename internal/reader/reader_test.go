@@ -94,6 +94,8 @@ func (t *fakeTransport) Close() error {
 	return nil
 }
 
+func (t *fakeTransport) drop() { _ = t.Close() }
+
 func (t *fakeTransport) push(frame string) {
 	select {
 	case t.in <- []byte(frame):
@@ -255,6 +257,60 @@ func TestT7SessionOccupied(t *testing.T) {
 	}
 	if got := transport.writes.Load(); got != 1 {
 		t.Fatalf("subscribe writes = %d, want 1 (no retry)", got)
+	}
+}
+
+func TestT18ReconnectSessionOccupiedStopsReader(t *testing.T) {
+	first := newFakeTransport(successfulSubscribe)
+	second := newFakeTransport(occupiedSubscribe)
+	approval := &fakeApproval{}
+	var dials atomic.Int32
+	cfg := readerConfig(first, approval)
+	cfg.Dialer = ws.DialerFunc(func(context.Context, string) (ws.Transport, error) {
+		switch dials.Add(1) {
+		case 1:
+			return first, nil
+		case 2:
+			return second, nil
+		default:
+			return nil, errors.New("unexpected additional KIS dial")
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	events := make(chan ws.Event, 1)
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, events) }()
+	select {
+	case <-first.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("initial KIS subscription did not complete")
+	}
+	first.push(kisExecutionFrame)
+	select {
+	case <-events:
+	case <-time.After(time.Second):
+		t.Fatal("initial execution was not delivered")
+	}
+	first.drop()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ws.ErrSessionOccupied) {
+			t.Fatalf("Reader.Run error = %v, want reconnect ErrSessionOccupied", err)
+		}
+		if got := fillreader.ProcessExitCode(err); got != fillreader.ExitCodeSessionOccupied {
+			t.Fatalf("exit code = %d, want %d", got, fillreader.ExitCodeSessionOccupied)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Reader.Run stayed alive after reconnect OPSP8996")
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("KIS dials = %d, want initial plus one reconnect", got)
+	}
+	if got := second.writes.Load(); got != 1 {
+		t.Fatalf("reconnect subscribe writes = %d, want 1", got)
 	}
 }
 

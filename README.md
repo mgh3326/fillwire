@@ -25,6 +25,8 @@ startup: XAUTOCLAIM pending entries before ordinary XREADGROUP
 
 `rejected` results remain pending. Network failures, timeouts, 5xx responses, 4xx envelope failures, and response/result-length mismatches are retried with backoff and are never acknowledged speculatively.
 
+On shutdown, fillwire stops the socket reader first, then gives already received events a bounded `drain_timeout` window to pass through decode and `XADD`. The drain uses a separate background-rooted context rather than the canceled signal context. If the window expires, the remaining in-memory entries are logged and counted before exit.
+
 Fillwire does not implement restart handoff, a reconcile-trigger client, a local checkpoint database, an HTTP metrics endpoint, heartbeat reporting, parallel consumers, broker orders, amendments, or cancellations. Those are outside this PR.
 
 ## Configuration
@@ -44,7 +46,7 @@ event_buffer = 256
 dup_track_max = 10000
 
 [redis]
-url = "redis://redis.example.invalid:6379/0"
+url = "rediss://redis.example.invalid:6380/0"
 
 [stream]
 key = "fills:kis"
@@ -62,6 +64,7 @@ timeout = "10s"
 
 [channel]
 buffer = 256
+drain_timeout = "5s"
 
 [retry]
 min = "1s"
@@ -70,6 +73,8 @@ factor = 2
 ```
 
 The approval provider reads `kis:websocket:approval_key` for compatibility with the existing cache but never writes that key. A cache miss delegates to the KIS REST approval provider; `Reissue` always bypasses the cache.
+
+Ingest URLs must use HTTPS, except HTTP is allowed only for `localhost`, `127.0.0.1`, or `::1`. Redis URLs must use `rediss`, except loopback `redis` and `unix` socket URLs. These checks run before startup so neither the ingest token nor the cached approval key can be sent over a remote plaintext connection.
 
 If KIS returns `OPSP8996` (`ws.ErrSessionOccupied`) while subscribing, fillwire does not retry and exits with the named `ExitCodeSessionOccupied` code, `42`. This lets a future supervisor distinguish the session-holder condition from generic failure.
 
