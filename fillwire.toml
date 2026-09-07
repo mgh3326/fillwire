@@ -1,0 +1,38 @@
+# Example-only configuration. All credentials are read from environment names;
+# no credential value belongs in this public repository.
+
+[kis]
+broker = "kis"
+endpoint = "live" # live or mock; this also selects the matching KIS TR.
+account_mode = "live"
+venue = "krx"
+hts_id = "EXAMPLE_HTS_ID"
+app_key_env = "KIS_APP_KEY"
+app_secret_env = "KIS_APP_SECRET"
+event_buffer = 256
+dup_track_max = 10000
+
+[redis]
+url = "redis://redis.example.invalid:6379/0"
+
+[stream]
+key = "fills:kis"
+max_len = 100000
+consumer_group = "fillwire-ingest"
+consumer_name = "fillwire-example"
+claim_min_idle = "1m"
+read_block = "5s"
+
+[ingest]
+url = "https://auto-trader.example.invalid/trading/api/execution-ledger/fills/ingest"
+token_env = "EXECUTION_LEDGER_INGEST_TOKEN"
+batch_size = 200
+timeout = "10s"
+
+[channel]
+buffer = 256
+
+[retry]
+min = "1s"
+max = "30s"
+factor = 2
