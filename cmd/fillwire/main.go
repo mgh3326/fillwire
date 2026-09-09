@@ -40,12 +40,26 @@ func main() {
 }
 
 func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
+	return runWithDependencies(ctx, cfg, logger, runDependencies{})
+}
+
+type runDependencies struct {
+	approvalRedis    redis.UniversalClient
+	approvalFallback ws.ApprovalKeyProvider
+	dialer           ws.Dialer
+}
+
+func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies) error {
 	redisOptions, err := redis.ParseURL(cfg.Redis.URL)
 	if err != nil {
 		return errors.New("startup: invalid Redis URL")
 	}
 	redisClient := redis.NewClient(redisOptions)
 	defer redisClient.Close()
+	approvalRedis := dependencies.approvalRedis
+	if approvalRedis == nil {
+		approvalRedis = redisClient
+	}
 
 	kisHost := kis.HostLive
 	if cfg.KIS.Endpoint == "mock" {
@@ -60,7 +74,11 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("startup: KIS REST client configuration failed")
 	}
-	approval, err := reader.NewApprovalProvider(redisClient, ws.NewClientApprovalProvider(kisClient), logger)
+	approvalFallback := dependencies.approvalFallback
+	if approvalFallback == nil {
+		approvalFallback = ws.NewClientApprovalProvider(kisClient)
+	}
+	approval, err := reader.NewApprovalProviderWithMode(approvalRedis, approvalFallback, cfg.KIS.ApprovalMode, logger)
 	if err != nil {
 		return err
 	}
@@ -111,6 +129,10 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 	pipeline := newIngressPipeline(ctx, events, records, decoder, queue)
 	readerDone := make(chan error, 1)
 	runnerDone := make(chan error, 1)
+	dialer := dependencies.dialer
+	if dialer == nil {
+		dialer = ws.NewDialer()
+	}
 
 	go func() {
 		defer close(events)
@@ -118,7 +140,7 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 			Endpoint:    cfg.KIS.Endpoint,
 			HTSID:       cfg.KIS.HTSID,
 			Approval:    approval,
-			Dialer:      ws.NewDialer(),
+			Dialer:      dialer,
 			EventBuffer: cfg.KIS.EventBuffer,
 			Logger:      logger,
 		}).Run(readerCtx, events)

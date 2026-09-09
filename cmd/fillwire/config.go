@@ -18,6 +18,7 @@ type fileConfig struct {
 		Broker       string `toml:"broker"`
 		Endpoint     string `toml:"endpoint"`
 		AccountMode  string `toml:"account_mode"`
+		ApprovalMode string `toml:"approval_mode"`
 		Venue        string `toml:"venue"`
 		HTSID        string `toml:"hts_id"`
 		AppKeyEnv    string `toml:"app_key_env"`
@@ -121,6 +122,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 func (cfg runtimeConfig) validateStatic() error {
 	if cfg.KIS.Broker != "kis" {
 		return errors.New("config: broker must be kis")
+	}
+	if cfg.KIS.ApprovalMode != "" && cfg.KIS.ApprovalMode != "cache-only" {
+		return errors.New("config: unsupported KIS approval_mode")
 	}
 	if cfg.KIS.Endpoint != "live" && cfg.KIS.Endpoint != "mock" {
 		return errors.New("config: KIS endpoint must be live or mock")

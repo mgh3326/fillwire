@@ -38,6 +38,7 @@ Fillwire does not implement restart handoff, a reconcile-trigger client, a local
 broker = "kis"
 endpoint = "live"
 account_mode = "live"
+approval_mode = "cache-only"
 venue = "krx"
 hts_id = "EXAMPLE_HTS_ID"
 app_key_env = "KIS_APP_KEY"
@@ -72,7 +73,7 @@ max = "30s"
 factor = 2
 ```
 
-The approval provider reads `kis:websocket:approval_key` for compatibility with the existing cache but never writes that key. A cache miss delegates to the KIS REST approval provider; `Reissue` always bypasses the cache.
+The approval provider reads `kis:websocket:approval_key` for compatibility with the existing cache but never writes that key. With `approval_mode = "cache-only"`, a missing, empty, or unreadable cache is a permanent fail-closed error: no KIS REST approval or reissue request is attempted, and fillwire exits with code `78`. `Reissue` has the same fail-closed behavior in this mode. If `approval_mode` is omitted, the existing behavior is unchanged: a true miss or empty value delegates to the KIS REST approval provider, `Reissue` bypasses the cache, and Redis errors remain errors rather than falling back to REST.
 
 Ingest URLs must use HTTPS, except HTTP is allowed only for `localhost`, `127.0.0.1`, or `::1`. Redis URLs must use `rediss`, except loopback `redis` and `unix` socket URLs. These checks run before startup so neither the ingest token nor the cached approval key can be sent over a remote plaintext connection.
 
