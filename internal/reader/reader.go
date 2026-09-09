@@ -139,7 +139,7 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		// latest value under a mutex is deliberately short and non-blocking.
 		OnReconnect: func(info ws.ReconnectInfo) {
 			if reconnect.record(info) && !info.Stopped && info.Err == nil && r.cfg.Logger != nil {
-				r.cfg.Logger.Info("KIS websocket reconnect succeeded")
+				r.cfg.Logger.Info("KIS websocket reconnect callback observed")
 			}
 		},
 	})

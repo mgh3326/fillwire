@@ -138,6 +138,20 @@ func occupiedSubscribe(t *fakeTransport, raw []byte) {
 	t.push(`{"header":{"tr_id":"` + request.Body.Input.TRID + `"},"body":{"rt_cd":"1","msg_cd":"OPSP8996","msg1":"session occupied","output":{}}}`)
 }
 
+func rejectedResubscribe(t *fakeTransport, raw []byte) {
+	var request struct {
+		Body struct {
+			Input struct {
+				TRID string `json:"tr_id"`
+			} `json:"input"`
+		} `json:"body"`
+	}
+	if json.Unmarshal(raw, &request) != nil {
+		return
+	}
+	t.push(`{"header":{"tr_id":"` + request.Body.Input.TRID + `"},"body":{"rt_cd":"1","msg_cd":"MCA99999","msg1":"subscription rejected","output":{}}}`)
+}
+
 func readerConfig(transport *fakeTransport, approval ws.ApprovalKeyProvider) fillreader.Config {
 	return fillreader.Config{
 		Endpoint: "live",
@@ -365,7 +379,7 @@ func TestT25WebsocketLifecycleObservations(t *testing.T) {
 	case <-time.After(time.Millisecond * 10):
 	}
 	waitReaderLogMessage(t, logs, "KIS websocket reconnect attempted", 1)
-	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect succeeded"); got != 0 {
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 0 {
 		t.Fatalf("reconnect success events before resubscribe = %d, want 0", got)
 	}
 	release()
@@ -374,7 +388,7 @@ func TestT25WebsocketLifecycleObservations(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reconnect KIS subscription did not complete")
 	}
-	waitReaderLogMessage(t, logs, "KIS websocket reconnect succeeded", 1)
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect callback observed", 1)
 
 	if got := readerLogMessageCount(t, logs.String(), "KIS websocket initial subscription active"); got != 1 {
 		t.Fatalf("initial subscription events = %d, want 1", got)
@@ -382,8 +396,8 @@ func TestT25WebsocketLifecycleObservations(t *testing.T) {
 	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect attempted"); got != 1 {
 		t.Fatalf("reconnect attempt events = %d, want 1", got)
 	}
-	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect succeeded"); got != 1 {
-		t.Fatalf("reconnect success events = %d, want 1", got)
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 1 {
+		t.Fatalf("reconnect callback observation events = %d, want 1", got)
 	}
 	cancel()
 	if err := <-done; err != nil {
@@ -431,8 +445,8 @@ func TestT26WebsocketReconnectAttemptObservedWhenDialFails(t *testing.T) {
 		t.Fatal("failed reconnect dial was not attempted")
 	}
 	waitReaderLogMessage(t, logs, "KIS websocket reconnect attempted", 1)
-	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect succeeded"); got != 0 {
-		t.Fatalf("reconnect success events after failed dial = %d, want 0", got)
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 0 {
+		t.Fatalf("reconnect callback observation events after failed dial = %d, want 0", got)
 	}
 	cancel()
 	if err := <-done; err != nil {
@@ -440,6 +454,73 @@ func TestT26WebsocketReconnectAttemptObservedWhenDialFails(t *testing.T) {
 	}
 	if got := dials.Load(); got != 2 {
 		t.Fatalf("KIS dials = %d, want initial plus failed reconnect", got)
+	}
+}
+
+func TestT27WebsocketReconnectCallbackObservedAfterRejectedResubscribe(t *testing.T) {
+	first := newFakeTransport(successfulSubscribe)
+	rejectionSeen := make(chan struct{}, 1)
+	second := newFakeTransport(func(transport *fakeTransport, raw []byte) {
+		rejectedResubscribe(transport, raw)
+		select {
+		case rejectionSeen <- struct{}{}:
+		default:
+		}
+	})
+	approval := &fakeApproval{}
+	logger, logs := readerJSONLogger()
+	var dials atomic.Int32
+	cfg := readerConfig(first, approval)
+	cfg.Logger = logger
+	cfg.Dialer = ws.DialerFunc(func(context.Context, string) (ws.Transport, error) {
+		switch dials.Add(1) {
+		case 1:
+			return first, nil
+		case 2:
+			return second, nil
+		default:
+			return nil, errors.New("unexpected additional KIS dial")
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, make(chan ws.Event, 1)) }()
+	select {
+	case <-first.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("initial KIS subscription did not complete")
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket initial subscription active", 1)
+	first.drop()
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect attempted", 1)
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect callback observed", 1)
+	select {
+	case <-rejectionSeen:
+	case <-time.After(time.Second):
+		t.Fatal("rejected resubscribe was not exercised")
+	}
+
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect attempted"); got != 1 {
+		t.Fatalf("reconnect attempt events = %d, want 1", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 1 {
+		t.Fatalf("reconnect callback observation events = %d, want 1", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect succeeded"); got != 0 {
+		t.Fatalf("legacy reconnect success events = %d, want 0", got)
+	}
+	if strings.Contains(logs.String(), "MCA99999") {
+		t.Fatalf("rejection code leaked into lifecycle logs: %q", logs.String())
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("reader returned %v", err)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("KIS dials = %d, want initial plus one reconnect", got)
 	}
 }
 
