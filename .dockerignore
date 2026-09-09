@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+*.toml
+*.service
+*.key
+*.pem
+artifacts/
+coverage.out
