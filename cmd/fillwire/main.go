@@ -60,7 +60,7 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("startup: KIS REST client configuration failed")
 	}
-	approval, err := reader.NewApprovalProvider(redisClient, ws.NewClientApprovalProvider(kisClient))
+	approval, err := reader.NewApprovalProvider(redisClient, ws.NewClientApprovalProvider(kisClient), logger)
 	if err != nil {
 		return err
 	}
@@ -120,6 +120,7 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
 			Approval:    approval,
 			Dialer:      ws.NewDialer(),
 			EventBuffer: cfg.KIS.EventBuffer,
+			Logger:      logger,
 		}).Run(readerCtx, events)
 	}()
 	ingressDone := pipeline.start()
