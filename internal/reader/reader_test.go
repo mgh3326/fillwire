@@ -636,6 +636,86 @@ func TestT11ApprovalProvider(t *testing.T) {
 	}
 }
 
+func TestCacheOnlyApprovalHitInitialSubscription(t *testing.T) {
+	mini := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = redisClient.Close() })
+	fallback := &fakeApproval{}
+	logger, logs := readerJSONLogger()
+	provider, err := fillreader.NewApprovalProviderWithMode(redisClient, fallback, fillreader.ApprovalModeCacheOnly, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mini.Set("kis:websocket:approval_key", "cached-synthetic-key"); err != nil {
+		t.Fatal(err)
+	}
+	transport := newFakeTransport(successfulSubscribe)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	cfg := readerConfig(transport, provider)
+	cfg.Logger = logger
+	go func() { done <- fillreader.New(cfg).Run(ctx, make(chan ws.Event, 1)) }()
+	select {
+	case <-transport.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("cache-only reader did not complete its initial subscription")
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket initial subscription active", 1)
+	if got := fallback.approvalCalls.Load(); got != 0 {
+		t.Fatalf("REST approval calls on cache hit = %d, want 0", got)
+	}
+	if got := fallback.reissueCalls.Load(); got != 0 {
+		t.Fatalf("REST reissue calls on cache hit = %d, want 0", got)
+	}
+	if got, err := mini.Get("kis:websocket:approval_key"); err != nil || got != "cached-synthetic-key" {
+		t.Fatalf("cached approval after subscription = %q, %v", got, err)
+	}
+	if strings.Contains(logs.String(), "cached-synthetic-key") {
+		t.Fatalf("approval key leaked into lifecycle logs: %q", logs.String())
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("cache-only reader returned %v", err)
+	}
+}
+
+func TestCacheOnlyApprovalProviderFailuresStayPermanent(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*miniredis.Miniredis)
+	}{
+		{name: "miss", setup: func(*miniredis.Miniredis) {}},
+		{name: "empty", setup: func(mini *miniredis.Miniredis) { mini.Set("kis:websocket:approval_key", "") }},
+		{name: "redis error", setup: func(mini *miniredis.Miniredis) { mini.SetError("ERR synthetic redis failure") }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mini := miniredis.RunT(t)
+			test.setup(mini)
+			redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+			t.Cleanup(func() { _ = redisClient.Close() })
+			fallback := &fakeApproval{}
+			provider, err := fillreader.NewApprovalProviderWithMode(redisClient, fallback, fillreader.ApprovalModeCacheOnly)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if key, err := provider.ApprovalKey(context.Background()); key != "" || !errors.Is(err, fillreader.ErrCacheOnlyApprovalUnavailable) {
+				t.Fatalf("cache-only %s ApprovalKey = %q, %v, want named permanent failure", test.name, key, err)
+			}
+			if key, err := provider.Reissue(context.Background()); key != "" || !errors.Is(err, fillreader.ErrCacheOnlyApprovalUnavailable) {
+				t.Fatalf("cache-only %s Reissue = %q, %v, want named permanent failure", test.name, key, err)
+			}
+			if got := fallback.approvalCalls.Load(); got != 0 {
+				t.Fatalf("cache-only %s REST approval calls = %d, want 0", test.name, got)
+			}
+			if got := fallback.reissueCalls.Load(); got != 0 {
+				t.Fatalf("cache-only %s REST reissue calls = %d, want 0", test.name, got)
+			}
+		})
+	}
+}
+
 type logCapture struct {
 	mu   sync.Mutex
 	data bytes.Buffer

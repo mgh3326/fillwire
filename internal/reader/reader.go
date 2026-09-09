@@ -17,6 +17,10 @@ import (
 // it to distinguish the session-holder case from other process failures.
 const ExitCodeSessionOccupied = 42
 
+// ExitCodeCacheOnlyApprovalUnavailable is reserved for a permanent loss of
+// the Redis-cached KIS approval key in cache-only mode.
+const ExitCodeCacheOnlyApprovalUnavailable = 78
+
 // ErrEventsClosed reports that KIS stopped the event stream without a caller
 // initiated shutdown. Treating this as success would leave the process alive
 // after the feed has died.
@@ -29,6 +33,7 @@ type Config struct {
 	Approval    ws.ApprovalKeyProvider
 	Dialer      ws.Dialer
 	EventBuffer int
+	Backoff     ws.BackoffConfig
 	Clock       kis.Clock
 	Logger      *slog.Logger
 
@@ -52,6 +57,11 @@ type reconnectState struct {
 	mu   sync.Mutex
 	info ws.ReconnectInfo
 	seen bool
+}
+
+type terminalApprovalFailure interface {
+	cacheOnlyFailureSignal() <-chan struct{}
+	cacheOnlyFailure() error
 }
 
 func (s *reconnectState) record(info ws.ReconnectInfo) bool {
@@ -134,6 +144,7 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		Approval:    r.cfg.Approval,
 		Dialer:      dialer,
 		EventBuffer: r.cfg.EventBuffer,
+		Backoff:     r.cfg.Backoff,
 		Clock:       r.cfg.Clock,
 		// The KIS callback runs on its internal reader goroutine. Recording the
 		// latest value under a mutex is deliberately short and non-blocking.
@@ -144,11 +155,21 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		},
 	})
 	if err != nil {
+		if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
+			if terminal := observer.cacheOnlyFailure(); terminal != nil {
+				return terminal
+			}
+		}
 		return err
 	}
 	defer conn.Close()
 
 	if err := conn.Subscribe(ctx, tr, r.cfg.HTSID); err != nil {
+		if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
+			if terminal := observer.cacheOnlyFailure(); terminal != nil {
+				return terminal
+			}
+		}
 		return err
 	}
 	if r.cfg.Logger != nil {
@@ -160,9 +181,20 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+		var failure <-chan struct{}
+		var observer terminalApprovalFailure
+		if candidate, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
+			observer = candidate
+			failure = candidate.cacheOnlyFailureSignal()
+		}
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-failure:
+			if terminal := observer.cacheOnlyFailure(); terminal != nil {
+				_ = conn.Close()
+				return terminal
+			}
 		case event, open := <-conn.Events():
 			if !open {
 				if ctx.Err() != nil {
@@ -174,6 +206,11 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 			case out <- event:
 			case <-ctx.Done():
 				return nil
+			case <-failure:
+				if terminal := observer.cacheOnlyFailure(); terminal != nil {
+					_ = conn.Close()
+					return terminal
+				}
 			}
 		}
 	}
@@ -193,6 +230,9 @@ func endpointAndTR(endpoint string) (string, string, error) {
 // ProcessExitCode centralizes the PR1 session-occupied policy so a later
 // release can extend it without scattering OPSP8996 checks through main.
 func ProcessExitCode(err error) int {
+	if errors.Is(err, ErrCacheOnlyApprovalUnavailable) {
+		return ExitCodeCacheOnlyApprovalUnavailable
+	}
 	if errors.Is(err, ws.ErrSessionOccupied) {
 		return ExitCodeSessionOccupied
 	}

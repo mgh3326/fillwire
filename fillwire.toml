@@ -5,6 +5,7 @@
 broker = "kis"
 endpoint = "live" # live or mock; this also selects the matching KIS TR.
 account_mode = "live"
+approval_mode = "cache-only" # omit to retain Redis-first/REST fallback behavior.
 venue = "krx"
 hts_id = "EXAMPLE_HTS_ID"
 app_key_env = "KIS_APP_KEY"
