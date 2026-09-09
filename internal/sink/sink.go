@@ -279,19 +279,37 @@ func (r *Runner) DeliverOnce(ctx context.Context, messages []stream.Message) err
 	}
 
 	ackIDs := make([]string, 0, len(messages))
+	inserted, updated, unchanged, rejected := 0, 0, 0, 0
 	for index, result := range response.Results {
 		switch result.Status {
-		case "inserted", "updated", "unchanged":
+		case "inserted":
+			inserted++
 			ackIDs = append(ackIDs, messages[index].ID)
-			if result.Status == "unchanged" && messages[index].DupSuspect {
+		case "updated":
+			updated++
+			ackIDs = append(ackIDs, messages[index].ID)
+		case "unchanged":
+			unchanged++
+			ackIDs = append(ackIDs, messages[index].ID)
+			if messages[index].DupSuspect {
 				r.logDuplicateAbsorbed(messages[index])
 			}
 		case "rejected":
+			rejected++
 			// Leave it pending. Acknowledging an item the ledger rejected would
 			// discard evidence and make recovery impossible.
 		default:
 			return fmt.Errorf("sink: unrecognized ingest result status %q", result.Status)
 		}
+	}
+	if r.logger != nil {
+		r.logger.Info("ingest response statuses observed",
+			"batch_size", len(messages),
+			"inserted", inserted,
+			"updated", updated,
+			"unchanged", unchanged,
+			"rejected", rejected,
+		)
 	}
 	return r.queue.Ack(ctx, ackIDs...)
 }

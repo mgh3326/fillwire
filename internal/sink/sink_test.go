@@ -1,11 +1,13 @@
 package sink_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -275,6 +277,112 @@ func TestT6ResponseLengthMismatchAcksNothing(t *testing.T) {
 	}
 }
 
+func TestT23IngestStatusObservationCountsValidatedResponse(t *testing.T) {
+	client, queue, counters := testQueue(t, "consumer", 4, 0)
+	if err := queue.EnsureGroup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 4; index++ {
+		if _, err := queue.Enqueue(context.Background(), fixtureRecord(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages, err := queue.ReadNew(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 4 {
+		t.Fatalf("group messages = %d, want 4", len(messages))
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":4,"accepted":3,"rejected":1,"results":[{"status":"inserted","row_id":101,"reason":null},{"status":"updated","row_id":102,"reason":null},{"status":"unchanged","row_id":103,"reason":null},{"status":"rejected","row_id":null,"reason":"synthetic validation"}]}`))
+	}))
+	defer server.Close()
+	logger, logs := jsonTestLogger()
+	runner := testRunnerWithLogger(t, queue, server.URL, counters, logger)
+	if err := runner.DeliverOnce(context.Background(), messages); err != nil {
+		t.Fatalf("DeliverOnce = %v, want nil", err)
+	}
+	waitPending(t, client, 1)
+
+	records := jsonLogRecords(t, logs.String())
+	if len(records) != 1 {
+		t.Fatalf("status observation records = %d, want 1; logs=%q", len(records), logs.String())
+	}
+	record := records[0]
+	wantKeys := map[string]bool{"time": true, "level": true, "msg": true, "batch_size": true, "inserted": true, "updated": true, "unchanged": true, "rejected": true}
+	if len(record) != len(wantKeys) {
+		t.Fatalf("status observation fields = %#v, want only standard fields plus five counts", record)
+	}
+	for key := range record {
+		if !wantKeys[key] {
+			t.Errorf("unexpected status observation field %q", key)
+		}
+	}
+	if record["msg"] != "ingest response statuses observed" {
+		t.Errorf("message = %v, want ingest response statuses observed", record["msg"])
+	}
+	for key, want := range map[string]float64{"batch_size": 4, "inserted": 1, "updated": 1, "unchanged": 1, "rejected": 1} {
+		if got := record[key]; got != want {
+			t.Errorf("%s = %v, want %v", key, got, want)
+		}
+	}
+	for _, forbidden := range []string{"ORDER-", "test-token", "row_id", "reason", "results", "synthetic validation"} {
+		if strings.Contains(logs.String(), forbidden) {
+			t.Errorf("status observation log contains forbidden %q: %s", forbidden, logs.String())
+		}
+	}
+}
+
+func TestT24IngestStatusObservationFailsClosed(t *testing.T) {
+	tests := []struct {
+		name      string
+		batchSize int64
+		response  string
+	}{
+		{
+			name:      "length mismatch",
+			batchSize: 3,
+			response:  `{"source":"fillwire","source_run_id":null,"received":3,"accepted":2,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null},{"status":"updated","row_id":2,"reason":null}]}`,
+		},
+		{
+			name:      "late unknown status",
+			batchSize: 4,
+			response:  `{"source":"fillwire","source_run_id":null,"received":4,"accepted":3,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null},{"status":"updated","row_id":2,"reason":null},{"status":"unchanged","row_id":3,"reason":null},{"status":"unexpected","row_id":4,"reason":null}]}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, queue, counters := testQueue(t, "consumer", test.batchSize, 0)
+			if err := queue.EnsureGroup(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			for index := 1; index <= int(test.batchSize); index++ {
+				if _, err := queue.Enqueue(context.Background(), fixtureRecord(index)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			messages, err := queue.ReadNew(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(test.response))
+			}))
+			defer server.Close()
+			logger, logs := jsonTestLogger()
+			runner := testRunnerWithLogger(t, queue, server.URL, counters, logger)
+			if err := runner.DeliverOnce(context.Background(), messages); err == nil {
+				t.Fatal("DeliverOnce = nil, want malformed response error")
+			}
+			waitPending(t, client, test.batchSize)
+			if got := strings.TrimSpace(logs.String()); got != "" {
+				t.Fatalf("malformed response emitted status observation: %s", got)
+			}
+		})
+	}
+}
+
 func TestT21PartialXAckIsIdempotent(t *testing.T) {
 	client, queue, counters := testQueue(t, "consumer", 2, 0)
 	if err := queue.EnsureGroup(context.Background()); err != nil {
@@ -474,16 +582,42 @@ func testQueue(t *testing.T, consumer string, batchSize int64, claimMinIdle time
 }
 
 func testRunner(t *testing.T, queue *stream.Queue, url string, counters *decode.Counters) *sink.Runner {
+	return testRunnerWithLogger(t, queue, url, counters, nil)
+}
+
+func testRunnerWithLogger(t *testing.T, queue *stream.Queue, url string, counters *decode.Counters, logger *slog.Logger) *sink.Runner {
 	t.Helper()
 	client, err := sink.NewClient(sink.HTTPConfig{URL: url, Token: "test-token", Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner, err := sink.NewRunner(queue, client, sink.Config{RetryMin: time.Millisecond, RetryMax: 5 * time.Millisecond, Factor: 2, Counters: counters})
+	runner, err := sink.NewRunner(queue, client, sink.Config{RetryMin: time.Millisecond, RetryMax: 5 * time.Millisecond, Factor: 2, Logger: logger, Counters: counters})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return runner
+}
+
+func jsonTestLogger() (*slog.Logger, *bytes.Buffer) {
+	logs := &bytes.Buffer{}
+	return slog.New(slog.NewJSONHandler(logs, nil)), logs
+}
+
+func jsonLogRecords(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	records := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("invalid JSON log record %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	return records
 }
 
 func fixtureRecord(index int) decode.Record {

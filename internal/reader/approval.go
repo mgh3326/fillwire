@@ -3,6 +3,7 @@ package reader
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
@@ -15,14 +16,19 @@ const approvalCacheKey = "kis:websocket:approval_key"
 type ApprovalProvider struct {
 	redis    redis.UniversalClient
 	fallback ws.ApprovalKeyProvider
+	logger   *slog.Logger
 }
 
 // NewApprovalProvider constructs the Redis-first approval provider.
-func NewApprovalProvider(client redis.UniversalClient, fallback ws.ApprovalKeyProvider) (*ApprovalProvider, error) {
+func NewApprovalProvider(client redis.UniversalClient, fallback ws.ApprovalKeyProvider, loggers ...*slog.Logger) (*ApprovalProvider, error) {
 	if client == nil || fallback == nil {
 		return nil, errors.New("reader: redis client and approval fallback are required")
 	}
-	return &ApprovalProvider{redis: client, fallback: fallback}, nil
+	var logger *slog.Logger
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
+	return &ApprovalProvider{redis: client, fallback: fallback, logger: logger}, nil
 }
 
 // ApprovalKey returns a cached key if present, without a REST call. Redis
@@ -34,6 +40,9 @@ func (p *ApprovalProvider) ApprovalKey(ctx context.Context) (string, error) {
 		return key, nil
 	}
 	if errors.Is(err, redis.Nil) || (err == nil && key == "") {
+		if p.logger != nil {
+			p.logger.Info("KIS approval key REST issuance attempted")
+		}
 		return p.fallback.ApprovalKey(ctx)
 	}
 	return "", err
@@ -41,5 +50,8 @@ func (p *ApprovalProvider) ApprovalKey(ctx context.Context) (string, error) {
 
 // Reissue deliberately bypasses the cache and delegates REST reissuance.
 func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
+	if p.logger != nil {
+		p.logger.Info("KIS approval key REST reissue attempted")
+	}
 	return p.fallback.Reissue(ctx)
 }

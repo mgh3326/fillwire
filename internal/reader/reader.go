@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -29,6 +30,7 @@ type Config struct {
 	Dialer      ws.Dialer
 	EventBuffer int
 	Clock       kis.Clock
+	Logger      *slog.Logger
 
 	// dial is an internal test seam. Production always uses ws.Dial, while the
 	// public Dialer/Transport interfaces remain the integration seam for KIS.
@@ -52,7 +54,7 @@ type reconnectState struct {
 	seen bool
 }
 
-func (s *reconnectState) record(info ws.ReconnectInfo) {
+func (s *reconnectState) record(info ws.ReconnectInfo) bool {
 	s.mu.Lock()
 	// resubscribe runs beside the connection reader upstream. If it wakes after
 	// a terminal reconnect verdict, it can report its stale successful outcome
@@ -60,11 +62,12 @@ func (s *reconnectState) record(info ws.ReconnectInfo) {
 	// Events channel is closing and no future reconnect can occur.
 	if s.seen && s.info.Stopped && !info.Stopped {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	s.info = info
 	s.seen = true
 	s.mu.Unlock()
+	return true
 }
 
 func (s *reconnectState) stoppedError() error {
@@ -87,6 +90,25 @@ func (r *Reader) dial(ctx context.Context, cfg ws.Config) (session, error) {
 	return ws.Dial(ctx, cfg)
 }
 
+type observedDialer struct {
+	dialer ws.Dialer
+	logger *slog.Logger
+
+	mu     sync.Mutex
+	called bool
+}
+
+func (d *observedDialer) Dial(ctx context.Context, endpoint string) (ws.Transport, error) {
+	d.mu.Lock()
+	reconnect := d.called
+	d.called = true
+	d.mu.Unlock()
+	if reconnect && d.logger != nil {
+		d.logger.Info("KIS websocket reconnect attempted")
+	}
+	return d.dialer.Dial(ctx, endpoint)
+}
+
 // Run dials once, subscribes once, and drains Events until cancellation. The
 // out send is intentionally blocking: a full bounded channel applies
 // backpressure instead of silently dropping a fill.
@@ -103,15 +125,23 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 	}
 
 	var reconnect reconnectState
+	dialer := r.cfg.Dialer
+	if dialer != nil {
+		dialer = &observedDialer{dialer: dialer, logger: r.cfg.Logger}
+	}
 	conn, err := r.dial(ctx, ws.Config{
 		Endpoint:    endpoint,
 		Approval:    r.cfg.Approval,
-		Dialer:      r.cfg.Dialer,
+		Dialer:      dialer,
 		EventBuffer: r.cfg.EventBuffer,
 		Clock:       r.cfg.Clock,
 		// The KIS callback runs on its internal reader goroutine. Recording the
 		// latest value under a mutex is deliberately short and non-blocking.
-		OnReconnect: reconnect.record,
+		OnReconnect: func(info ws.ReconnectInfo) {
+			if reconnect.record(info) && !info.Stopped && info.Err == nil && r.cfg.Logger != nil {
+				r.cfg.Logger.Info("KIS websocket reconnect callback observed")
+			}
+		},
 	})
 	if err != nil {
 		return err
@@ -120,6 +150,9 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 
 	if err := conn.Subscribe(ctx, tr, r.cfg.HTSID); err != nil {
 		return err
+	}
+	if r.cfg.Logger != nil {
+		r.cfg.Logger.Info("KIS websocket initial subscription active")
 	}
 	for {
 		// Prefer the caller's shutdown over a simultaneously closed Events

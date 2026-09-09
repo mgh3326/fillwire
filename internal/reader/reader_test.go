@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -136,6 +138,20 @@ func occupiedSubscribe(t *fakeTransport, raw []byte) {
 	t.push(`{"header":{"tr_id":"` + request.Body.Input.TRID + `"},"body":{"rt_cd":"1","msg_cd":"OPSP8996","msg1":"session occupied","output":{}}}`)
 }
 
+func rejectedResubscribe(t *fakeTransport, raw []byte) {
+	var request struct {
+		Body struct {
+			Input struct {
+				TRID string `json:"tr_id"`
+			} `json:"input"`
+		} `json:"body"`
+	}
+	if json.Unmarshal(raw, &request) != nil {
+		return
+	}
+	t.push(`{"header":{"tr_id":"` + request.Body.Input.TRID + `"},"body":{"rt_cd":"1","msg_cd":"MCA99999","msg1":"subscription rejected","output":{}}}`)
+}
+
 func readerConfig(transport *fakeTransport, approval ws.ApprovalKeyProvider) fillreader.Config {
 	return fillreader.Config{
 		Endpoint: "live",
@@ -246,9 +262,12 @@ func TestT1NormalPipeline(t *testing.T) {
 
 func TestT7SessionOccupied(t *testing.T) {
 	transport := newFakeTransport(occupiedSubscribe)
+	logger, logs := readerJSONLogger()
+	cfg := readerConfig(transport, &fakeApproval{})
+	cfg.Logger = logger
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	err := fillreader.New(readerConfig(transport, &fakeApproval{})).Run(ctx, make(chan ws.Event, 1))
+	err := fillreader.New(cfg).Run(ctx, make(chan ws.Event, 1))
 	if !errors.Is(err, ws.ErrSessionOccupied) {
 		t.Fatalf("error = %v, want ErrSessionOccupied", err)
 	}
@@ -257,6 +276,9 @@ func TestT7SessionOccupied(t *testing.T) {
 	}
 	if got := transport.writes.Load(); got != 1 {
 		t.Fatalf("subscribe writes = %d, want 1 (no retry)", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket initial subscription active"); got != 0 {
+		t.Fatalf("initial subscription events = %d, want 0 after failed subscription", got)
 	}
 }
 
@@ -314,6 +336,194 @@ func TestT18ReconnectSessionOccupiedStopsReader(t *testing.T) {
 	}
 }
 
+func TestT25WebsocketLifecycleObservations(t *testing.T) {
+	first := newFakeTransport(successfulSubscribe)
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSecond) }) }
+	t.Cleanup(release)
+	second := newFakeTransport(func(transport *fakeTransport, raw []byte) {
+		<-releaseSecond
+		successfulSubscribe(transport, raw)
+	})
+	approval := &fakeApproval{}
+	logger, logs := readerJSONLogger()
+	var dials atomic.Int32
+	cfg := readerConfig(first, approval)
+	cfg.Logger = logger
+	cfg.Dialer = ws.DialerFunc(func(context.Context, string) (ws.Transport, error) {
+		switch dials.Add(1) {
+		case 1:
+			return first, nil
+		case 2:
+			return second, nil
+		default:
+			return nil, errors.New("unexpected additional KIS dial")
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, make(chan ws.Event, 1)) }()
+	select {
+	case <-first.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("initial KIS subscription did not complete")
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket initial subscription active", 1)
+	first.drop()
+	select {
+	case <-second.subscribed:
+		t.Fatal("reconnect subscription completed before its release")
+	case <-time.After(time.Millisecond * 10):
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect attempted", 1)
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 0 {
+		t.Fatalf("reconnect success events before resubscribe = %d, want 0", got)
+	}
+	release()
+	select {
+	case <-second.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect KIS subscription did not complete")
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect callback observed", 1)
+
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket initial subscription active"); got != 1 {
+		t.Fatalf("initial subscription events = %d, want 1", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect attempted"); got != 1 {
+		t.Fatalf("reconnect attempt events = %d, want 1", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 1 {
+		t.Fatalf("reconnect callback observation events = %d, want 1", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("reader returned %v", err)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("KIS dials = %d, want initial plus one reconnect", got)
+	}
+}
+
+func TestT26WebsocketReconnectAttemptObservedWhenDialFails(t *testing.T) {
+	first := newFakeTransport(successfulSubscribe)
+	approval := &fakeApproval{}
+	logger, logs := readerJSONLogger()
+	redialEntered := make(chan struct{}, 1)
+	var dials atomic.Int32
+	cfg := readerConfig(first, approval)
+	cfg.Logger = logger
+	cfg.Dialer = ws.DialerFunc(func(ctx context.Context, _ string) (ws.Transport, error) {
+		switch dials.Add(1) {
+		case 1:
+			return first, nil
+		case 2:
+			redialEntered <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		default:
+			return nil, errors.New("unexpected additional KIS dial")
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, make(chan ws.Event, 1)) }()
+	select {
+	case <-first.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("initial KIS subscription did not complete")
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket initial subscription active", 1)
+	first.drop()
+	select {
+	case <-redialEntered:
+	case <-time.After(time.Second):
+		t.Fatal("failed reconnect dial was not attempted")
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect attempted", 1)
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 0 {
+		t.Fatalf("reconnect callback observation events after failed dial = %d, want 0", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("reader returned %v", err)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("KIS dials = %d, want initial plus failed reconnect", got)
+	}
+}
+
+func TestT27WebsocketReconnectCallbackObservedAfterRejectedResubscribe(t *testing.T) {
+	first := newFakeTransport(successfulSubscribe)
+	rejectionSeen := make(chan struct{}, 1)
+	second := newFakeTransport(func(transport *fakeTransport, raw []byte) {
+		rejectedResubscribe(transport, raw)
+		select {
+		case rejectionSeen <- struct{}{}:
+		default:
+		}
+	})
+	approval := &fakeApproval{}
+	logger, logs := readerJSONLogger()
+	var dials atomic.Int32
+	cfg := readerConfig(first, approval)
+	cfg.Logger = logger
+	cfg.Dialer = ws.DialerFunc(func(context.Context, string) (ws.Transport, error) {
+		switch dials.Add(1) {
+		case 1:
+			return first, nil
+		case 2:
+			return second, nil
+		default:
+			return nil, errors.New("unexpected additional KIS dial")
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, make(chan ws.Event, 1)) }()
+	select {
+	case <-first.subscribed:
+	case <-time.After(time.Second):
+		t.Fatal("initial KIS subscription did not complete")
+	}
+	waitReaderLogMessage(t, logs, "KIS websocket initial subscription active", 1)
+	first.drop()
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect attempted", 1)
+	waitReaderLogMessage(t, logs, "KIS websocket reconnect callback observed", 1)
+	select {
+	case <-rejectionSeen:
+	case <-time.After(time.Second):
+		t.Fatal("rejected resubscribe was not exercised")
+	}
+
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect attempted"); got != 1 {
+		t.Fatalf("reconnect attempt events = %d, want 1", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 1 {
+		t.Fatalf("reconnect callback observation events = %d, want 1", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect succeeded"); got != 0 {
+		t.Fatalf("legacy reconnect success events = %d, want 0", got)
+	}
+	if strings.Contains(logs.String(), "MCA99999") {
+		t.Fatalf("rejection code leaked into lifecycle logs: %q", logs.String())
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("reader returned %v", err)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("KIS dials = %d, want initial plus one reconnect", got)
+	}
+}
+
 func TestT10Backpressure(t *testing.T) {
 	transport := newFakeTransport(successfulSubscribe)
 	out := make(chan ws.Event, 1)
@@ -354,7 +564,8 @@ func TestT11ApprovalProvider(t *testing.T) {
 	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
 	defer redisClient.Close()
 	fallback := &fakeApproval{}
-	provider, err := fillreader.NewApprovalProvider(redisClient, fallback)
+	logger, logs := readerJSONLogger()
+	provider, err := fillreader.NewApprovalProvider(redisClient, fallback, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +580,9 @@ func TestT11ApprovalProvider(t *testing.T) {
 	if got := fallback.approvalCalls.Load(); got != 0 {
 		t.Fatalf("REST fallback calls with cache = %d, want 0", got)
 	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST issuance attempted"); got != 0 {
+		t.Fatalf("REST issuance events with cache = %d, want 0", got)
+	}
 	if err := redisClient.Del(ctx, "kis:websocket:approval_key").Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -379,12 +593,109 @@ func TestT11ApprovalProvider(t *testing.T) {
 	if got := fallback.approvalCalls.Load(); got != 1 {
 		t.Fatalf("REST fallback calls after miss = %d, want 1", got)
 	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST issuance attempted"); got != 1 {
+		t.Fatalf("REST issuance events after miss = %d, want 1", got)
+	}
+	if err := redisClient.Set(ctx, "kis:websocket:approval_key", "", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.ApprovalKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := fallback.approvalCalls.Load(); got != 2 {
+		t.Fatalf("REST fallback calls after empty key = %d, want 2", got)
+	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST issuance attempted"); got != 2 {
+		t.Fatalf("REST issuance events after empty key = %d, want 2", got)
+	}
 	if _, err := provider.Reissue(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if got := fallback.reissueCalls.Load(); got != 1 {
 		t.Fatalf("reissue calls = %d, want 1", got)
 	}
+	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST reissue attempted"); got != 1 {
+		t.Fatalf("REST reissue events = %d, want 1", got)
+	}
+	mini.Close()
+	if _, err := provider.ApprovalKey(ctx); err == nil {
+		t.Fatal("Redis error = nil, want surfaced error")
+	}
+	if got := fallback.approvalCalls.Load(); got != 2 {
+		t.Fatalf("REST fallback calls after Redis error = %d, want 2", got)
+	}
+	for _, record := range readerLogRecords(t, logs.String()) {
+		if len(record) != 3 {
+			t.Errorf("approval observation fields = %#v, want standard fields only", record)
+		}
+	}
+	for _, forbidden := range []string{"cached-fixture", "fixture-reissued", "kis:websocket:approval_key", "redis"} {
+		if strings.Contains(logs.String(), forbidden) {
+			t.Errorf("approval observation log contains forbidden %q: %s", forbidden, logs.String())
+		}
+	}
+}
+
+type logCapture struct {
+	mu   sync.Mutex
+	data bytes.Buffer
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.data.Write(p)
+}
+
+func (c *logCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.data.String()
+}
+
+func readerJSONLogger() (*slog.Logger, *logCapture) {
+	logs := &logCapture{}
+	return slog.New(slog.NewJSONHandler(logs, nil)), logs
+}
+
+func readerLogRecords(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	records := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("invalid JSON log record %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func readerLogMessageCount(t *testing.T, raw, message string) int {
+	t.Helper()
+	count := 0
+	for _, record := range readerLogRecords(t, raw) {
+		if record["msg"] == message {
+			count++
+		}
+	}
+	return count
+}
+
+func waitReaderLogMessage(t *testing.T, logs *logCapture, message string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := readerLogMessageCount(t, logs.String(), message); got >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("log message %q count = %d, want at least %d; logs=%q", message, readerLogMessageCount(t, logs.String(), message), want, logs.String())
 }
 
 func assertJSONEqual(t *testing.T, want, got []byte) {
