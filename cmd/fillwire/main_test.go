@@ -303,7 +303,10 @@ factor = 2
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(os.Args[0], "-test.run=^TestCacheOnlyMissMainProcessExit78$", "-test.v")
+	const childTimeout = 10 * time.Second
+	childCtx, cancelChild := context.WithTimeout(context.Background(), childTimeout)
+	defer cancelChild()
+	command := exec.CommandContext(childCtx, os.Args[0], "-test.run=^TestCacheOnlyMissMainProcessExit78$", "-test.v")
 	command.Env = append(os.Environ(),
 		"FILLWIRE_CACHE_ONLY_EXIT_CHILD=1",
 		"FILLWIRE_CACHE_ONLY_CONFIG="+configPath,
@@ -312,6 +315,9 @@ factor = 2
 		"FILLWIRE_TEST_INGEST_TOKEN=synthetic-ingest-token",
 	)
 	output, err := command.CombinedOutput()
+	if errors.Is(childCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("child process timed out after %s; output = %s", childTimeout, output)
+	}
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
 		t.Fatalf("child error = %v, output = %s", err, output)
