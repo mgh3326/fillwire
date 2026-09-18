@@ -12,12 +12,14 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# STATE_DIR, --env-file, and --volume paths are host-specific placeholders.
-# The EnvironmentFile holds exactly one line, IMAGE=<repo>@sha256:<digest>;
-# see docs/digest-pin-deploy.md. It is required (no '-' prefix) so the unit
-# can never start an unpinned image.
-Environment=STATE_DIR=/var/lib/fillwire
-EnvironmentFile=${STATE_DIR}/fillwire.service.image
+# The EnvironmentFile, --env-file, and --volume paths are host-specific
+# placeholders. EnvironmentFile must be an absolute path: systemd expands
+# only '%' specifiers there, never $VARIABLES (config_parse_unit_env_file
+# uses unit_full_printf), so a ${STATE_DIR}-style indirection would read
+# nothing and leave ${IMAGE} empty. No '-' prefix: a missing pin file must
+# fail the unit rather than start an unpinned image. The file holds exactly
+# one line, IMAGE=<repo>@sha256:<digest>; see docs/digest-pin-deploy.md.
+EnvironmentFile=/var/lib/fillwire/fillwire.service.image
 ExecStartPre=-/usr/bin/docker rm -f fillwire
 # Secrets arrive only through --env-file (KIS_APP_KEY, KIS_APP_SECRET,
 # EXECUTION_LEDGER_INGEST_TOKEN, referenced by name in the TOML). The TOML
@@ -30,9 +32,9 @@ RestartSec=5
 # (for example the python at-kis-ws process); retrying can never clear it.
 # Exit 78 = the Redis-cached approval key is permanently unavailable in
 # cache-only mode. Both need operator action, so they must not consume the
-# StartLimitBurst budget. Requires systemd >= 254; older releases log an
-# unknown-directive warning and the StartLimit* bound above still caps the
-# loop.
+# StartLimitBurst budget. The directive exists since systemd v189
+# (systemd NEWS); on older releases it is ignored and the StartLimit*
+# bound above still caps the loop.
 RestartPreventExitStatus=42 78
 
 [Install]
