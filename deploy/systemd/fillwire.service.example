@@ -1,0 +1,41 @@
+[Unit]
+Description=fillwire KIS execution-fill ingest container (digest pinned)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+# Crash-loop guard: during the 2026-09-18 first start the native unit
+# restart-looped to NRestarts=11 (RestartSec=5s) on a permanently occupied
+# KIS app key. Bound the restart rate so a persistent failure trips the
+# unit into failed state for an operator instead of looping forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The EnvironmentFile, --env-file, and --volume paths are host-specific
+# placeholders. EnvironmentFile must be an absolute path: systemd expands
+# only '%' specifiers there, never $VARIABLES (config_parse_unit_env_file
+# uses unit_full_printf), so a ${STATE_DIR}-style indirection would read
+# nothing and leave ${IMAGE} empty. No '-' prefix: a missing pin file must
+# fail the unit rather than start an unpinned image. The file holds exactly
+# one line, IMAGE=<repo>@sha256:<digest>; see docs/digest-pin-deploy.md.
+EnvironmentFile=/var/lib/fillwire/fillwire.service.image
+ExecStartPre=-/usr/bin/docker rm -f fillwire
+# Secrets arrive only through --env-file (KIS_APP_KEY, KIS_APP_SECRET,
+# EXECUTION_LEDGER_INGEST_TOKEN, referenced by name in the TOML). The TOML
+# itself is mounted read-only; the image is always ${IMAGE}, never a tag.
+ExecStart=/usr/bin/docker run --rm --name fillwire --network host --env-file /etc/fillwire/fillwire.env --volume /etc/fillwire/fillwire.toml:/etc/fillwire/fillwire.toml:ro ${IMAGE} -config /etc/fillwire/fillwire.toml
+ExecStop=/usr/bin/docker stop --time 30 fillwire
+Restart=always
+RestartSec=5
+# Exit 42 = KIS OPSP8996: the app key already holds a websocket session
+# (for example the python at-kis-ws process); retrying can never clear it.
+# Exit 78 = the Redis-cached approval key is permanently unavailable in
+# cache-only mode. Both need operator action, so they must not consume the
+# StartLimitBurst budget. The directive exists since systemd v189
+# (systemd NEWS); on older releases it is ignored and the StartLimit*
+# bound above still caps the loop.
+RestartPreventExitStatus=42 78
+
+[Install]
+WantedBy=multi-user.target
