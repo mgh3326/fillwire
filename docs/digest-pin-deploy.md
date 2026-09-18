@@ -20,12 +20,19 @@ Container contract (see `deploy/systemd/fillwire.service.example`):
   holds exactly one line, `IMAGE=ghcr.io/mgh3326/fillwire@sha256:<64 hex>`.
   Tags are never deployed.
 
-Pin-state files (default `STATE_DIR=/var/lib/fillwire`):
+Pin-state files (the unit's `EnvironmentFile` points at
+`/var/lib/fillwire/fillwire.service.image`; the rest of the directory is
+the pin history):
 
 ```text
-/var/lib/fillwire/fillwire.service.image          # current pin
-/var/lib/fillwire/fillwire.service.image.previous # previous pin, for rollback
+/var/lib/fillwire/fillwire.service.image            # current pin
+/var/lib/fillwire/fillwire.service.image.previous   # most recent pre-deploy pin
+/var/lib/fillwire/fillwire.service.image.<UTC>      # per-deploy history snapshot
 ```
+
+A history snapshot is written before every pin change, so the directory
+accumulates the full pin lineage — after deploys A→B→C the history holds A
+and B, and any recorded digest can be restored, not just the latest.
 
 ## Finding the digest for a commit
 
@@ -54,9 +61,11 @@ docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/mgh3326/fillwir
 All commands run on the target host. `<digest>` is the full
 `sha256:<64 hex>` value found above.
 
-1. Record the current pin as previous, then write the new pin:
+1. Snapshot the current pin into the UTC-stamped history, refresh
+   `.previous`, then write the new pin:
 
    ```sh
+   sudo cp /var/lib/fillwire/fillwire.service.image "/var/lib/fillwire/fillwire.service.image.$(date -u +%Y%m%dT%H%M%SZ)"
    sudo cp /var/lib/fillwire/fillwire.service.image /var/lib/fillwire/fillwire.service.image.previous
    printf 'IMAGE=ghcr.io/mgh3326/fillwire@%s\n' '<digest>' | sudo tee /var/lib/fillwire/fillwire.service.image
    ```
@@ -94,17 +103,51 @@ All commands run on the target host. `<digest>` is the full
 
 ## Roll back
 
-Rollback is restoring the previous pin and restarting. The previous digest
-lives in `/var/lib/fillwire/fillwire.service.image.previous` (written at step
-1 of every deploy).
+Rollback is restoring an earlier pin from the history and restarting. The
+history is the `/var/lib/fillwire/fillwire.service.image.<UTC>` files — one
+per replaced pin — so you can return to any recorded digest, not only the
+one in `.previous` (after deploys A→B→C, the original A is still on disk).
+
+1. Snapshot the current pin first — this is what makes a failed rollback
+   undoable:
+
+   ```sh
+   sudo cp /var/lib/fillwire/fillwire.service.image "/var/lib/fillwire/fillwire.service.image.$(date -u +%Y%m%dT%H%M%SZ)"
+   ```
+
+2. List the history and pick the file holding the wanted digest:
+
+   ```sh
+   ls -t /var/lib/fillwire
+   cat /var/lib/fillwire/fillwire.service.image.<stamp>
+   # confirm the single IMAGE= line shows the digest you want
+   ```
+
+3. Restore it, pull it, restart:
+
+   ```sh
+   sudo cp /var/lib/fillwire/fillwire.service.image.<stamp> /var/lib/fillwire/fillwire.service.image
+   sudo docker pull "$(cut -d= -f2 /var/lib/fillwire/fillwire.service.image)"
+   sudo systemctl restart fillwire.service
+   ```
+
+Then re-run the same three verification commands from deploy step 4.
+
+### Undoing a failed rollback
+
+If the rolled-back unit fails verification, the pre-rollback pin is the
+newest history file — the snapshot written in rollback step 1. Restore it
+the same way:
 
 ```sh
-sudo cp /var/lib/fillwire/fillwire.service.image.previous /var/lib/fillwire/fillwire.service.image
+ls -t /var/lib/fillwire
+cat /var/lib/fillwire/fillwire.service.image.<newest-stamp>
+sudo cp /var/lib/fillwire/fillwire.service.image.<newest-stamp> /var/lib/fillwire/fillwire.service.image
 sudo docker pull "$(cut -d= -f2 /var/lib/fillwire/fillwire.service.image)"
 sudo systemctl restart fillwire.service
 ```
 
-Then re-run the same three verification commands from deploy step 4.
+Then verify again. If that also fails, escalate — do not keep cycling pins.
 
 ## Alternating with python at-kis-ws
 
@@ -171,8 +214,9 @@ native `fillwire.service`. Perform this once, in a deploy window, with
    ```
 
 4. Install the container unit over the same unit name, adapted from
-   `deploy/systemd/fillwire.service.example` (edit `STATE_DIR`, `--env-file`,
-   and `--volume` paths to the host's real locations), then reload and start:
+   `deploy/systemd/fillwire.service.example` (edit the `EnvironmentFile`,
+   `--env-file`, and `--volume` paths to the host's real locations), then
+   reload and start:
 
    ```sh
    sudoedit /etc/systemd/system/fillwire.service
@@ -182,9 +226,20 @@ native `fillwire.service`. Perform this once, in a deploy window, with
    sudo systemctl start fillwire.service
    ```
 
-5. Re-run the deploy step-4 verification. To return to the native binary,
-   restore the backup over `/etc/systemd/system/fillwire.service`,
-   `sudo systemctl daemon-reload`, then `sudo systemctl enable --now fillwire.service`.
+5. Re-run the deploy step-4 verification.
+
+To return to the native binary, stop the container **first** — the same
+one-websocket-per-app-key rule as `at-kis-ws` applies, so the native
+binary must not start while the container could still hold the session:
+
+```sh
+sudo systemctl stop fillwire.service
+docker ps --format '{{.Names}}'
+# expected: no fillwire line — the container must be gone before continuing
+sudo cp /root/fillwire-native-backup/fillwire.service /etc/systemd/system/fillwire.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fillwire.service
+```
 
 ## Health surface
 
