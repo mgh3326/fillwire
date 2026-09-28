@@ -31,14 +31,15 @@ Fillwire does not implement restart handoff, a reconcile-trigger client, a local
 
 ## Configuration
 
-[`fillwire.toml`](fillwire.toml) is an example-only configuration. The ingest credential is referenced by environment-variable name; its value never appears in the configuration or logs. The KIS REST fallback likewise takes application credentials from environment-variable names.
+[`fillwire.toml`](fillwire.toml) is an example-only configuration. The ingest and KIS credentials are referenced by environment-variable name; their values never appear in the configuration or logs.
 
 ```toml
 [kis]
 broker = "kis"
 endpoint = "live"
 account_mode = "live"
-approval_mode = "cache-only"
+approval_mode = ""
+approval_refresh_margin = "1h"
 venue = "krx"
 hts_id = "EXAMPLE_HTS_ID"
 app_key_env = "KIS_APP_KEY"
@@ -71,6 +72,9 @@ drain_timeout = "5s"
 min = "1s"
 max = "30s"
 factor = 2
+
+[alerts]
+rate_limit = "10m"
 ```
 
 The default approval policy shares the Python at-kis-ws Redis approval contract. The
@@ -88,11 +92,16 @@ deadline. Publishing checks lock ownership atomically; a late holder cannot
 write or release a successor's lock. The provider reads Redis TTL rather than
 assuming its local clock agrees with Redis.
 
-The kis.approval_refresh_margin setting defaults to 1h. A key with Redis TTL
+The kis.approval_refresh_margin setting defaults to 1h and must be greater
+than zero and no more than 2h. A key with Redis TTL
 at or below that margin is refreshed under the same lock; a background loop
 checks the TTL at least once per minute even if no resubscribe occurs.
 Resubscribe also checks the margin. Racing timer and subscribe paths share the
-lock and reuse the published key. The optional cache-only policy retains its
+lock and reuse the published key. A failed refresh while the old key still
+has positive Redis TTL keeps the existing stream alive and retries in-process
+with bounded jittered backoff. A resubscribe may use that still-live key after
+a non-forced refresh failure. An absent or expired key remains a transient
+process failure, and forced reissue never reuses a KIS-rejected key. The optional cache-only policy retains its
 operator-controlled behavior: missing or empty cache exits 78 without REST.
 Redis failure remains transient, including in cache-only mode.
 

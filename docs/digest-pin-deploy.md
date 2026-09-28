@@ -12,7 +12,9 @@ Container contract (see `deploy/systemd/fillwire.service.example`):
 - `docker run --rm --network host` — KIS websocket, Redis TLS, and the ingest
   POST all use the host network; nothing is published.
 - Secrets arrive only through `--env-file` (`KIS_APP_KEY`, `KIS_APP_SECRET`,
-  `EXECUTION_LEDGER_INGEST_TOKEN`, referenced by name in the TOML). No secret
+  `EXECUTION_LEDGER_INGEST_TOKEN`, `FILLWIRE_ALERT_TELEGRAM_BOT_TOKEN`, and
+  `FILLWIRE_ALERT_TELEGRAM_CHAT_ID`; the first three are referenced by name
+  in the TOML). No secret
   is ever a build arg or an image layer.
 - The TOML is bind-mounted read-only; the binary is invoked as
   `fillwire -config <in-container path>`.
@@ -257,11 +259,15 @@ curl gate; that is a design note only and no code is added here.
 
 ## Task 180 re-observation plan (operator window only)
 
-This is a plan, not an observation record. The desk must wire the real
-Telegram bot token and chat ID at deploy; do not put them in this runbook.
+This is a plan, not an observation record. Before starting the window, the
+desk updates the host /etc/fillwire/fillwire.toml to set approval_mode = ""
+and approval_refresh_margin = "1h". A host TOML left at approval_mode =
+"cache-only" will not self-issue at the 23-hour boundary. The desk also wires
+FILLWIRE_ALERT_TELEGRAM_BOT_TOKEN and FILLWIRE_ALERT_TELEGRAM_CHAT_ID in
+/etc/fillwire/fillwire.env at deploy. Keep real values out of this runbook.
 During a scheduled window, stop at-kis-ws and verify it is inactive before
 starting fillwire. Keep at-kis-ws stopped while fillwire owns the KIS session.
-Observe across the 23-hour Redis approval-cache boundary and at least one
+The desk performs the observation across the 23-hour Redis approval-cache boundary and at least one
 Korean market session. Record the approval_rest_issue_call and lock contention
 log counts, cache TTL, restart count, fill ingress, and Telegram delivery
 outcome without recording key or credential values. A healthy boundary has

@@ -36,7 +36,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, cfg, logger); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(ctx, cfg, logger, alerter); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("fillwire stopped", "reason", safeRuntimeError(err))
 		os.Exit(exitCodeWithAlert(err, alerter))
 	}
@@ -55,14 +55,15 @@ func exitCodeWithAlert(err error, alerter alert.Alerter) int {
 	return code
 }
 
-func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
-	return runWithDependencies(ctx, cfg, logger, runDependencies{})
+func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, alerter alert.Alerter) error {
+	return runWithDependencies(ctx, cfg, logger, runDependencies{alerter: alerter})
 }
 
 type runDependencies struct {
 	approvalRedis    redis.UniversalClient
 	approvalFallback ws.ApprovalKeyProvider
 	dialer           ws.Dialer
+	alerter          alert.Alerter
 }
 
 type kisApprovalIssuer struct{ client *kis.Client }
@@ -118,6 +119,11 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	approval, err := reader.NewApprovalProviderConfig(approvalRedis, issuer, cfg.KIS.ApprovalMode, cfg.KIS.AccountMode, margin, logger)
 	if err != nil {
 		return err
+	}
+	if dependencies.alerter != nil {
+		approval.SetTransientAlert(func() {
+			dependencies.alerter.Alert(context.Background(), "transient", "fillwire approval refresh failed; retrying while cached key remains valid")
+		})
 	}
 
 	counters := decode.NewCounters()

@@ -10,6 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/mgh3326/fillwire/internal/reader"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestTelegramSendSuppressionAndFailure(t *testing.T) {
@@ -59,5 +63,74 @@ func TestMissingTelegramEnvironmentDisablesWithOneLoudLog(t *testing.T) {
 	a.Alert(context.Background(), "configuration", "synthetic failure")
 	if strings.Count(logs.String(), "Telegram alerting disabled") != 1 {
 		t.Fatalf("disabled log count = %d", strings.Count(logs.String(), "Telegram alerting disabled"))
+	}
+}
+
+type fakeApprovalHTTP struct {
+	url    string
+	client *http.Client
+}
+
+func (i fakeApprovalHTTP) Issue(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.url+"/oauth2/Approval", strings.NewReader(`{"appkey":"fixture","secretkey":"fixture"}`))
+	if err != nil {
+		return "", err
+	}
+	response, err := i.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		return "", reader.ErrApprovalUnavailable
+	}
+	return "new-key", nil
+}
+func TestRecoverableApprovalFailureUsesTelegramRateLimit(t *testing.T) {
+	mini := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	defer client.Close()
+	var approvalCalls, telegramCalls atomic.Int32
+	approvalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { approvalCalls.Add(1); w.WriteHeader(503) }))
+	defer approvalServer.Close()
+	telegramServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if telegramCalls.Add(1) == 2 {
+			w.WriteHeader(500)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer telegramServer.Close()
+	fakeNow := time.Now()
+	var logs strings.Builder
+	a := &Telegram{token: "fixture-bot", chat: "fixture-chat", endpoint: telegramServer.URL + "/botfixture-bot/sendMessage", client: telegramServer.Client(), logger: slog.New(slog.NewTextHandler(&logs, nil)), interval: 10 * time.Minute, now: func() time.Time { return fakeNow }, last: map[string]time.Time{}}
+	p, err := reader.NewApprovalProviderConfig(client, fakeApprovalHTTP{approvalServer.URL, approvalServer.Client()}, "", "live", reader.DefaultRefreshMargin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetTransientAlert(func() {
+		a.Alert(context.Background(), "transient", "fillwire approval refresh failed; retrying while cached key remains valid")
+	})
+	mini.Set("kis:websocket:approval_key", "still-live")
+	mini.SetTTL("kis:websocket:approval_key", 30*time.Minute)
+	for i := 0; i < 3; i++ {
+		key, err := p.ApprovalKey(context.Background())
+		if err != nil || key != "still-live" {
+			t.Fatalf("recoverable approval %d = %q, %v", i, key, err)
+		}
+	}
+	if telegramCalls.Load() != 1 {
+		t.Fatalf("Telegram sends inside one interval = %d, want 1", telegramCalls.Load())
+	}
+	fakeNow = fakeNow.Add(10 * time.Minute)
+	key, err := p.ApprovalKey(context.Background())
+	if err != nil || key != "still-live" {
+		t.Fatalf("failed Telegram delivery changed key result = %q, %v", key, err)
+	}
+	if telegramCalls.Load() != 2 || approvalCalls.Load() != 4 {
+		t.Fatalf("Telegram sends=%d REST attempts=%d, want 2 and 4", telegramCalls.Load(), approvalCalls.Load())
+	}
+	if !strings.Contains(logs.String(), "Telegram alert delivery failed") || strings.Contains(logs.String(), "fixture-bot") || strings.Contains(logs.String(), "still-live") {
+		t.Fatal("Telegram failure log missing or leaked values")
 	}
 }

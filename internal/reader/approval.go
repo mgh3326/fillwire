@@ -26,7 +26,10 @@ const (
 	ApprovalPoll          = 250 * time.Millisecond
 	ApprovalIssueTimeout  = 10 * time.Second
 	DefaultRefreshMargin  = time.Hour
+	MaxRefreshMargin      = 2 * time.Hour
 	publishDeadline       = 14 * time.Second
+	refreshRetryMin       = time.Second
+	refreshRetryMax       = 30 * time.Second
 )
 
 const approvalCacheKey = "kis:websocket:approval_key"
@@ -69,6 +72,8 @@ type ApprovalProvider struct {
 
 	mu          sync.Mutex
 	lastKey     string
+	knownUntil  time.Time
+	onTransient func()
 	failureOnce sync.Once
 	failureCh   chan struct{}
 	failureErr  error
@@ -93,13 +98,17 @@ func NewApprovalProviderWithMode(client redis.UniversalClient, fallback ws.Appro
 }
 
 func NewApprovalProviderConfig(client redis.UniversalClient, issuer ApprovalIssuer, mode, accountMode string, margin time.Duration, logger *slog.Logger) (*ApprovalProvider, error) {
-	if client == nil || issuer == nil || (mode != "" && mode != ApprovalModeCacheOnly) || (accountMode != "live" && accountMode != "mock") || margin <= 0 || margin >= ApprovalCacheTTL {
+	if client == nil || issuer == nil || (mode != "" && mode != ApprovalModeCacheOnly) || (accountMode != "live" && accountMode != "mock") || margin <= 0 || margin > MaxRefreshMargin {
 		return nil, ErrApprovalConfig
 	}
 	return &ApprovalProvider{redis: client, issuer: issuer, logger: logger, mode: mode, accountMode: accountMode, margin: margin, metrics: &ApprovalMetrics{}, now: time.Now, wait: realWait, failureCh: make(chan struct{})}, nil
 }
 
 func (p *ApprovalProvider) Metrics() *ApprovalMetrics { return p.metrics }
+
+// SetTransientAlert reports recoverable refresh failures through the process
+// alerter. The alerter owns class-based rate limiting and delivery timeouts.
+func (p *ApprovalProvider) SetTransientAlert(fn func()) { p.onTransient = fn }
 func (p *ApprovalProvider) cacheKey() string {
 	if p.accountMode == "mock" {
 		return "kis_mock:websocket:approval_key"
@@ -133,28 +142,52 @@ func (p *ApprovalProvider) cached(ctx context.Context) (string, time.Duration, e
 func usable(key string, ttl, margin time.Duration) bool {
 	return strings.TrimSpace(key) != "" && ttl > margin
 }
+func live(key string, ttl time.Duration) bool { return strings.TrimSpace(key) != "" && ttl > 0 }
 
 func (p *ApprovalProvider) ApprovalKey(ctx context.Context) (string, error) {
 	key, ttl, err := p.cached(ctx)
 	if p.mode == ApprovalModeCacheOnly {
 		if err != nil {
-			return p.fail(err)
+			return p.terminal(err)
 		}
 		if strings.TrimSpace(key) == "" {
 			p.markFailure(ErrCacheOnlyApprovalUnavailable)
 			return "", ErrCacheOnlyApprovalUnavailable
 		}
-		p.remember(key)
+		p.noteLive(ttl)
+		p.present(key)
 		return key, nil
 	}
 	if err != nil {
-		return p.fail(err)
+		return p.terminal(err)
 	}
 	if usable(key, ttl, p.margin) {
-		p.remember(key)
+		p.noteLive(ttl)
+		p.present(key)
 		return key, nil
 	}
-	return p.singleFlight(ctx, false, "")
+	if live(key, ttl) {
+		p.noteLive(ttl)
+	}
+	issued, err := p.singleFlight(ctx, false, "")
+	if err == nil {
+		p.present(issued)
+		return issued, nil
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	// A non-forced refresh may fail while the old key remains valid. Read
+	// value and positive Redis TTL atomically before reusing it. Reissue never
+	// reaches this branch because KIS has explicitly rejected that key.
+	old, remaining, readErr := p.cached(ctx)
+	if readErr == nil && live(old, remaining) {
+		p.noteLive(remaining)
+		p.present(old)
+		p.recoverableFailure()
+		return old, nil
+	}
+	return p.terminal(err)
 }
 func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
 	if p.mode == ApprovalModeCacheOnly {
@@ -164,9 +197,37 @@ func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
 	p.mu.Lock()
 	rejected := p.lastKey
 	p.mu.Unlock()
-	return p.singleFlight(ctx, true, rejected)
+	key, err := p.singleFlight(ctx, true, rejected)
+	if err != nil {
+		return p.terminal(err)
+	}
+	p.present(key)
+	return key, nil
 }
-func (p *ApprovalProvider) remember(key string) { p.mu.Lock(); p.lastKey = key; p.mu.Unlock() }
+func (p *ApprovalProvider) present(key string) { p.mu.Lock(); p.lastKey = key; p.mu.Unlock() }
+func (p *ApprovalProvider) noteLive(ttl time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Reserve a second for the read/clock gap. This estimate is used only to
+	// keep an existing stream alive during a Redis read failure, never to hand
+	// a key to a new subscription.
+	if ttl > time.Second {
+		p.knownUntil = p.now().Add(ttl - time.Second)
+	} else {
+		p.knownUntil = p.now()
+	}
+}
+func (p *ApprovalProvider) knownLive() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.now().Before(p.knownUntil)
+}
+func (p *ApprovalProvider) recoverableFailure() {
+	p.observe("approval_refresh_retry", "account_mode", p.accountMode)
+	if p.onTransient != nil {
+		p.onTransient()
+	}
+}
 func (p *ApprovalProvider) fail(err error) (string, error) {
 	if errors.Is(err, context.Canceled) {
 		return "", context.Canceled
@@ -177,8 +238,14 @@ func (p *ApprovalProvider) fail(err error) (string, error) {
 	if errors.Is(err, ErrApprovalLockLost) {
 		wrapped = ErrApprovalLockLost
 	}
-	p.markFailure(wrapped)
 	return "", wrapped
+}
+func (p *ApprovalProvider) terminal(err error) (string, error) {
+	_, safe := p.fail(err)
+	if !errors.Is(safe, context.Canceled) {
+		p.markFailure(safe)
+	}
+	return "", safe
 }
 func (p *ApprovalProvider) markFailure(err error) {
 	p.failureOnce.Do(func() { p.mu.Lock(); p.failureErr = err; p.mu.Unlock(); close(p.failureCh) })
@@ -227,7 +294,7 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 			if usable(key, ttl, p.margin) && (!force || (rejected != "" && key != rejected)) {
 				p.metrics.LockWaitSuccess.Add(1)
 				p.observe("approval_lock_wait_success", "account_mode", p.accountMode, "count", p.metrics.LockWaitSuccess.Load())
-				p.remember(key)
+				p.noteLive(ttl)
 				return key, nil
 			}
 			left := deadline.Sub(p.now())
@@ -268,7 +335,7 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 		return p.fail(err)
 	}
 	if usable(key, ttl, p.margin) && (!force || (rejected != "" && key != rejected)) {
-		p.remember(key)
+		p.noteLive(ttl)
 		return key, nil
 	}
 	if force {
@@ -307,7 +374,7 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 	if result == nil {
 		return p.fail(ErrApprovalLockLost)
 	}
-	p.remember(issued)
+	p.noteLive(ApprovalCacheTTL)
 	return issued, nil
 }
 
@@ -322,6 +389,26 @@ func realWait(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func refreshRetryDelay(base time.Duration) time.Duration {
+	if base < refreshRetryMin {
+		base = refreshRetryMin
+	}
+	if base > refreshRetryMax {
+		base = refreshRetryMax
+	}
+	delay := base + time.Duration(mrand.Int64N(int64(base/2)+1))
+	if delay > refreshRetryMax {
+		return refreshRetryMax
+	}
+	return delay
+}
+func increaseRefreshRetry(base time.Duration) time.Duration {
+	if base >= refreshRetryMax/2 {
+		return refreshRetryMax
+	}
+	return base * 2
+}
+
 // RefreshLoop refreshes in the background even if no subscribe occurs. Redis
 // PTTL is the expiry source, so wall-clock jumps cannot postpone renewal.
 func (p *ApprovalProvider) RefreshLoop(ctx context.Context) error {
@@ -329,6 +416,7 @@ func (p *ApprovalProvider) RefreshLoop(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}
+	retry := refreshRetryMin
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -338,18 +426,52 @@ func (p *ApprovalProvider) RefreshLoop(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			_, e := p.fail(err)
-			return e
+			if !p.knownLive() {
+				_, e := p.terminal(err)
+				return e
+			}
+			p.recoverableFailure()
+			if err := p.wait(ctx, refreshRetryDelay(retry)); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				_, e := p.terminal(err)
+				return e
+			}
+			retry = increaseRefreshRetry(retry)
+			continue
+		}
+		if live(key, ttl) {
+			p.noteLive(ttl)
 		}
 		if !usable(key, ttl, p.margin) {
 			if _, err := p.singleFlight(ctx, false, ""); err != nil {
 				if ctx.Err() != nil {
 					return nil
 				}
-				return err
+				old, remaining, readErr := p.cached(ctx)
+				if !(readErr == nil && live(old, remaining)) && !(readErr != nil && p.knownLive()) {
+					_, e := p.terminal(err)
+					return e
+				}
+				if readErr == nil {
+					p.noteLive(remaining)
+				}
+				p.recoverableFailure()
+				if err := p.wait(ctx, refreshRetryDelay(retry)); err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					_, e := p.terminal(err)
+					return e
+				}
+				retry = increaseRefreshRetry(retry)
+				continue
 			}
+			retry = refreshRetryMin
 			continue
 		}
+		retry = refreshRetryMin
 		delay := ttl - p.margin
 		if delay > time.Minute {
 			delay = time.Minute
@@ -358,7 +480,7 @@ func (p *ApprovalProvider) RefreshLoop(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			_, e := p.fail(err)
+			_, e := p.terminal(err)
 			return e
 		}
 	}

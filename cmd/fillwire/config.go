@@ -120,7 +120,7 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if cfg.Retry.Factor < 1 {
 		return runtimeConfig{}, errors.New("config: retry factor must be at least one")
 	}
-	if cfg.refreshMargin, err = time.ParseDuration(cfg.KIS.RefreshMargin); err != nil || cfg.refreshMargin <= 0 || cfg.refreshMargin >= reader.ApprovalCacheTTL {
+	if cfg.refreshMargin, err = time.ParseDuration(cfg.KIS.RefreshMargin); err != nil || cfg.refreshMargin <= 0 || cfg.refreshMargin > reader.MaxRefreshMargin {
 		return runtimeConfig{}, errors.New("config: invalid KIS approval_refresh_margin")
 	}
 	if cfg.alertRateLimit, err = time.ParseDuration(cfg.Alerts.RateLimit); err != nil || cfg.alertRateLimit <= 0 {

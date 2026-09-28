@@ -156,6 +156,9 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		},
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
 			if terminal := observer.cacheOnlyFailure(); terminal != nil {
 				return terminal
@@ -166,6 +169,9 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 	defer conn.Close()
 
 	if err := conn.Subscribe(ctx, tr, r.cfg.HTSID); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
 			if terminal := observer.cacheOnlyFailure(); terminal != nil {
 				return terminal

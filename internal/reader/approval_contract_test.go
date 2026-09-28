@@ -453,3 +453,367 @@ func TestApprovalRefreshCancellationIsClean(t *testing.T) {
 		t.Fatalf("shutdown raised approval failure: %v", err)
 	}
 }
+
+func TestApprovalFailedRefreshKeepsLiveKeyAndRetries(t *testing.T) {
+	var calls atomic.Int32
+	var unavailable atomic.Bool
+	unavailable.Store(true)
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if unavailable.Load() {
+			w.WriteHeader(503)
+			return
+		}
+		fmt.Fprint(w, `{"approval_key":"replacement"}`)
+	})
+	mini.Set(p.cacheKey(), "still-live")
+	mini.SetTTL(p.cacheKey(), 30*time.Minute)
+	now := time.Now()
+	p.now = func() time.Time { return now }
+	alerts := 0
+	lastAlert := time.Time{}
+	p.SetTransientAlert(func() {
+		if lastAlert.IsZero() || now.Sub(lastAlert) >= 10*time.Minute {
+			alerts++
+			lastAlert = now
+		}
+	})
+	key, err := p.ApprovalKey(context.Background())
+	if err != nil || key != "still-live" || p.cacheOnlyFailure() != nil {
+		t.Fatalf("resubscribe after 503 = %q, %v, terminal=%v; want live cache", key, err, p.cacheOnlyFailure())
+	}
+	if calls.Load() != 1 || alerts != 1 {
+		t.Fatalf("initial REST calls=%d alerts=%d, want 1 each", calls.Load(), alerts)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	retries := []time.Duration{}
+	p.wait = func(ctx context.Context, d time.Duration) error {
+		if key, _ := mini.Get(p.cacheKey()); key == "replacement" {
+			cancel()
+			return ctx.Err()
+		}
+		retries = append(retries, d)
+		mini.FastForward(d)
+		now = now.Add(d)
+		if calls.Load() >= 3 {
+			unavailable.Store(false)
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- p.RefreshLoop(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("refresh loop = %v, want clean stop", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh retry did not complete")
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("REST calls = %d, want initial failure, two retries, then success", calls.Load())
+	}
+	if len(retries) != 2 {
+		t.Fatalf("retry waits = %v, want 2 bounded waits", retries)
+	}
+	for _, d := range retries {
+		if d < refreshRetryMin || d > refreshRetryMax {
+			t.Fatalf("retry wait = %s, want 1s..30s", d)
+		}
+	}
+	if alerts != 1 {
+		t.Fatalf("alerts within one 10m interval = %d, want 1", alerts)
+	}
+	if value, _ := mini.Get(p.cacheKey()); value != "replacement" {
+		t.Fatalf("replacement cache = %q", value)
+	}
+	if ttl := mini.TTL(p.cacheKey()); ttl != ApprovalCacheTTL {
+		t.Fatalf("replacement TTL = %s, want 23h", ttl)
+	}
+	if p.cacheOnlyFailure() != nil {
+		t.Fatalf("recoverable refresh latched terminal failure: %v", p.cacheOnlyFailure())
+	}
+	now = now.Add(10 * time.Minute)
+	unavailable.Store(true)
+	mini.Set(p.cacheKey(), "still-live")
+	mini.SetTTL(p.cacheKey(), 30*time.Minute)
+	key, err = p.ApprovalKey(context.Background())
+	if err != nil || key != "still-live" || alerts != 2 {
+		t.Fatalf("next alert interval: key=%q err=%v alerts=%d, want live key and 2 alerts", key, err, alerts)
+	}
+}
+
+func TestApprovalNoLiveKeyFailureIsTerminal(t *testing.T) {
+	_, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })
+	if _, err := p.ApprovalKey(context.Background()); !errors.Is(err, ErrApprovalUnavailable) || p.cacheOnlyFailure() == nil {
+		t.Fatalf("cold failure = %v terminal=%v, want transient terminal", err, p.cacheOnlyFailure())
+	}
+	mini2, _, p2 := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })
+	mini2.Set(p2.cacheKey(), "expired")
+	mini2.SetTTL(p2.cacheKey(), time.Millisecond)
+	mini2.FastForward(2 * time.Millisecond)
+	if _, err := p2.ApprovalKey(context.Background()); !errors.Is(err, ErrApprovalUnavailable) || p2.cacheOnlyFailure() == nil {
+		t.Fatalf("expired cache failure = %v terminal=%v, want transient terminal", err, p2.cacheOnlyFailure())
+	}
+}
+
+func TestApprovalCancelMidIssueDoesNotLatch(t *testing.T) {
+	mini := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	defer client.Close()
+	entered := make(chan struct{})
+	p, err := NewApprovalProviderConfig(client, issuerFunc(func(ctx context.Context) (string, error) { close(entered); <-ctx.Done(); return "", ctx.Err() }), "", "live", DefaultRefreshMargin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.RefreshLoop(ctx) }()
+	<-entered
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("cancel mid-issue = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not stop")
+	}
+	if err := p.cacheOnlyFailure(); err != nil {
+		t.Fatalf("canceled issue latched terminal failure: %v", err)
+	}
+	if mini.Exists(p.lockKey()) {
+		t.Fatal("canceled holder kept lock")
+	}
+}
+
+func TestApprovalContenderWaitsForSlowHolder(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	_, client, holder := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		close(entered)
+		<-release
+		fmt.Fprint(w, `{"approval_key":"issued"}`)
+	})
+	contender, err := NewApprovalProviderConfig(client, holder.issuer, "", "live", DefaultRefreshMargin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderDone := make(chan error, 1)
+	go func() { _, err := holder.ApprovalKey(context.Background()); holderDone <- err }()
+	<-entered
+	time.AfterFunc(1500*time.Millisecond, func() { close(release) })
+	key, err := contender.ApprovalKey(context.Background())
+	if err != nil || key != "issued" || calls.Load() != 1 {
+		t.Fatalf("slow-holder contender = %q, %v; REST calls=%d, want issued and one call", key, err, calls.Load())
+	}
+	if err := <-holderDone; err != nil {
+		t.Fatal(err)
+	}
+}
+func TestApprovalForcedReissueFailureClearsRejectedKey(t *testing.T) {
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })
+	mini.Set(p.cacheKey(), "rejected")
+	mini.SetTTL(p.cacheKey(), ApprovalCacheTTL)
+	if _, err := p.ApprovalKey(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Reissue(context.Background()); !errors.Is(err, ErrApprovalUnavailable) {
+		t.Fatalf("forced issue failure = %v", err)
+	}
+	if mini.Exists(p.cacheKey()) {
+		value, _ := mini.Get(p.cacheKey())
+		t.Fatalf("rejected key %q still cached after failed forced reissue", value)
+	}
+}
+func TestApprovalForcedContenderNeverReturnsRejectedKey(t *testing.T) {
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { t.Error("forced contender issued outside lock") })
+	mini.Set(p.cacheKey(), "rejected")
+	mini.SetTTL(p.cacheKey(), ApprovalCacheTTL)
+	if _, err := p.ApprovalKey(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mini.Set(p.lockKey(), "other-holder")
+	mini.SetTTL(p.lockKey(), ApprovalLockTTL)
+	time.AfterFunc(600*time.Millisecond, func() { mini.Set(p.cacheKey(), "replacement"); mini.SetTTL(p.cacheKey(), ApprovalCacheTTL) })
+	key, err := p.Reissue(context.Background())
+	if err != nil || key != "replacement" {
+		t.Fatalf("forced contender = %q, %v, want replacement", key, err)
+	}
+	if p.Metrics().IssueCalls.Load() != 0 {
+		t.Fatalf("contender REST calls=%d, want 0", p.Metrics().IssueCalls.Load())
+	}
+}
+func TestApprovalRefreshRechecksAtMostOneMinute(t *testing.T) {
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected REST") })
+	mini.Set(p.cacheKey(), "fresh")
+	mini.SetTTL(p.cacheKey(), ApprovalCacheTTL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waited time.Duration
+	p.wait = func(_ context.Context, d time.Duration) error { waited = d; cancel(); return ctx.Err() }
+	if err := p.RefreshLoop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if waited <= 0 || waited > time.Minute {
+		t.Fatalf("refresh wait = %s, want at most 1m", waited)
+	}
+}
+
+type publishDeadlineHook struct{ lockAt, publishAt time.Time }
+
+func (*publishDeadlineHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (*publishDeadlineHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *publishDeadlineHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "set" && len(cmd.Args()) == 6 && fmt.Sprint(cmd.Args()[5]) == "nx" {
+			h.lockAt = time.Now()
+		}
+		if cmd.Name() == "eval" && strings.Contains(fmt.Sprint(cmd.Args()[1]), "'SET', KEYS[2]") {
+			h.publishAt, _ = ctx.Deadline()
+		}
+		return next(ctx, cmd)
+	}
+}
+func TestApprovalPublishDeadlineUnderLockTTL(t *testing.T) {
+	_, client, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"approval_key":"issued"}`) })
+	hook := &publishDeadlineHook{}
+	client.AddHook(hook)
+	if _, err := p.ApprovalKey(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if hook.lockAt.IsZero() || hook.publishAt.IsZero() || hook.publishAt.Sub(hook.lockAt) >= ApprovalLockTTL {
+		t.Fatalf("publish deadline %s after lock attempt, want below 15s", hook.publishAt.Sub(hook.lockAt))
+	}
+}
+
+func TestApprovalRefreshMarginConstructorBoundary(t *testing.T) {
+	mini := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	defer client.Close()
+	issuer := issuerFunc(func(context.Context) (string, error) { return "fixture", nil })
+	if _, err := NewApprovalProviderConfig(client, issuer, "", "live", MaxRefreshMargin, nil); err != nil {
+		t.Fatalf("2h margin rejected: %v", err)
+	}
+	if _, err := NewApprovalProviderConfig(client, issuer, "", "live", MaxRefreshMargin+time.Nanosecond, nil); !errors.Is(err, ErrApprovalConfig) {
+		t.Fatalf("margin above 2h = %v, want config error", err)
+	}
+}
+
+func TestApprovalRefreshRetriesRedisBlipWhileKnownKeyLive(t *testing.T) {
+	var calls atomic.Int32
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, `{"approval_key":"replacement"}`)
+	})
+	mini.Set(p.cacheKey(), "old")
+	mini.SetTTL(p.cacheKey(), ApprovalCacheTTL)
+	now := time.Now()
+	p.now = func() time.Time { return now }
+	if key, err := p.ApprovalKey(context.Background()); err != nil || key != "old" {
+		t.Fatalf("initial cache = %q, %v", key, err)
+	}
+	advance := ApprovalCacheTTL - 30*time.Minute
+	mini.FastForward(advance)
+	now = now.Add(advance)
+	mini.SetError("ERR synthetic Redis blip")
+	alerts := 0
+	p.SetTransientAlert(func() { alerts++ })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waits := 0
+	p.wait = func(ctx context.Context, d time.Duration) error {
+		waits++
+		if waits == 1 {
+			if d < refreshRetryMin || d > refreshRetryMax {
+				t.Errorf("Redis retry = %s, want 1s..30s", d)
+			}
+			mini.SetError("")
+			mini.FastForward(d)
+			now = now.Add(d)
+			return nil
+		}
+		cancel()
+		return ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() { done <- p.RefreshLoop(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Redis blip ended stream: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Redis refresh did not recover")
+	}
+	if alerts != 1 || calls.Load() != 1 || p.cacheOnlyFailure() != nil {
+		t.Fatalf("Redis recovery alerts=%d REST=%d terminal=%v, want 1,1,nil", alerts, calls.Load(), p.cacheOnlyFailure())
+	}
+	if value, _ := mini.Get(p.cacheKey()); value != "replacement" {
+		t.Fatalf("Redis recovery cached %q, want replacement", value)
+	}
+}
+
+func TestApprovalCanceledProviderCallDoesNotLatch(t *testing.T) {
+	_, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { t.Error("canceled call reached fake KIS") })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.ApprovalKey(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled provider call = %v, want context.Canceled", err)
+	}
+	if failure := p.cacheOnlyFailure(); failure != nil {
+		t.Fatalf("canceled provider call latched terminal failure: %v", failure)
+	}
+}
+
+func TestApprovalForcedReissueTracksPresentedKeyAcrossTimerRefresh(t *testing.T) {
+	var calls atomic.Int32
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			fmt.Fprint(w, `{"approval_key":"background-key"}`)
+		} else {
+			fmt.Fprint(w, `{"approval_key":"forced-replacement"}`)
+		}
+	})
+	mini.Set(p.cacheKey(), "rejected-presented")
+	mini.SetTTL(p.cacheKey(), ApprovalCacheTTL)
+	if key, err := p.ApprovalKey(context.Background()); err != nil || key != "rejected-presented" {
+		t.Fatalf("presented key = %q, %v", key, err)
+	}
+	mini.SetTTL(p.cacheKey(), 30*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.wait = func(ctx context.Context, d time.Duration) error {
+		if key, _ := mini.Get(p.cacheKey()); key == "background-key" {
+			cancel()
+			return ctx.Err()
+		}
+		return errors.New("unexpected wait before timer refresh")
+	}
+	if err := p.RefreshLoop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mini.Set(p.cacheKey(), "rejected-presented")
+	mini.SetTTL(p.cacheKey(), ApprovalCacheTTL)
+	key, err := p.Reissue(context.Background())
+	if err != nil || key != "forced-replacement" || calls.Load() != 2 {
+		t.Fatalf("forced reissue after timer = %q, %v, REST calls=%d; rejected key must not return", key, err, calls.Load())
+	}
+}
+
+func TestApprovalRefreshExpiredKeyFailureExitsTransient(t *testing.T) {
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) })
+	mini.Set(p.cacheKey(), "expired")
+	mini.SetTTL(p.cacheKey(), time.Millisecond)
+	mini.FastForward(2 * time.Millisecond)
+	err := p.RefreshLoop(context.Background())
+	if !errors.Is(err, ErrApprovalUnavailable) || p.cacheOnlyFailure() == nil || ProcessExitCode(err) != 1 {
+		t.Fatalf("expired-key refresh = %v, terminal=%v, exit=%d; want transient exit 1", err, p.cacheOnlyFailure(), ProcessExitCode(err))
+	}
+}
