@@ -5,7 +5,8 @@
 broker = "kis"
 endpoint = "live" # live or mock; this also selects the matching KIS TR.
 account_mode = "live"
-approval_mode = "cache-only" # omit to retain Redis-first/REST fallback behavior.
+approval_mode = "" # default: Redis single-flight issue and refresh; cache-only remains available.
+approval_refresh_margin = "1h"
 venue = "krx"
 hts_id = "EXAMPLE_HTS_ID"
 app_key_env = "KIS_APP_KEY"
@@ -38,3 +39,6 @@ drain_timeout = "5s"
 min = "1s"
 max = "30s"
 factor = 2
+
+[alerts]
+rate_limit = "10m" # per failure class, per process

@@ -225,11 +225,17 @@ func TestCacheOnlyRunFailsClosedForCacheFailures(t *testing.T) {
 			if elapsed := time.Since(started); elapsed > time.Second {
 				t.Fatalf("cache-only %s completed in %s, want under 1s", test.name, elapsed)
 			}
-			if !errors.Is(err, fillreader.ErrCacheOnlyApprovalUnavailable) {
-				t.Fatalf("run error = %v, want named cache-only failure", err)
+			wantErr := fillreader.ErrCacheOnlyApprovalUnavailable
+			wantExit := fillreader.ExitCodeCacheOnlyApprovalUnavailable
+			if test.name == "redis error" {
+				wantErr = fillreader.ErrApprovalUnavailable
+				wantExit = 1
 			}
-			if got := fillreader.ProcessExitCode(err); got != fillreader.ExitCodeCacheOnlyApprovalUnavailable {
-				t.Fatalf("process exit code = %d, want %d", got, fillreader.ExitCodeCacheOnlyApprovalUnavailable)
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("run error = %v, want %v", err, wantErr)
+			}
+			if got := fillreader.ProcessExitCode(err); got != wantExit {
+				t.Fatalf("process exit code = %d, want %d", got, wantExit)
 			}
 			if got := fallback.approvalCalls.Load(); got != 0 {
 				t.Fatalf("REST approval calls = %d, want 0", got)
@@ -400,5 +406,97 @@ func shutdownFixtureEvent() ws.Event {
 			FilledAt: "093015",
 			Filled:   "2",
 		},
+	}
+}
+
+type failingAlerter struct{ classes []string }
+
+func (a *failingAlerter) Alert(_ context.Context, class, _ string) {
+	a.classes = append(a.classes, class) /* failed delivery is swallowed by Alerter */
+}
+func TestExitCodeWithAlertClassificationAndDeliveryFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantCode  int
+		wantClass string
+	}{
+		{"configuration", fillreader.ErrApprovalConfig, 78, "configuration"},
+		{"transient", fillreader.ErrApprovalUnavailable, 1, "transient"},
+		{"session occupied", ws.ErrSessionOccupied, 42, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &failingAlerter{}
+			code := exitCodeWithAlert(tc.err, a)
+			if code != tc.wantCode {
+				t.Fatalf("exit code after alert delivery failure = %d, want %d", code, tc.wantCode)
+			}
+			if tc.wantClass == "" && len(a.classes) != 0 || tc.wantClass != "" && (len(a.classes) != 1 || a.classes[0] != tc.wantClass) {
+				t.Fatalf("alert classes = %v, want %q", a.classes, tc.wantClass)
+			}
+		})
+	}
+}
+func TestMissingCredentialMainExit78(t *testing.T) {
+	if os.Getenv("FILLWIRE_CONFIG_EXIT_CHILD") == "1" {
+		flag.CommandLine = flag.NewFlagSet("fillwire", flag.ExitOnError)
+		os.Args = []string{"fillwire", "-config", os.Getenv("FILLWIRE_CONFIG_EXIT_PATH")}
+		main()
+		return
+	}
+	path := t.TempDir() + "/fillwire.toml"
+	if err := os.WriteFile(path, []byte("[kis]\nbroker = \"kis\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestMissingCredentialMainExit78$")
+	child.Env = append(os.Environ(), "FILLWIRE_CONFIG_EXIT_CHILD=1", "FILLWIRE_CONFIG_EXIT_PATH="+path, "FILLWIRE_ALERT_TELEGRAM_BOT_TOKEN=", "FILLWIRE_ALERT_TELEGRAM_CHAT_ID=")
+	output, err := child.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("child error = %v, output = %s", err, output)
+	}
+	if code := exitErr.ExitCode(); code != 78 {
+		t.Fatalf("configuration exit code = %d, want 78; output = %s", code, output)
+	}
+	if strings.Count(string(output), "Telegram alerting disabled") != 1 {
+		t.Fatalf("disabled-alert startup log count = %d, want 1", strings.Count(string(output), "Telegram alerting disabled"))
+	}
+}
+
+func TestApprovalAndAlertSettingDefaultsAndValidation(t *testing.T) {
+	t.Setenv("KIS_APP_KEY", "fixture-app")
+	t.Setenv("KIS_APP_SECRET", "fixture-secret")
+	t.Setenv("EXECUTION_LEDGER_INGEST_TOKEN", "fixture-ingest")
+	raw, err := os.ReadFile("../../fillwire.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := t.TempDir() + "/fillwire.toml"
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.refreshMargin != time.Hour || cfg.alertRateLimit != 10*time.Minute {
+		t.Fatalf("setting defaults = %s, %s; want 1h, 10m", cfg.refreshMargin, cfg.alertRateLimit)
+	}
+	for _, tc := range []struct{ name, old, new string }{
+		{"invalid margin", "approval_refresh_margin = \"1h\"", "approval_refresh_margin = \"23h\""},
+		{"invalid alert rate", "rate_limit = \"10m\"", "rate_limit = \"0s\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := strings.Replace(string(raw), tc.old, tc.new, 1)
+			if mutated == string(raw) {
+				t.Fatal("fixture replacement failed")
+			}
+			if err := os.WriteFile(path, []byte(mutated), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadConfig(path); err == nil {
+				t.Fatal("invalid setting accepted")
+			}
+		})
 	}
 }

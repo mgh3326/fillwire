@@ -73,7 +73,49 @@ max = "30s"
 factor = 2
 ```
 
-The approval provider reads `kis:websocket:approval_key` for compatibility with the existing cache but never writes that key. With `approval_mode = "cache-only"`, a missing, empty, or unreadable cache is a permanent fail-closed error: no KIS REST approval or reissue request is attempted, and fillwire exits with code `78`. `Reissue` has the same fail-closed behavior in this mode. If `approval_mode` is omitted, the existing behavior is unchanged: a true miss or empty value delegates to the KIS REST approval provider, `Reissue` bypasses the cache, and Redis errors remain errors rather than falling back to REST.
+The default approval policy shares the Python at-kis-ws Redis approval contract. The
+reference is auto_trader origin/main commit be0839808b35b7fcd4bbeb326ac0a84daf7ad96a,
+files app/services/kis_websocket_internal/approval_keys.py and constants.py.
+Live uses the raw-string cache key kis:websocket:approval_key and lock key
+kis:websocket:approval_key:lock; mock uses kis_mock:websocket:approval_key and
+kis_mock:websocket:approval_key:lock. The cache TTL is 23h (82800 seconds).
+The lock uses SET NX EX with a unique token and 15s TTL; release is atomic
+compare-and-delete. A contender waits at most 12s, rechecking every 0.25s
+plus up to 0.25s jitter. It returns a transient failure if no sufficiently
+live key appears, never issuing outside the lock. The approval REST issue call
+has a 10s timeout, and the entire issue-and-publish operation has a 14s
+deadline. Publishing checks lock ownership atomically; a late holder cannot
+write or release a successor's lock. The provider reads Redis TTL rather than
+assuming its local clock agrees with Redis.
+
+The kis.approval_refresh_margin setting defaults to 1h. A key with Redis TTL
+at or below that margin is refreshed under the same lock; a background loop
+checks the TTL at least once per minute even if no resubscribe occurs.
+Resubscribe also checks the margin. Racing timer and subscribe paths share the
+lock and reuse the published key. The optional cache-only policy retains its
+operator-controlled behavior: missing or empty cache exits 78 without REST.
+Redis failure remains transient, including in cache-only mode.
+
+Configuration errors, including missing KIS credentials and invalid settings,
+exit 78 and the example systemd unit prevents restart for that code. Session
+occupancy retains exit 42. Network, KIS 5xx, Redis, and lock-timeout failures
+exit 1 so the unit retries under its restart-rate guard.
+
+Telegram alerts use FILLWIRE_ALERT_TELEGRAM_BOT_TOKEN and
+FILLWIRE_ALERT_TELEGRAM_CHAT_ID. The desk owns the real values and wires them
+only at deploy. If either is unset, one startup error log announces that
+alerting is disabled. The alerts.rate_limit setting defaults to 10m per
+failure class within the process. Delivery uses Telegram sendMessage with a
+3s timeout; failure is logged without tokens and cannot alter the exit code.
+Only fixed configuration and transient summaries are sent, never credentials,
+approval keys, or exception bodies.
+
+Structured logs count approval_rest_issue_call, approval_lock_acquired,
+approval_lock_contended, approval_lock_wait_success, and
+approval_lock_wait_failed. Each has account_mode and process-local cumulative
+count fields. Task 180 should compare those counts with the Python service's
+approval issue calls across the cache boundary. They are not durable counters
+and reset on process restart.
 
 Ingest URLs must use HTTPS, except HTTP is allowed only for `localhost`, `127.0.0.1`, or `::1`. Redis URLs must use `rediss`, except loopback `redis` and `unix` socket URLs. These checks run before startup so neither the ingest token nor the cached approval key can be sent over a remote plaintext connection.
 

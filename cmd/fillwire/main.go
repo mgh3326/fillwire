@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
@@ -25,18 +26,33 @@ func main() {
 	configPath := flag.String("config", "fillwire.toml", "path to fillwire TOML configuration")
 	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	alerter := alert.FromEnv(logger, alert.DefaultRateLimit)
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		logger.Error("startup configuration failed", "reason", err.Error())
-		os.Exit(1)
+		os.Exit(exitCodeWithAlert(reader.ErrApprovalConfig, alerter))
 	}
+	alerter.SetRateLimit(cfg.alertRateLimit)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, cfg, logger); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("fillwire stopped", "reason", safeRuntimeError(err))
-		os.Exit(reader.ProcessExitCode(err))
+		os.Exit(exitCodeWithAlert(err, alerter))
 	}
+}
+
+func exitCodeWithAlert(err error, alerter alert.Alerter) int {
+	code := reader.ProcessExitCode(err)
+	if alerter != nil {
+		if code == reader.ExitCodeConfiguration {
+			alerter.Alert(context.Background(), "configuration", "fillwire configuration failure; operator action required")
+		}
+		if code == 1 {
+			alerter.Alert(context.Background(), "transient", "fillwire transient failure; retry or restart required")
+		}
+	}
+	return code
 }
 
 func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) error {
@@ -49,10 +65,24 @@ type runDependencies struct {
 	dialer           ws.Dialer
 }
 
+type kisApprovalIssuer struct{ client *kis.Client }
+type approvalFallbackIssuer struct{ provider ws.ApprovalKeyProvider }
+
+func (i approvalFallbackIssuer) Issue(ctx context.Context) (string, error) {
+	return i.provider.Reissue(ctx)
+}
+func (i kisApprovalIssuer) Issue(ctx context.Context) (string, error) {
+	result, err := i.client.IssueApprovalKey(ctx)
+	if err != nil || result.ApprovalKey == "" {
+		return "", reader.ErrApprovalUnavailable
+	}
+	return result.ApprovalKey, nil
+}
+
 func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies) error {
 	redisOptions, err := redis.ParseURL(cfg.Redis.URL)
 	if err != nil {
-		return errors.New("startup: invalid Redis URL")
+		return fmt.Errorf("%w: invalid Redis URL", reader.ErrApprovalConfig)
 	}
 	redisClient := redis.NewClient(redisOptions)
 	defer redisClient.Close()
@@ -69,16 +99,20 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		Host:           kisHost,
 		AppKey:         cfg.appKey,
 		AppSecret:      cfg.appSecret,
-		RequestTimeout: cfg.timeout,
+		RequestTimeout: reader.ApprovalIssueTimeout,
 	})
 	if err != nil {
-		return errors.New("startup: KIS REST client configuration failed")
+		return fmt.Errorf("%w: KIS REST client", reader.ErrApprovalConfig)
 	}
-	approvalFallback := dependencies.approvalFallback
-	if approvalFallback == nil {
-		approvalFallback = ws.NewClientApprovalProvider(kisClient)
+	var issuer reader.ApprovalIssuer = kisApprovalIssuer{client: kisClient}
+	if dependencies.approvalFallback != nil {
+		issuer = approvalFallbackIssuer{dependencies.approvalFallback}
 	}
-	approval, err := reader.NewApprovalProviderWithMode(approvalRedis, approvalFallback, cfg.KIS.ApprovalMode, logger)
+	margin := cfg.refreshMargin
+	if margin == 0 {
+		margin = reader.DefaultRefreshMargin
+	}
+	approval, err := reader.NewApprovalProviderConfig(approvalRedis, issuer, cfg.KIS.ApprovalMode, cfg.KIS.AccountMode, margin, logger)
 	if err != nil {
 		return err
 	}
@@ -124,6 +158,14 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	records := make(chan decode.Record, cfg.Channel.Buffer)
 	readerCtx, stopReader := context.WithCancel(context.Background())
 	defer stopReader()
+	refreshDone := make(chan error, 1)
+	if cfg.KIS.ApprovalMode != reader.ApprovalModeCacheOnly {
+		go func() {
+			if err := approval.RefreshLoop(readerCtx); err != nil {
+				refreshDone <- err
+			}
+		}()
+	}
 	runnerCtx, stopRunner := context.WithCancel(context.Background())
 	defer stopRunner()
 	pipeline := newIngressPipeline(ctx, events, records, decoder, queue)
@@ -167,6 +209,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		ingressFinished = true
 	case stopErr = <-runnerDone:
 		runnerFinished = true
+	case stopErr = <-refreshDone:
 	}
 
 	// Stop the socket first. The bounded events and records channels remain

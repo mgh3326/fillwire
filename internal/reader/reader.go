@@ -20,6 +20,7 @@ const ExitCodeSessionOccupied = 42
 // ExitCodeCacheOnlyApprovalUnavailable is reserved for a permanent loss of
 // the Redis-cached KIS approval key in cache-only mode.
 const ExitCodeCacheOnlyApprovalUnavailable = 78
+const ExitCodeConfiguration = 78
 
 // ErrEventsClosed reports that KIS stopped the event stream without a caller
 // initiated shutdown. Treating this as success would leave the process alive
@@ -232,6 +233,9 @@ func endpointAndTR(endpoint string) (string, string, error) {
 func ProcessExitCode(err error) int {
 	if errors.Is(err, ErrCacheOnlyApprovalUnavailable) {
 		return ExitCodeCacheOnlyApprovalUnavailable
+	}
+	if errors.Is(err, ErrApprovalConfig) {
+		return ExitCodeConfiguration
 	}
 	if errors.Is(err, ws.ErrSessionOccupied) {
 		return ExitCodeSessionOccupied

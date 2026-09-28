@@ -254,3 +254,23 @@ exactly the checks in deploy step 4. A future opt-in health listener (for
 example `-health-listen 127.0.0.1:<port>` serving `GET /healthz`, 200 only
 while the KIS subscription is active) would let the unit add an `ExecStartPost`
 curl gate; that is a design note only and no code is added here.
+
+## Task 180 re-observation plan (operator window only)
+
+This is a plan, not an observation record. The desk must wire the real
+Telegram bot token and chat ID at deploy; do not put them in this runbook.
+During a scheduled window, stop at-kis-ws and verify it is inactive before
+starting fillwire. Keep at-kis-ws stopped while fillwire owns the KIS session.
+Observe across the 23-hour Redis approval-cache boundary and at least one
+Korean market session. Record the approval_rest_issue_call and lock contention
+log counts, cache TTL, restart count, fill ingress, and Telegram delivery
+outcome without recording key or credential values. A healthy boundary has
+one approval issue per mode across competing instances, a refreshed key before
+expiry, and no recurring approval churn. Escalate any exit 42, 78, or repeated
+exit 1 with the bounded logs and timestamps.
+
+Step 7 restore remains the existing switch-back procedure above: stop
+fillwire, verify it is inactive, then start at-kis-ws. If fillwire's deployment
+pin must also be restored, use the Roll back section's snapshot, pin restore,
+pull, restart, and three verification checks. Never run both websocket owners
+at once.
