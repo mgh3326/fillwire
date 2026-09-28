@@ -432,3 +432,24 @@ func TestApprovalLockUsesSetNXEXUniqueTokens(t *testing.T) {
 		t.Fatalf("separate issuance calls = %d, want 2", calls.Load())
 	}
 }
+
+func TestApprovalRefreshCancellationIsClean(t *testing.T) {
+	mini, _, p := newApprovalFixture(t, "live", func(w http.ResponseWriter, r *http.Request) { t.Error("unexpected approval request on shutdown") })
+	mini.Set(p.cacheKey(), "cached")
+	mini.SetTTL(p.cacheKey(), ApprovalCacheTTL)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.RefreshLoop(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("refresh cancellation = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not stop")
+	}
+	if err := p.cacheOnlyFailure(); err != nil {
+		t.Fatalf("shutdown raised approval failure: %v", err)
+	}
+}

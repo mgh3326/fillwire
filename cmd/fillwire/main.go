@@ -74,6 +74,9 @@ func (i approvalFallbackIssuer) Issue(ctx context.Context) (string, error) {
 func (i kisApprovalIssuer) Issue(ctx context.Context) (string, error) {
 	result, err := i.client.IssueApprovalKey(ctx)
 	if err != nil || result.ApprovalKey == "" {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", reader.ErrApprovalUnavailable
 	}
 	return result.ApprovalKey, nil

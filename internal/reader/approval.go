@@ -168,6 +168,9 @@ func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
 }
 func (p *ApprovalProvider) remember(key string) { p.mu.Lock(); p.lastKey = key; p.mu.Unlock() }
 func (p *ApprovalProvider) fail(err error) (string, error) {
+	if errors.Is(err, context.Canceled) {
+		return "", context.Canceled
+	}
 	// Third-party errors can contain request URLs or response bodies. Never
 	// carry those values into process logs or alerts.
 	wrapped := ErrApprovalUnavailable
@@ -241,6 +244,9 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 				}
 				return p.fail(err)
 			}
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
 		p.metrics.LockWaitFailed.Add(1)
 		p.observe("approval_lock_wait_failed", "account_mode", p.accountMode, "count", p.metrics.LockWaitFailed.Load())
@@ -324,13 +330,22 @@ func (p *ApprovalProvider) RefreshLoop(ctx context.Context) error {
 		return nil
 	}
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		key, ttl, err := p.cached(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			_, e := p.fail(err)
 			return e
 		}
 		if !usable(key, ttl, p.margin) {
 			if _, err := p.singleFlight(ctx, false, ""); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 			continue
