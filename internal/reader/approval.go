@@ -202,6 +202,7 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 		return p.fail(err)
 	}
 	token := hex.EncodeToString(tokenBytes)
+	lockAttemptAt := time.Now()
 	acquired, err := p.redis.SetNX(ctx, p.lockKey(), token, ApprovalLockTTL).Result()
 	if err != nil {
 		return p.fail(err)
@@ -209,10 +210,15 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 	if !acquired {
 		p.metrics.LockContended.Add(1)
 		p.observe("approval_lock_contended", "account_mode", p.accountMode, "count", p.metrics.LockContended.Load())
+		waitCtx, cancelWait := context.WithTimeout(ctx, ApprovalWait)
+		defer cancelWait()
 		deadline := p.now().Add(ApprovalWait)
 		for {
-			key, ttl, err := p.cached(ctx)
+			key, ttl, err := p.cached(waitCtx)
 			if err != nil {
+				if waitCtx.Err() != nil {
+					break
+				}
 				return p.fail(err)
 			}
 			if usable(key, ttl, p.margin) && (!force || (rejected != "" && key != rejected)) {
@@ -229,7 +235,10 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 			if poll > left {
 				poll = left
 			}
-			if err := p.wait(ctx, poll); err != nil {
+			if err := p.wait(waitCtx, poll); err != nil {
+				if waitCtx.Err() != nil {
+					break
+				}
 				return p.fail(err)
 			}
 		}
@@ -241,7 +250,7 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 	p.observe("approval_lock_acquired", "account_mode", p.accountMode, "count", p.metrics.LockAcquired.Load())
 	// The 10-second HTTP request and all Redis writes share a 14-second deadline,
 	// leaving a one-second guard before the 15-second lock can expire.
-	issueCtx, cancel := context.WithTimeout(ctx, publishDeadline)
+	issueCtx, cancel := context.WithDeadline(ctx, lockAttemptAt.Add(publishDeadline))
 	defer cancel()
 	defer func() {
 		releaseCtx, c := context.WithTimeout(context.Background(), time.Second)
