@@ -225,11 +225,17 @@ func TestCacheOnlyRunFailsClosedForCacheFailures(t *testing.T) {
 			if elapsed := time.Since(started); elapsed > time.Second {
 				t.Fatalf("cache-only %s completed in %s, want under 1s", test.name, elapsed)
 			}
-			if !errors.Is(err, fillreader.ErrCacheOnlyApprovalUnavailable) {
-				t.Fatalf("run error = %v, want named cache-only failure", err)
+			wantErr := fillreader.ErrCacheOnlyApprovalUnavailable
+			wantExit := fillreader.ExitCodeCacheOnlyApprovalUnavailable
+			if test.name == "redis error" {
+				wantErr = fillreader.ErrApprovalUnavailable
+				wantExit = 1
 			}
-			if got := fillreader.ProcessExitCode(err); got != fillreader.ExitCodeCacheOnlyApprovalUnavailable {
-				t.Fatalf("process exit code = %d, want %d", got, fillreader.ExitCodeCacheOnlyApprovalUnavailable)
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("run error = %v, want %v", err, wantErr)
+			}
+			if got := fillreader.ProcessExitCode(err); got != wantExit {
+				t.Fatalf("process exit code = %d, want %d", got, wantExit)
 			}
 			if got := fallback.approvalCalls.Load(); got != 0 {
 				t.Fatalf("REST approval calls = %d, want 0", got)
@@ -400,5 +406,233 @@ func shutdownFixtureEvent() ws.Event {
 			FilledAt: "093015",
 			Filled:   "2",
 		},
+	}
+}
+
+type failingAlerter struct{ classes []string }
+
+func (a *failingAlerter) Alert(_ context.Context, class, _ string) {
+	a.classes = append(a.classes, class) /* failed delivery is swallowed by Alerter */
+}
+func TestExitCodeWithAlertClassificationAndDeliveryFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantCode  int
+		wantClass string
+	}{
+		{"configuration", fillreader.ErrApprovalConfig, 78, "configuration"},
+		{"transient", fillreader.ErrApprovalUnavailable, 1, "transient"},
+		{"session occupied", ws.ErrSessionOccupied, 42, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &failingAlerter{}
+			code := exitCodeWithAlert(tc.err, a)
+			if code != tc.wantCode {
+				t.Fatalf("exit code after alert delivery failure = %d, want %d", code, tc.wantCode)
+			}
+			if tc.wantClass == "" && len(a.classes) != 0 || tc.wantClass != "" && (len(a.classes) != 1 || a.classes[0] != tc.wantClass) {
+				t.Fatalf("alert classes = %v, want %q", a.classes, tc.wantClass)
+			}
+		})
+	}
+}
+func TestMissingCredentialMainExit78(t *testing.T) {
+	if os.Getenv("FILLWIRE_CONFIG_EXIT_CHILD") == "1" {
+		flag.CommandLine = flag.NewFlagSet("fillwire", flag.ExitOnError)
+		os.Args = []string{"fillwire", "-config", os.Getenv("FILLWIRE_CONFIG_EXIT_PATH")}
+		main()
+		return
+	}
+	path := t.TempDir() + "/fillwire.toml"
+	if err := os.WriteFile(path, []byte("[kis]\nbroker = \"kis\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestMissingCredentialMainExit78$")
+	child.Env = append(os.Environ(), "FILLWIRE_CONFIG_EXIT_CHILD=1", "FILLWIRE_CONFIG_EXIT_PATH="+path, "FILLWIRE_ALERT_TELEGRAM_BOT_TOKEN=", "FILLWIRE_ALERT_TELEGRAM_CHAT_ID=")
+	output, err := child.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("child error = %v, output = %s", err, output)
+	}
+	if code := exitErr.ExitCode(); code != 78 {
+		t.Fatalf("configuration exit code = %d, want 78; output = %s", code, output)
+	}
+	if strings.Count(string(output), "Telegram alerting disabled") != 1 {
+		t.Fatalf("disabled-alert startup log count = %d, want 1", strings.Count(string(output), "Telegram alerting disabled"))
+	}
+}
+
+func TestApprovalAndAlertSettingDefaultsAndValidation(t *testing.T) {
+	t.Setenv("KIS_APP_KEY", "fixture-app")
+	t.Setenv("KIS_APP_SECRET", "fixture-secret")
+	t.Setenv("EXECUTION_LEDGER_INGEST_TOKEN", "fixture-ingest")
+	raw, err := os.ReadFile("../../fillwire.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := t.TempDir() + "/fillwire.toml"
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.refreshMargin != time.Hour || cfg.alertRateLimit != 10*time.Minute {
+		t.Fatalf("setting defaults = %s, %s; want 1h, 10m", cfg.refreshMargin, cfg.alertRateLimit)
+	}
+	boundary := strings.Replace(string(raw), "approval_refresh_margin = \"1h\"", "approval_refresh_margin = \"2h\"", 1)
+	if err := os.WriteFile(path, []byte(boundary), 0600); err != nil {
+		t.Fatal(err)
+	}
+	boundaryCfg, err := loadConfig(path)
+	if err != nil || boundaryCfg.refreshMargin != 2*time.Hour {
+		t.Fatalf("2h refresh margin = %s, %v, want accepted", boundaryCfg.refreshMargin, err)
+	}
+	for _, tc := range []struct{ name, old, new string }{
+		{"margin above 2h", "approval_refresh_margin = \"1h\"", "approval_refresh_margin = \"2h1ns\""},
+		{"zero margin", "approval_refresh_margin = \"1h\"", "approval_refresh_margin = \"0s\""},
+		{"invalid alert rate", "rate_limit = \"10m\"", "rate_limit = \"0s\""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := strings.Replace(string(raw), tc.old, tc.new, 1)
+			if mutated == string(raw) {
+				t.Fatal("fixture replacement failed")
+			}
+			if err := os.WriteFile(path, []byte(mutated), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadConfig(path); err == nil {
+				t.Fatal("invalid setting accepted")
+			}
+			if tc.name == "margin above 2h" {
+				a := &failingAlerter{}
+				if code := exitCodeWithAlert(fillreader.ErrApprovalConfig, a); code != 78 || len(a.classes) != 1 || a.classes[0] != "configuration" {
+					t.Fatalf("out-of-range margin exit=%d alerts=%v, want 78 and configuration", code, a.classes)
+				}
+			}
+		})
+	}
+}
+
+type fakeHTTPApprovalFallback struct {
+	url    string
+	client *http.Client
+	calls  atomic.Int32
+}
+
+func (p *fakeHTTPApprovalFallback) ApprovalKey(ctx context.Context) (string, error) {
+	return p.Reissue(ctx)
+}
+func (p *fakeHTTPApprovalFallback) Reissue(ctx context.Context) (string, error) {
+	p.calls.Add(1)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url+"/oauth2/Approval", nil)
+	if err != nil {
+		return "", err
+	}
+	response, err := p.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fillreader.ErrApprovalUnavailable
+	}
+	return "synthetic", nil
+}
+
+type atomicAlerter struct{ calls atomic.Int32 }
+
+func (a *atomicAlerter) Alert(context.Context, string, string) { a.calls.Add(1) }
+func TestShutdownDuringApprovalWaitHasNoExitOrAlert(t *testing.T) {
+	for _, tc := range []string{"contender lock wait", "fake approval HTTP in flight"} {
+		t.Run(tc, func(t *testing.T) {
+			mainRedis := miniredis.RunT(t)
+			approvalRedis := miniredis.RunT(t)
+			if tc == "contender lock wait" {
+				approvalRedis.Set("kis_mock:websocket:approval_key:lock", "other-owner")
+				approvalRedis.SetTTL("kis_mock:websocket:approval_key:lock", 15*time.Second)
+			}
+			client := redis.NewClient(&redis.Options{Addr: approvalRedis.Addr()})
+			defer client.Close()
+			requestStarted := make(chan struct{}, 1)
+			var httpStarted atomic.Bool
+			approvalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				httpStarted.Store(true)
+				select {
+				case requestStarted <- struct{}{}:
+				default:
+				}
+				select {
+				case <-r.Context().Done():
+				case <-time.After(time.Second):
+				}
+			}))
+			defer approvalServer.Close()
+			fallback := &fakeHTTPApprovalFallback{url: approvalServer.URL, client: approvalServer.Client()}
+			ingest := httptest.NewServer(http.NotFoundHandler())
+			defer ingest.Close()
+			cfg := cacheOnlyRuntimeConfig(mainRedis.Addr(), ingest.URL)
+			cfg.KIS.ApprovalMode = ""
+			alerts := &atomicAlerter{}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc == "contender lock wait" {
+				time.AfterFunc(100*time.Millisecond, cancel)
+			} else {
+				go func() {
+					select {
+					case <-requestStarted:
+						cancel()
+					case <-time.After(2 * time.Second):
+						cancel()
+					}
+				}()
+			}
+			started := time.Now()
+			err := runWithDependencies(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), runDependencies{approvalRedis: client, approvalFallback: fallback, dialer: &countingDialer{}, alerter: alerts})
+			code := 0
+			if err != nil && !errors.Is(err, context.Canceled) {
+				code = exitCodeWithAlert(err, alerts)
+			}
+			if code != 0 || alerts.calls.Load() != 0 {
+				t.Fatalf("shutdown exit=%d alerts=%d err=%v, want clean shutdown", code, alerts.calls.Load(), err)
+			}
+			if time.Since(started) > 3*time.Second {
+				t.Fatalf("shutdown took %s, want bounded", time.Since(started))
+			}
+			if tc == "contender lock wait" && fallback.calls.Load() != 0 {
+				t.Fatalf("contender made %d fake REST calls, want 0", fallback.calls.Load())
+			}
+			if tc == "fake approval HTTP in flight" && (fallback.calls.Load() == 0 || !httpStarted.Load()) {
+				t.Fatal("fake HTTP request did not start")
+			}
+		})
+	}
+}
+
+func TestRunWiresRecoverableRefreshAlertAndUsesLiveKey(t *testing.T) {
+	mainRedis := miniredis.RunT(t)
+	approvalRedis := miniredis.RunT(t)
+	approvalRedis.Set("kis_mock:websocket:approval_key", "still-live")
+	approvalRedis.SetTTL("kis_mock:websocket:approval_key", 30*time.Minute)
+	client := redis.NewClient(&redis.Options{Addr: approvalRedis.Addr()})
+	defer client.Close()
+	approvalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	defer approvalServer.Close()
+	ingest := httptest.NewServer(http.NotFoundHandler())
+	defer ingest.Close()
+	cfg := cacheOnlyRuntimeConfig(mainRedis.Addr(), ingest.URL)
+	cfg.KIS.ApprovalMode = ""
+	fallback := &fakeHTTPApprovalFallback{url: approvalServer.URL, client: approvalServer.Client()}
+	dialer := &countingDialer{}
+	alerts := &atomicAlerter{}
+	_ = runWithDependencies(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), runDependencies{approvalRedis: client, approvalFallback: fallback, dialer: dialer, alerter: alerts})
+	if dialer.calls.Load() != 1 || fallback.calls.Load() == 0 || alerts.calls.Load() == 0 {
+		t.Fatalf("recoverable refresh: dials=%d fake REST=%d alerts=%d, want live-key dial and alert", dialer.calls.Load(), fallback.calls.Load(), alerts.calls.Load())
+	}
+	if value, _ := approvalRedis.Get("kis_mock:websocket:approval_key"); value != "still-live" {
+		t.Fatalf("failed refresh replaced live key with %q", value)
 	}
 }

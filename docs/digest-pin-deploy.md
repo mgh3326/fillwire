@@ -12,7 +12,9 @@ Container contract (see `deploy/systemd/fillwire.service.example`):
 - `docker run --rm --network host` — KIS websocket, Redis TLS, and the ingest
   POST all use the host network; nothing is published.
 - Secrets arrive only through `--env-file` (`KIS_APP_KEY`, `KIS_APP_SECRET`,
-  `EXECUTION_LEDGER_INGEST_TOKEN`, referenced by name in the TOML). No secret
+  `EXECUTION_LEDGER_INGEST_TOKEN`, `FILLWIRE_ALERT_TELEGRAM_BOT_TOKEN`, and
+  `FILLWIRE_ALERT_TELEGRAM_CHAT_ID`; the first three are referenced by name
+  in the TOML). No secret
   is ever a build arg or an image layer.
 - The TOML is bind-mounted read-only; the binary is invoked as
   `fillwire -config <in-container path>`.
@@ -254,3 +256,27 @@ exactly the checks in deploy step 4. A future opt-in health listener (for
 example `-health-listen 127.0.0.1:<port>` serving `GET /healthz`, 200 only
 while the KIS subscription is active) would let the unit add an `ExecStartPost`
 curl gate; that is a design note only and no code is added here.
+
+## Task 180 re-observation plan (operator window only)
+
+This is a plan, not an observation record. Before starting the window, the
+desk updates the host /etc/fillwire/fillwire.toml to set approval_mode = ""
+and approval_refresh_margin = "1h". A host TOML left at approval_mode =
+"cache-only" will not self-issue at the 23-hour boundary. The desk also wires
+FILLWIRE_ALERT_TELEGRAM_BOT_TOKEN and FILLWIRE_ALERT_TELEGRAM_CHAT_ID in
+/etc/fillwire/fillwire.env at deploy. Keep real values out of this runbook.
+During a scheduled window, stop at-kis-ws and verify it is inactive before
+starting fillwire. Keep at-kis-ws stopped while fillwire owns the KIS session.
+The desk performs the observation across the 23-hour Redis approval-cache boundary and at least one
+Korean market session. Record the approval_rest_issue_call and lock contention
+log counts, cache TTL, restart count, fill ingress, and Telegram delivery
+outcome without recording key or credential values. A healthy boundary has
+one approval issue per mode across competing instances, a refreshed key before
+expiry, and no recurring approval churn. Escalate any exit 42, 78, or repeated
+exit 1 with the bounded logs and timestamps.
+
+Step 7 restore remains the existing switch-back procedure above: stop
+fillwire, verify it is inactive, then start at-kis-ws. If fillwire's deployment
+pin must also be restored, use the Roll back section's snapshot, pin restore,
+pull, restart, and three verification checks. Never run both websocket owners
+at once.

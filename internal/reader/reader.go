@@ -20,6 +20,7 @@ const ExitCodeSessionOccupied = 42
 // ExitCodeCacheOnlyApprovalUnavailable is reserved for a permanent loss of
 // the Redis-cached KIS approval key in cache-only mode.
 const ExitCodeCacheOnlyApprovalUnavailable = 78
+const ExitCodeConfiguration = 78
 
 // ErrEventsClosed reports that KIS stopped the event stream without a caller
 // initiated shutdown. Treating this as success would leave the process alive
@@ -155,6 +156,9 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		},
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
 			if terminal := observer.cacheOnlyFailure(); terminal != nil {
 				return terminal
@@ -165,6 +169,9 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 	defer conn.Close()
 
 	if err := conn.Subscribe(ctx, tr, r.cfg.HTSID); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
 			if terminal := observer.cacheOnlyFailure(); terminal != nil {
 				return terminal
@@ -232,6 +239,9 @@ func endpointAndTR(endpoint string) (string, string, error) {
 func ProcessExitCode(err error) int {
 	if errors.Is(err, ErrCacheOnlyApprovalUnavailable) {
 		return ExitCodeCacheOnlyApprovalUnavailable
+	}
+	if errors.Is(err, ErrApprovalConfig) {
+		return ExitCodeConfiguration
 	}
 	if errors.Is(err, ws.ErrSessionOccupied) {
 		return ExitCodeSessionOccupied

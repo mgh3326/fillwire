@@ -9,22 +9,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/alert"
+	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/pelletier/go-toml/v2"
 )
 
 type fileConfig struct {
 	KIS struct {
-		Broker       string `toml:"broker"`
-		Endpoint     string `toml:"endpoint"`
-		AccountMode  string `toml:"account_mode"`
-		ApprovalMode string `toml:"approval_mode"`
-		Venue        string `toml:"venue"`
-		HTSID        string `toml:"hts_id"`
-		AppKeyEnv    string `toml:"app_key_env"`
-		AppSecretEnv string `toml:"app_secret_env"`
-		EventBuffer  int    `toml:"event_buffer"`
-		DupTrackMax  int    `toml:"dup_track_max"`
+		Broker        string `toml:"broker"`
+		Endpoint      string `toml:"endpoint"`
+		AccountMode   string `toml:"account_mode"`
+		ApprovalMode  string `toml:"approval_mode"`
+		RefreshMargin string `toml:"approval_refresh_margin"`
+		Venue         string `toml:"venue"`
+		HTSID         string `toml:"hts_id"`
+		AppKeyEnv     string `toml:"app_key_env"`
+		AppSecretEnv  string `toml:"app_secret_env"`
+		EventBuffer   int    `toml:"event_buffer"`
+		DupTrackMax   int    `toml:"dup_track_max"`
 	} `toml:"kis"`
 	Redis struct {
 		URL string `toml:"url"`
@@ -52,19 +55,24 @@ type fileConfig struct {
 		Max    string  `toml:"max"`
 		Factor float64 `toml:"factor"`
 	} `toml:"retry"`
+	Alerts struct {
+		RateLimit string `toml:"rate_limit"`
+	} `toml:"alerts"`
 }
 
 type runtimeConfig struct {
 	fileConfig
-	claimMinIdle time.Duration
-	readBlock    time.Duration
-	timeout      time.Duration
-	retryMin     time.Duration
-	retryMax     time.Duration
-	drainTimeout time.Duration
-	ingestToken  string
-	appKey       string
-	appSecret    string
+	claimMinIdle   time.Duration
+	readBlock      time.Duration
+	timeout        time.Duration
+	retryMin       time.Duration
+	retryMax       time.Duration
+	drainTimeout   time.Duration
+	ingestToken    string
+	appKey         string
+	appSecret      string
+	refreshMargin  time.Duration
+	alertRateLimit time.Duration
 }
 
 func loadConfig(path string) (runtimeConfig, error) {
@@ -81,6 +89,12 @@ func loadConfig(path string) (runtimeConfig, error) {
 	}
 	if strings.TrimSpace(cfg.Channel.DrainTimeout) == "" {
 		cfg.Channel.DrainTimeout = "5s"
+	}
+	if cfg.KIS.RefreshMargin == "" {
+		cfg.KIS.RefreshMargin = "1h"
+	}
+	if cfg.Alerts.RateLimit == "" {
+		cfg.Alerts.RateLimit = alert.DefaultRateLimit.String()
 	}
 	if err := cfg.validateStatic(); err != nil {
 		return runtimeConfig{}, err
@@ -105,6 +119,12 @@ func loadConfig(path string) (runtimeConfig, error) {
 	}
 	if cfg.Retry.Factor < 1 {
 		return runtimeConfig{}, errors.New("config: retry factor must be at least one")
+	}
+	if cfg.refreshMargin, err = time.ParseDuration(cfg.KIS.RefreshMargin); err != nil || cfg.refreshMargin <= 0 || cfg.refreshMargin > reader.MaxRefreshMargin {
+		return runtimeConfig{}, errors.New("config: invalid KIS approval_refresh_margin")
+	}
+	if cfg.alertRateLimit, err = time.ParseDuration(cfg.Alerts.RateLimit); err != nil || cfg.alertRateLimit <= 0 {
+		return runtimeConfig{}, errors.New("config: invalid alerts rate_limit")
 	}
 	var ok bool
 	if cfg.ingestToken, ok = os.LookupEnv(cfg.Ingest.TokenEnv); !ok || cfg.ingestToken == "" {

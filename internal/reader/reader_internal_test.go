@@ -37,3 +37,25 @@ func TestT19UnexpectedEventCloseReturnsGenericFailure(t *testing.T) {
 		t.Fatalf("exit code = %d, want generic non-zero non-%d", got, ExitCodeSessionOccupied)
 	}
 }
+
+type cancelSubscribeSession struct {
+	cancel context.CancelFunc
+	events chan ws.Event
+}
+
+func (s *cancelSubscribeSession) Events() <-chan ws.Event { return s.events }
+func (s *cancelSubscribeSession) Subscribe(context.Context, string, string) error {
+	s.cancel()
+	return errors.New("synthetic subscribe transport error")
+}
+func (*cancelSubscribeSession) Close() error { return nil }
+func TestSubscribeErrorAfterCancellationIsCleanShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := New(Config{Endpoint: "live", HTSID: "HTS_EXAMPLE", dial: func(context.Context, ws.Config) (session, error) {
+		return &cancelSubscribeSession{cancel: cancel, events: make(chan ws.Event)}, nil
+	}})
+	if err := r.Run(ctx, make(chan ws.Event, 1)); err != nil {
+		t.Fatalf("canceled subscribe error = %v, want nil", err)
+	}
+}

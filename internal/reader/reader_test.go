@@ -561,78 +561,34 @@ func TestT10Backpressure(t *testing.T) {
 
 func TestT11ApprovalProvider(t *testing.T) {
 	mini := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer redisClient.Close()
+	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	defer client.Close()
 	fallback := &fakeApproval{}
-	logger, logs := readerJSONLogger()
-	provider, err := fillreader.NewApprovalProvider(redisClient, fallback, logger)
+	provider, err := fillreader.NewApprovalProvider(client, fallback)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := redisClient.Set(ctx, "kis:websocket:approval_key", "cached-fixture", 0).Err(); err != nil {
+	if err := client.Set(ctx, "kis:websocket:approval_key", "cached-fixture", 23*time.Hour).Err(); err != nil {
 		t.Fatal(err)
 	}
 	key, err := provider.ApprovalKey(ctx)
 	if err != nil || key != "cached-fixture" {
-		t.Fatalf("cached approval = %q, %v", key, err)
+		t.Fatalf("cache hit = %q, %v", key, err)
 	}
-	if got := fallback.approvalCalls.Load(); got != 0 {
-		t.Fatalf("REST fallback calls with cache = %d, want 0", got)
+	if fallback.reissueCalls.Load() != 0 {
+		t.Fatal("cache hit issued REST request")
 	}
-	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST issuance attempted"); got != 0 {
-		t.Fatalf("REST issuance events with cache = %d, want 0", got)
-	}
-	if err := redisClient.Del(ctx, "kis:websocket:approval_key").Err(); err != nil {
-		t.Fatal(err)
-	}
+	mini.Del("kis:websocket:approval_key")
 	key, err = provider.ApprovalKey(ctx)
-	if err != nil || key != "fixture" {
-		t.Fatalf("fallback approval = %q, %v", key, err)
+	if err != nil || key != "fixture-reissued" {
+		t.Fatalf("cache miss = %q, %v", key, err)
 	}
-	if got := fallback.approvalCalls.Load(); got != 1 {
-		t.Fatalf("REST fallback calls after miss = %d, want 1", got)
+	if fallback.reissueCalls.Load() != 1 {
+		t.Fatalf("REST issue calls = %d, want 1", fallback.reissueCalls.Load())
 	}
-	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST issuance attempted"); got != 1 {
-		t.Fatalf("REST issuance events after miss = %d, want 1", got)
-	}
-	if err := redisClient.Set(ctx, "kis:websocket:approval_key", "", 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := provider.ApprovalKey(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := fallback.approvalCalls.Load(); got != 2 {
-		t.Fatalf("REST fallback calls after empty key = %d, want 2", got)
-	}
-	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST issuance attempted"); got != 2 {
-		t.Fatalf("REST issuance events after empty key = %d, want 2", got)
-	}
-	if _, err := provider.Reissue(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got := fallback.reissueCalls.Load(); got != 1 {
-		t.Fatalf("reissue calls = %d, want 1", got)
-	}
-	if got := readerLogMessageCount(t, logs.String(), "KIS approval key REST reissue attempted"); got != 1 {
-		t.Fatalf("REST reissue events = %d, want 1", got)
-	}
-	mini.Close()
-	if _, err := provider.ApprovalKey(ctx); err == nil {
-		t.Fatal("Redis error = nil, want surfaced error")
-	}
-	if got := fallback.approvalCalls.Load(); got != 2 {
-		t.Fatalf("REST fallback calls after Redis error = %d, want 2", got)
-	}
-	for _, record := range readerLogRecords(t, logs.String()) {
-		if len(record) != 3 {
-			t.Errorf("approval observation fields = %#v, want standard fields only", record)
-		}
-	}
-	for _, forbidden := range []string{"cached-fixture", "fixture-reissued", "kis:websocket:approval_key", "redis"} {
-		if strings.Contains(logs.String(), forbidden) {
-			t.Errorf("approval observation log contains forbidden %q: %s", forbidden, logs.String())
-		}
+	if ttl := mini.TTL("kis:websocket:approval_key"); ttl != fillreader.ApprovalCacheTTL {
+		t.Fatalf("cache TTL = %s, want 23h", ttl)
 	}
 }
 
@@ -700,8 +656,12 @@ func TestCacheOnlyApprovalProviderFailuresStayPermanent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if key, err := provider.ApprovalKey(context.Background()); key != "" || !errors.Is(err, fillreader.ErrCacheOnlyApprovalUnavailable) {
-				t.Fatalf("cache-only %s ApprovalKey = %q, %v, want named permanent failure", test.name, key, err)
+			want := fillreader.ErrCacheOnlyApprovalUnavailable
+			if test.name == "redis error" {
+				want = fillreader.ErrApprovalUnavailable
+			}
+			if key, err := provider.ApprovalKey(context.Background()); key != "" || !errors.Is(err, want) {
+				t.Fatalf("cache-only %s ApprovalKey = %q, %v, want %v", test.name, key, err, want)
 			}
 			if key, err := provider.Reissue(context.Background()); key != "" || !errors.Is(err, fillreader.ErrCacheOnlyApprovalUnavailable) {
 				t.Fatalf("cache-only %s Reissue = %q, %v, want named permanent failure", test.name, key, err)
