@@ -17,7 +17,11 @@ Container contract (see `deploy/systemd/fillwire.service.example`):
   in the TOML). No secret
   is ever a build arg or an image layer.
 - The TOML is bind-mounted read-only; the binary is invoked as
-  `fillwire -config <in-container path>`.
+  `fillwire -config <in-container path>`. Its `[ingest]` section also carries
+  `token_header` (default `X-Execution-Ledger-Ingest-Token`): the name under
+  which the token is sent, verbatim. It must equal the API side's
+  `EXECUTION_LEDGER_INGEST_TOKEN_HEADER` or every ingest POST is refused with
+  401. A host TOML predating the key needs no edit — the default applies.
 - The image reference is `${IMAGE}` from a systemd `EnvironmentFile` that
   holds exactly one line, `IMAGE=ghcr.io/mgh3326/fillwire@sha256:<64 hex>`.
   Tags are never deployed.

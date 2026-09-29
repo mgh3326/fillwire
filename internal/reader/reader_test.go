@@ -189,8 +189,11 @@ func TestT1NormalPipeline(t *testing.T) {
 		if request.Method != http.MethodPost {
 			t.Errorf("method = %s", request.Method)
 		}
-		if got := request.Header.Get("Authorization"); got != "Bearer test-token" {
-			t.Errorf("authorization = %q", got)
+		if got := request.Header.Get("X-Execution-Ledger-Ingest-Token"); got != "test-token" {
+			t.Errorf("X-Execution-Ledger-Ingest-Token = %q", got)
+		}
+		if got := request.Header.Get("Authorization"); got != "" {
+			t.Errorf("authorization = %q, want none sent", got)
 		}
 		body, err := io.ReadAll(request.Body)
 		if err != nil {

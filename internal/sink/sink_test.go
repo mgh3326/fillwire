@@ -565,6 +565,167 @@ func TestT16DupSuspectIsNotTopLevelIngestField(t *testing.T) {
 	}
 }
 
+// TestIngestAuthHeaderContract mimics the auto_trader ingest middleware: the
+// token must arrive verbatim under X-Execution-Ledger-Ingest-Token (the
+// auto_trader EXECUTION_LEDGER_INGEST_TOKEN_HEADER default), and no
+// Authorization header may ride along. Mutants that send "Bearer <token>", a
+// different default header name, or a prefixed value turn this RED through
+// the 401 path.
+func TestIngestAuthHeaderContract(t *testing.T) {
+	const token = "test-token"
+	var mu sync.Mutex
+	var authValues, tokenValues []string
+	tokenHeaders := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		authValues = append(authValues, request.Header.Get("Authorization"))
+		tokenValues = append(tokenValues, request.Header.Get("X-Execution-Ledger-Ingest-Token"))
+		for name, values := range request.Header {
+			for _, value := range values {
+				if value == token {
+					tokenHeaders[name]++
+				}
+			}
+		}
+		mu.Unlock()
+		if request.Header.Get("X-Execution-Ledger-Ingest-Token") != token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":1,"accepted":1,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null}]}`))
+	}))
+	defer server.Close()
+
+	// No TokenHeader: the client must default to the contract header.
+	client, err := sink.NewClient(sink.HTTPConfig{URL: server.URL, Token: token, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Post(context.Background(), []decode.Record{fixtureRecord(1)})
+	if err != nil {
+		t.Fatalf("Post = %v, want the contract header to authenticate", err)
+	}
+	if response.Accepted != 1 {
+		t.Fatalf("Accepted = %d, want 1", response.Accepted)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokenValues) != 1 || tokenValues[0] != token {
+		t.Fatalf("X-Execution-Ledger-Ingest-Token values = %v, want exactly [%q]", tokenValues, token)
+	}
+	if authValues[0] != "" {
+		t.Fatalf("Authorization header sent by default: %q", authValues[0])
+	}
+	if len(tokenHeaders) != 1 || tokenHeaders["X-Execution-Ledger-Ingest-Token"] != 1 {
+		t.Fatalf("token carried under header names %v, want only X-Execution-Ledger-Ingest-Token", tokenHeaders)
+	}
+}
+
+// TestIngestAuthHeaderRejected proves the contract mimic above actually
+// enforces auth: a wrong token value is refused with 401 exactly as the
+// auto_trader middleware does, and the client error exposes only the code.
+func TestIngestAuthHeaderRejected(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("X-Execution-Ledger-Ingest-Token") != "test-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":1,"accepted":1,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null}]}`))
+	}))
+	defer server.Close()
+	client, err := sink.NewClient(sink.HTTPConfig{URL: server.URL, Token: "wrong-token", Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Post(context.Background(), []decode.Record{fixtureRecord(1)})
+	var status *sink.HTTPStatusError
+	if !errors.As(err, &status) || status.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Post error = %v, want HTTPStatusError 401", err)
+	}
+	if strings.Contains(err.Error(), "wrong-token") {
+		t.Fatalf("status error leaked token: %v", err)
+	}
+}
+
+// TestIngestAuthHeaderOverride sends the token under a configured name —
+// including the edge case where the name is literally Authorization, which
+// must still carry the raw token with no Bearer prefix.
+func TestIngestAuthHeaderOverride(t *testing.T) {
+	const token = "test-token"
+	for _, name := range []string{"X-Desk-Ingest-Token", "Authorization"} {
+		t.Run(name, func(t *testing.T) {
+			var seenValue, seenDefault, seenAuth string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				seenValue = request.Header.Get(name)
+				seenDefault = request.Header.Get("X-Execution-Ledger-Ingest-Token")
+				seenAuth = request.Header.Get("Authorization")
+				if seenValue != token {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":1,"accepted":1,"rejected":0,"results":[{"status":"inserted","row_id":1,"reason":null}]}`))
+			}))
+			defer server.Close()
+			client, err := sink.NewClient(sink.HTTPConfig{URL: server.URL, Token: token, TokenHeader: name, Timeout: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Post(context.Background(), []decode.Record{fixtureRecord(1)}); err != nil {
+				t.Fatalf("Post = %v, want configured header to authenticate", err)
+			}
+			if seenValue != token {
+				t.Fatalf("header %s value = %q, want verbatim %q", name, seenValue, token)
+			}
+			if name == "Authorization" {
+				if seenAuth != token {
+					t.Fatalf("configured Authorization value = %q, want raw %q", seenAuth, token)
+				}
+			} else {
+				if seenAuth != "" {
+					t.Fatalf("Authorization header sent while overridden: %q", seenAuth)
+				}
+				if seenDefault != "" {
+					t.Fatalf("default header sent while overridden: %q", seenDefault)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateIngestTokenHeader(t *testing.T) {
+	for _, name := range []string{
+		sink.DefaultIngestTokenHeader, "Authorization", "X-Custom_Token.1",
+		"a!#$%&'*+-.^_`|~z09",
+	} {
+		if err := sink.ValidateIngestTokenHeader(name); err != nil {
+			t.Fatalf("ValidateIngestTokenHeader(%q) = %v, want nil", name, err)
+		}
+	}
+	for _, name := range []string{
+		"", " ", "Bad Header", "X/Bad", "X:Bad", "X@Bad", "(x)", "x,", "헤더", "X-\xff",
+	} {
+		err := sink.ValidateIngestTokenHeader(name)
+		if err == nil {
+			t.Fatalf("ValidateIngestTokenHeader(%q) = nil, want error", name)
+		}
+		switch err.Error() {
+		case "sink: ingest token header name is empty", "sink: ingest token header name is invalid":
+		default:
+			t.Fatalf("ValidateIngestTokenHeader(%q) error = %q, want a static message with no echo", name, err)
+		}
+	}
+}
+
+// TestNewClientRejectsInvalidTokenHeader keeps programmatic callers fail-closed
+// even when they bypass config loading.
+func TestNewClientRejectsInvalidTokenHeader(t *testing.T) {
+	for _, name := range []string{"Bad Header", "X/Bad", " "} {
+		if _, err := sink.NewClient(sink.HTTPConfig{URL: "https://example.invalid/ingest", Token: "test-token", TokenHeader: name, Timeout: time.Second}); err == nil {
+			t.Fatalf("NewClient accepted TokenHeader %q", name)
+		}
+	}
+}
+
 func testQueue(t *testing.T, consumer string, batchSize int64, claimMinIdle time.Duration) (*redis.Client, *stream.Queue, *decode.Counters) {
 	t.Helper()
 	mini := miniredis.RunT(t)

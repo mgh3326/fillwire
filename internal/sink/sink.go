@@ -22,18 +22,59 @@ import (
 
 const source = "fillwire"
 
+// DefaultIngestTokenHeader is the header the ingest token travels in when the
+// configuration does not name another one. It must equal the auto_trader
+// default of EXECUTION_LEDGER_INGEST_TOKEN_HEADER
+// (auto_trader app/core/config.py; contract documented in
+// docs/runbooks/execution-ledger-ingest.md there). The middleware compares the
+// raw value with hmac.compare_digest — no Bearer prefix.
+const DefaultIngestTokenHeader = "X-Execution-Ledger-Ingest-Token"
+
 // HTTPConfig configures the token-authenticated ingest client.
 type HTTPConfig struct {
-	URL     string
-	Token   string
-	Timeout time.Duration
+	URL string
+	// Token is sent verbatim as the value of TokenHeader.
+	Token string
+	// TokenHeader names the single header carrying Token. Empty selects
+	// DefaultIngestTokenHeader. Any other value must be a valid HTTP field
+	// name (RFC 7230 token); it is never prefixed with a scheme.
+	TokenHeader string
+	Timeout     time.Duration
 }
 
 // Client posts only the allowlisted ledger upsert structure.
 type Client struct {
-	url        string
-	token      string
-	httpClient *http.Client
+	url         string
+	token       string
+	tokenHeader string
+	httpClient  *http.Client
+}
+
+// ValidateIngestTokenHeader rejects names that cannot be sent as an HTTP
+// header field name. Empty is rejected here; the caller defaults it first.
+func ValidateIngestTokenHeader(name string) error {
+	if name == "" {
+		return errors.New("sink: ingest token header name is empty")
+	}
+	for i := 0; i < len(name); i++ {
+		if !isHTTPTokenChar(name[i]) {
+			return errors.New("sink: ingest token header name is invalid")
+		}
+	}
+	return nil
+}
+
+// isHTTPTokenChar reports whether b is an RFC 7230 tchar, the only bytes a
+// header field name may contain.
+func isHTTPTokenChar(b byte) bool {
+	if 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z' || '0' <= b && b <= '9' {
+		return true
+	}
+	switch b {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
 }
 
 // NewClient creates a client with a finite timeout and redirects disabled.
@@ -44,12 +85,20 @@ func NewClient(cfg HTTPConfig) (*Client, error) {
 	if cfg.Token == "" {
 		return nil, errors.New("sink: ingest token is required")
 	}
+	tokenHeader := cfg.TokenHeader
+	if tokenHeader == "" {
+		tokenHeader = DefaultIngestTokenHeader
+	}
+	if err := ValidateIngestTokenHeader(tokenHeader); err != nil {
+		return nil, err
+	}
 	if cfg.Timeout <= 0 {
 		return nil, errors.New("sink: ingest timeout must be positive")
 	}
 	return &Client{
-		url:   cfg.URL,
-		token: cfg.Token,
+		url:         cfg.URL,
+		token:       cfg.Token,
+		tokenHeader: tokenHeader,
 		httpClient: &http.Client{
 			Timeout: cfg.Timeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -60,7 +109,7 @@ func NewClient(cfg HTTPConfig) (*Client, error) {
 }
 
 // ValidateIngestURL rejects transport settings that could disclose the ingest
-// bearer token. Plain HTTP is safe only for an explicitly local test or
+// token. Plain HTTP is safe only for an explicitly local test or
 // colocated endpoint; production endpoints must use HTTPS.
 func ValidateIngestURL(raw string) error {
 	parsed, err := url.ParseRequestURI(raw)
@@ -133,7 +182,10 @@ func (c *Client) Post(ctx context.Context, fills []decode.Record) (Response, err
 		return Response{}, errors.New("sink: could not create ingest request")
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	// The token travels verbatim under the configured header name — the
+	// auto_trader middleware compares the raw value. No Bearer prefix, and no
+	// Authorization header unless tokenHeader is literally "Authorization".
+	req.Header.Set(c.tokenHeader, c.token)
 
 	response, err := c.httpClient.Do(req)
 	if err != nil {

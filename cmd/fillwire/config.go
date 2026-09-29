@@ -41,10 +41,11 @@ type fileConfig struct {
 		ReadBlock    string `toml:"read_block"`
 	} `toml:"stream"`
 	Ingest struct {
-		URL      string `toml:"url"`
-		TokenEnv string `toml:"token_env"`
-		Batch    int64  `toml:"batch_size"`
-		Timeout  string `toml:"timeout"`
+		URL         string `toml:"url"`
+		TokenEnv    string `toml:"token_env"`
+		TokenHeader string `toml:"token_header"`
+		Batch       int64  `toml:"batch_size"`
+		Timeout     string `toml:"timeout"`
 	} `toml:"ingest"`
 	Channel struct {
 		Buffer       int    `toml:"buffer"`
@@ -95,6 +96,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 	}
 	if cfg.Alerts.RateLimit == "" {
 		cfg.Alerts.RateLimit = alert.DefaultRateLimit.String()
+	}
+	if cfg.Ingest.TokenHeader == "" {
+		cfg.Ingest.TokenHeader = sink.DefaultIngestTokenHeader
 	}
 	if err := cfg.validateStatic(); err != nil {
 		return runtimeConfig{}, err
@@ -175,6 +179,9 @@ func (cfg runtimeConfig) validateStatic() error {
 	}
 	if err := sink.ValidateIngestURL(cfg.Ingest.URL); err != nil {
 		return errors.New("config: ingest URL rejected")
+	}
+	if err := sink.ValidateIngestTokenHeader(cfg.Ingest.TokenHeader); err != nil {
+		return errors.New("config: invalid ingest token_header")
 	}
 	return nil
 }

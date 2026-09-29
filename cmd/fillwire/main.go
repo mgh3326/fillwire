@@ -148,7 +148,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	if err != nil {
 		return err
 	}
-	ingestClient, err := sink.NewClient(sink.HTTPConfig{URL: cfg.Ingest.URL, Token: cfg.ingestToken, Timeout: cfg.timeout})
+	ingestClient, err := sink.NewClient(sink.HTTPConfig{URL: cfg.Ingest.URL, Token: cfg.ingestToken, TokenHeader: cfg.Ingest.TokenHeader, Timeout: cfg.timeout})
 	if err != nil {
 		return err
 	}

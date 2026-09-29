@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/mgh3326/fillwire/internal/decode"
 	fillreader "github.com/mgh3326/fillwire/internal/reader"
+	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
@@ -355,6 +357,7 @@ func cacheOnlyRuntimeConfig(redisAddr, ingestURL string) runtimeConfig {
 	cfg.Stream.Group = "fillwire-test"
 	cfg.Stream.Consumer = "consumer"
 	cfg.Ingest.URL = ingestURL
+	cfg.Ingest.TokenHeader = sink.DefaultIngestTokenHeader
 	cfg.Ingest.Batch = 1
 	cfg.Channel.Buffer = 1
 	cfg.Retry.Factor = 2
@@ -386,6 +389,7 @@ func validStaticConfig() runtimeConfig {
 	cfg.Stream.Group = "fillwire-ingest"
 	cfg.Stream.Consumer = "consumer"
 	cfg.Ingest.TokenEnv = "EXECUTION_LEDGER_INGEST_TOKEN"
+	cfg.Ingest.TokenHeader = sink.DefaultIngestTokenHeader
 	cfg.Ingest.Batch = 1
 	cfg.Channel.Buffer = 1
 	return cfg
@@ -460,6 +464,83 @@ func TestMissingCredentialMainExit78(t *testing.T) {
 	}
 	if strings.Count(string(output), "Telegram alerting disabled") != 1 {
 		t.Fatalf("disabled-alert startup log count = %d, want 1", strings.Count(string(output), "Telegram alerting disabled"))
+	}
+}
+
+func TestIngestTokenHeaderConfig(t *testing.T) {
+	t.Setenv("KIS_APP_KEY", "fixture-app")
+	t.Setenv("KIS_APP_SECRET", "fixture-secret")
+	t.Setenv("EXECUTION_LEDGER_INGEST_TOKEN", "fixture-ingest")
+	raw, err := os.ReadFile("../../fillwire.toml")
+	if err != nil {
+		t.Fatalf("ReadFile fillwire.toml = %v", err)
+	}
+	// fillwire.toml must ship the contract header name so the example cannot
+	// drift from auto_trader's EXECUTION_LEDGER_INGEST_TOKEN_HEADER default.
+	shipLine := "token_header = \"X-Execution-Ledger-Ingest-Token\""
+	if !strings.Contains(string(raw), shipLine) {
+		t.Fatalf("fillwire.toml lacks %s", shipLine)
+	}
+	replace := func(line string) string {
+		mutated := strings.Replace(string(raw), shipLine, line, 1)
+		if mutated == string(raw) {
+			t.Fatalf("static mutation did not change fixture: %s", line)
+		}
+		return mutated
+	}
+	load := func(t *testing.T, text string) (runtimeConfig, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "fillwire.toml")
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return loadConfig(path)
+	}
+
+	// The shipped example already carries the contract default.
+	cfg, err := load(t, string(raw))
+	if err != nil {
+		t.Fatalf("loadConfig shipped fillwire.toml = %v", err)
+	}
+	if cfg.Ingest.TokenHeader != sink.DefaultIngestTokenHeader {
+		t.Fatalf("shipped token_header = %q, want %q", cfg.Ingest.TokenHeader, sink.DefaultIngestTokenHeader)
+	}
+
+	// A pre-upgrade deployed file has no token_header key and must still work:
+	// the default is applied when the key is absent.
+	cfg, err = load(t, replace(""))
+	if err != nil {
+		t.Fatalf("loadConfig without token_header = %v", err)
+	}
+	if cfg.Ingest.TokenHeader != sink.DefaultIngestTokenHeader {
+		t.Fatalf("absent token_header = %q, want default %q", cfg.Ingest.TokenHeader, sink.DefaultIngestTokenHeader)
+	}
+
+	// An operator override is honored verbatim.
+	cfg, err = load(t, replace("token_header = \"X-Desk-Ingest\""))
+	if err != nil {
+		t.Fatalf("loadConfig override = %v", err)
+	}
+	if cfg.Ingest.TokenHeader != "X-Desk-Ingest" {
+		t.Fatalf("override token_header = %q, want %q", cfg.Ingest.TokenHeader, "X-Desk-Ingest")
+	}
+
+	// Invalid header names are rejected at config load, before any request can
+	// carry them; the error must never echo the token value.
+	for _, line := range []string{
+		"token_header = \" \"",
+		"token_header = \"Bad Header\"",
+		"token_header = \"X/Bad\"",
+		"token_header = \"X-Bad:Name\"",
+		"token_header = \"Authorization Bearer\"",
+	} {
+		_, err := load(t, replace(line))
+		if err == nil {
+			t.Fatalf("loadConfig accepted %s", line)
+		}
+		if strings.Contains(err.Error(), "fixture-ingest") {
+			t.Fatalf("config error leaked token: %v", err)
+		}
 	}
 }
 
