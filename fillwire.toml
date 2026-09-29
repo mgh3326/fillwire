@@ -28,6 +28,10 @@ read_block = "5s"
 [ingest]
 url = "https://auto-trader.example.invalid/trading/api/execution-ledger/fills/ingest"
 token_env = "EXECUTION_LEDGER_INGEST_TOKEN"
+# Header the token travels in. The default (and the value below) must equal
+# auto_trader's EXECUTION_LEDGER_INGEST_TOKEN_HEADER; a mismatch there or here
+# makes every ingest POST fail with 401.
+token_header = "X-Execution-Ledger-Ingest-Token"
 batch_size = 200
 timeout = "10s"
 
