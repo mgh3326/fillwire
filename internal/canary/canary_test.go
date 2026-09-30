@@ -727,6 +727,36 @@ func TestAmbiguousPlaceReceiptTriggersCheck(t *testing.T) {
 	}
 }
 
+// A decoded 200 check answered fine even when the stored receipt still carries
+// its own error code (e.g. broker_timeout on an unresolved UNKNOWN row).
+// order_check.error_code is reserved for the check itself failing to answer.
+func TestAnsweredCheckNeverCarriesReceiptErrorCode(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.URL.Path == "/v1/price-band":
+			return jsonResponse(`{"schema_version":"price-band/v1","stock_code":"005930","lower_limit":"49700"}`), nil
+		case request.URL.Path == "/v1/commands":
+			return jsonResponse(`{"schema_version":"execution-receipt/v1","command_id":"x","disposition":"UNKNOWN","error_code":"broker_timeout","recorded_at":"2026-09-02T01:00:00Z"}`), nil
+		case strings.HasSuffix(request.URL.Path, "/resolve"):
+			return jsonResponse(`{"schema_version":"command-check/v1","command_id":"x","disposition":"UNKNOWN","error_code":"broker_timeout","evidence_read":"completed","orders_seen":3,"matched":0}`), nil
+		default:
+			return jsonResponse(`{"state":"CANCELLED"}`), nil
+		}
+	})}
+	at := fixedKR(2026, time.September, 2, 10, 0)
+	result := execute(context.Background(), Config{EdgeURL: "http://127.0.0.1:8080", KRSymbol: "005930"}, func() time.Time { return at }, client, Options{}.timeouts())
+	if result.OrderCheck == nil {
+		t.Fatal("order_check missing after ambiguous place")
+	}
+	if result.OrderCheck.ErrorCode != "" {
+		t.Fatalf("order_check.error_code = %q; a decoded 200 check must not carry the receipt error code", result.OrderCheck.ErrorCode)
+	}
+	if result.OrderCheck.Disposition != string(executioncontracts.DispositionUnknown) || result.OrderCheck.EvidenceRead != "completed" ||
+		result.OrderCheck.OrdersSeen != 3 || result.OrderCheck.Matched != 0 {
+		t.Fatalf("order_check = %+v", result.OrderCheck)
+	}
+}
+
 // AC2: the band GET has its own budget. A slow band burns only that budget —
 // the run fails as price_unavailable at the band stage without ever placing.
 func TestSlowBandGetHonorsItsOwnBudget(t *testing.T) {

@@ -24,6 +24,14 @@ environment file, set the SQLite path inside the mounted directory:
 BROKER_EDGE_SQLITE_PATH=/var/lib/broker-edge/kis-mock-edge.sqlite
 ```
 
+This variable is required in the unit's environment file, not optional: when
+it is unset the process silently falls back to `kis-mock-edge.sqlite` relative
+to the container's working directory (`/home/nonroot`), which is writable but
+lives in the ephemeral container layer of `docker run --rm`. A new empty
+receipt database then appears on every start — commands still place and
+cancel normally, but resolve and cancel lookups cannot see rows recorded in
+the host file, and every restart loses the store.
+
 The `:main` tag follows the latest successful main build. Do not run it
 directly in a unit: use the digest-pinning pull deployment documented in
 [`docs/digest-pin-deploy.md`](../docs/digest-pin-deploy.md). The examples below

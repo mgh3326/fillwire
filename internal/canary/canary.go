@@ -412,7 +412,9 @@ func (result *Result) checkOwnOrder(
 			check.EvidenceRead = answered.EvidenceRead
 			check.OrdersSeen = answered.OrdersSeen
 			check.Matched = answered.Matched
-			check.ErrorCode = answered.ErrorCode
+			// A decoded 200 means the check answered; its error_code belongs to
+			// the stored receipt, not to the check itself, so it stays empty.
+			check.ErrorCode = ""
 		}
 	} else {
 		var shadow struct {

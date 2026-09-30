@@ -163,7 +163,9 @@ Local settings:
 - `BROKER_EDGE_LISTEN_ADDR` — optional loopback address; default
   `127.0.0.1:8080`.
 - `BROKER_EDGE_SQLITE_PATH` — optional local receipt database; default
-  `kis-mock-edge.sqlite`.
+  `kis-mock-edge.sqlite` relative to the process working directory. Deployed
+  units must set it to a path inside the mounted state directory: the default
+  lands inside the container's ephemeral layer under `docker run --rm`.
 - `EDGE_KIS_LIVE_SHADOW_ENABLED` — must be exactly `true` to accept `kis_live`
   intent witnesses; otherwise the scope returns `403 scope_disabled`.
 - `EDGE_KIS_LIVE_MODE` — optional; only `shadow` is accepted.

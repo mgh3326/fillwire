@@ -104,8 +104,11 @@ answer. Only a `disposition=ACCEPTED` answer dispatches the usual
 command-id cancel, whose state lands in `order_check.cancel_state`. No other
 order is ever touched, and a successful cleanup does not relabel the failed
 place as `ok`: the outcome stays `place_not_accepted` so the timeout remains
-alertable. `command_not_found` from the check is itself evidence that the
-edge never stored the command.
+alertable. `command_not_found` from the check means the command was absent
+from the edge's store when the check ran; it is not proof the edge could
+never hold it — the original request may still reserve and send it
+afterward, and a check aimed at a different store file than the one that
+recorded the command reports the same absence.
 
 The textfile contains `broker_edge_canary_result{scope,outcome}` (only the
 last result, value 1), `broker_edge_canary_last_run_timestamp_seconds`, and
