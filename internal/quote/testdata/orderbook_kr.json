@@ -1,0 +1,1 @@
+{"type":"message","topic":"orderbook:kr:005930","data":{"timestamp":"2026-09-30T13:15:02.456+09:00","currency":"KRW","asks":[{"price":"72100","volume":"8500"},{"price":"72200","volume":"900"}],"bids":[{"price":"72000","volume":"12000"},{"price":"71900","volume":"300"}]}}

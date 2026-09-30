@@ -1,0 +1,1 @@
+{"type": "subscriptions", "id": "req-2", "subscribed": ["trade:kr:005930"], "rejected": [{"target": "trade:kr:999999", "code": "stock-not-found", "message": "해당 종목을 찾을 수 없습니다."}]}

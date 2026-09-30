@@ -46,3 +46,18 @@ factor = 2
 
 [alerts]
 rate_limit = "10m" # per failure class, per process
+
+# Quote reader (Toss Securities realtime websocket: trade + orderbook ->
+# quotes:toss). Off unless enabled = true. It reads the Toss access token that
+# auto_trader keeps in Redis at [redis] url, read-only; it holds no Toss client
+# id or secret and never issues or refreshes a token. It opens exactly one of
+# the two Toss websocket connections the account allows. Unknown keys in this
+# table reject the reader. See README "Quote reader".
+[quotes]
+enabled = false
+provider = "toss"
+symbols_file = "/etc/fillwire/quote-symbols.txt" # "<kr|us> <code>" per line, at most 40
+token_key = "toss:oauth:0000000000000000:access_token" # the cached token key; replace the 16-hex fingerprint
+stream_key = "quotes:toss" # must start with quotes:
+max_len = 100000 # XADD MAXLEN ~ N
+buffer = 1024 # at most 65536

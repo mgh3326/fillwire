@@ -14,6 +14,7 @@ import (
 
 	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/decode"
+	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
@@ -64,6 +65,14 @@ type runDependencies struct {
 	approvalFallback ws.ApprovalKeyProvider
 	dialer           ws.Dialer
 	alerter          alert.Alerter
+
+	// Quote lane test seams. They are never shared with the fills fields above.
+	quoteToken    quote.TokenSource
+	quoteDialer   quote.Dialer
+	quoteClock    quote.Clock
+	quoteRetryMin time.Duration
+	quoteRetryMax time.Duration
+	quotePing     time.Duration
 }
 
 type kisApprovalIssuer struct{ client *kis.Client }
@@ -200,6 +209,10 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	go func() {
 		runnerDone <- runner.Run(runnerCtx)
 	}()
+	// The quote lane starts after the fills pipeline and never feeds the
+	// select below: its failures cannot stop fillwire.
+	quotes := startQuoteLane(cfg, logger, dependencies)
+	defer quotes.halt()
 
 	var (
 		stopErr         error
@@ -220,6 +233,9 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		runnerFinished = true
 	case stopErr = <-refreshDone:
 	}
+
+	quotes.halt()
+	quotesDeadline := time.Now().Add(quoteStopTimeout)
 
 	// Stop the socket first. The bounded events and records channels remain
 	// live until the separate drain context expires, so a received fill gets an
@@ -264,6 +280,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			logger.Error("ingest runner did not stop before shutdown timeout")
 		}
 	}
+	quotes.wait(quotesDeadline, logger)
 	return stopErr
 }
 

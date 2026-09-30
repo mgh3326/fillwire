@@ -1,0 +1,1 @@
+{"type": "message", "topic": "orderbook:kr:005930", "data": {"timestamp": "2026-06-18T23:30:00.000+09:00", "currency": "KRW", "asks": [{"price": "71500", "volume": "5"}], "bids": [{"price": "71400", "volume": "10"}]}}
