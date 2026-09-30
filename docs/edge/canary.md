@@ -20,6 +20,21 @@ run writes its result as one JSON object to stdout. Set `CANARY_TEXTFILE_DIR` (d
 `/var/lib/node_exporter/textfile`) to expose the atomically replaced
 `broker_edge_canary.prom` node_exporter textfile.
 
+A successful run emits exactly `{"scope":...,"outcome":"ok","timestamp":...}`.
+When the edge rejects a place or cancel, the object additionally carries
+`error_code` (the edge's closed error vocabulary, e.g. `tick_mismatch`,
+`broker_5xx`, `token_expired`) and, when the broker produced an HTTP response,
+`rejection` — an object with the broker's own `rt_cd`, `msg_cd`, `msg1`, and
+`http_status`. Each of `rt_cd`, `msg_cd`, `msg1` is emitted only when the
+broker's JSON value is a string; any other JSON type is replaced by
+`"<non-string omitted>"`. `http_status` is the HTTP status integer from the
+response, never a body field. All `rejection` text is masked at capture so
+account numbers, access tokens, and application keys can never appear;
+`msg1` is capped at 512 runes. The fields are absent on `ok`, `no_session`,
+and `edge_unreachable`
+outcomes and whenever the edge response could not be decoded. `rejection`
+values are response-only evidence: the edge never persists them.
+
 The textfile contains `broker_edge_canary_result{scope,outcome}` (only the
 last result, value 1), `broker_edge_canary_last_run_timestamp_seconds`, and
 `broker_edge_canary_last_success_timestamp_seconds{scope}`. It deliberately

@@ -86,7 +86,9 @@ func (disposition *ExecutionDisposition) UnmarshalJSON(raw []byte) error {
 
 // ExecutionReceiptV1 is the durable acknowledgement of an execution command.
 // BrokerOrderID and ErrorCode are absent unless the corresponding fact is
-// known; no upstream response payload is included.
+// known; no upstream response payload is included. Rejection is the single
+// exception: it carries only the masked failure fields declared by
+// BrokerRejectionV1 and exists on the response alone.
 type ExecutionReceiptV1 struct {
 	SchemaVersion string               `json:"schema_version"`
 	CommandID     string               `json:"command_id"`
@@ -94,6 +96,19 @@ type ExecutionReceiptV1 struct {
 	BrokerOrderID string               `json:"broker_order_id,omitempty"`
 	ErrorCode     string               `json:"error_code,omitempty"`
 	RecordedAt    string               `json:"recorded_at"`
+	Rejection     *BrokerRejectionV1   `json:"rejection,omitempty"`
+}
+
+// BrokerRejectionV1 carries a broker response's own failure fields so a
+// rejected place or cancel leaves evidence. Every text value is masked at
+// capture and capped in length: account numbers, access tokens, and
+// application keys can never appear here. It is response-only and is never
+// written to durable storage.
+type BrokerRejectionV1 struct {
+	RtCd       string `json:"rt_cd,omitempty"`
+	MsgCd      string `json:"msg_cd,omitempty"`
+	Msg1       string `json:"msg1,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
 // TokenLeaseView exposes validity metadata only. It intentionally never carries

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
 )
 
 var errCancelNotEligible = errors.New("cancel target not eligible")
@@ -22,6 +24,9 @@ type PreparedCancelBroker interface {
 type CancelBrokerResult struct {
 	State     CancelState
 	ErrorCode string
+	// Rejection carries the broker's own masked failure fields when the broker
+	// answered. It is response evidence and is never persisted.
+	Rejection *executioncontracts.BrokerRejectionV1
 }
 
 // Cancel returns a durable cancellation result. A committed UNKNOWN marker is
@@ -87,7 +92,9 @@ func (service *Service) Cancel(ctx context.Context, commandID string) (receipt C
 	if result.State == CancelStateUnknown && result.ErrorCode == "" {
 		result.ErrorCode = ErrorBrokerUnknown
 	}
-	return service.Store.FinalizeCancel(ctx, service.cancelReceipt(commandID, result.State, result.ErrorCode))
+	final := service.cancelReceipt(commandID, result.State, result.ErrorCode)
+	final.Rejection = result.Rejection
+	return service.Store.FinalizeCancel(ctx, final)
 }
 
 func (service *Service) cancelReceipt(commandID string, state CancelState, code string) CancelReceipt {

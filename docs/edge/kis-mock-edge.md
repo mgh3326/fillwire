@@ -40,8 +40,13 @@ re-prices a command.
 - `UNKNOWN`: the pending send boundary was crossed but provider acceptance
   cannot be proved.
 
-`broker_order_id` and `error_code` are optional. The response does not contain
-broker payloads, credentials, account identifiers, order details, or tokens.
+`broker_order_id` and `error_code` are optional. When the broker answered a
+place or cancel without accepting it, the response additionally carries
+`rejection`: the broker's own `rt_cd`, `msg_cd`, `msg1`, and `http_status`,
+masked at capture so account numbers, access tokens, and application keys can
+never appear. `rejection` is response-only — no schema column persists it —
+and aside from it the response does not contain broker payloads, credentials,
+account identifiers, order details, or tokens.
 
 ## Durable idempotency and failure semantics
 

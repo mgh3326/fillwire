@@ -167,12 +167,12 @@ func (service *Service) Process(ctx context.Context, command executioncontracts.
 	}
 	result := prepared.Send(ctx)
 	if result.Accepted && result.BrokerOrderID != "" {
-		return service.finalize(ctx, command.CommandID, executioncontracts.DispositionAccepted, result.BrokerOrderID, "", result.KRXForwardOrderOrgNo)
+		return service.finalize(ctx, command.CommandID, executioncontracts.DispositionAccepted, result.BrokerOrderID, "", result.KRXForwardOrderOrgNo, nil)
 	}
 	if result.ErrorCode == "" {
 		result.ErrorCode = ErrorBrokerUnknown
 	}
-	return service.finalize(ctx, command.CommandID, executioncontracts.DispositionUnknown, "", result.ErrorCode, "")
+	return service.finalize(ctx, command.CommandID, executioncontracts.DispositionUnknown, "", result.ErrorCode, "", result.Rejection)
 }
 
 func (service *Service) brokerForScope(scope string) Broker {
@@ -191,9 +191,10 @@ func (service *Service) storeFinal(ctx context.Context, commandID string, dispos
 	return stored, nil
 }
 
-func (service *Service) finalize(ctx context.Context, commandID string, disposition executioncontracts.ExecutionDisposition, brokerOrderID, code, krxForwardOrderOrgNo string) (executioncontracts.ExecutionReceiptV1, error) {
+func (service *Service) finalize(ctx context.Context, commandID string, disposition executioncontracts.ExecutionDisposition, brokerOrderID, code, krxForwardOrderOrgNo string, rejection *executioncontracts.BrokerRejectionV1) (executioncontracts.ExecutionReceiptV1, error) {
 	receipt := service.receipt(commandID, disposition, code)
 	receipt.BrokerOrderID = brokerOrderID
+	receipt.Rejection = rejection
 	stored, err := service.Store.Finalize(ctx, receipt, krxForwardOrderOrgNo)
 	if err != nil {
 		return receipt, err

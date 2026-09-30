@@ -37,11 +37,14 @@ type PreparedBroker interface {
 
 // BrokerResult contains only facts suitable for a receipt. A non-accepted
 // result is deliberately mapped to UNKNOWN by Service after Send begins.
+// Rejection carries the broker's own masked failure fields when the broker
+// answered; it is response evidence and is never persisted.
 type BrokerResult struct {
 	Accepted             bool
 	BrokerOrderID        string
 	KRXForwardOrderOrgNo string
 	ErrorCode            string
+	Rejection            *executioncontracts.BrokerRejectionV1
 }
 
 // KISMockBroker is the real VTS-only broker implementation.
@@ -135,6 +138,7 @@ func (broker KISMockBroker) prepareWithCredentials(
 	return &preparedKISMockBroker{
 		client:  kismockread.NewPinnedHTTPClient(broker.Transport, config.Timeout),
 		request: request,
+		masker:  newSecretMasker(config, token),
 	}, ""
 }
 
@@ -196,7 +200,11 @@ func (broker KISMockBroker) PrepareCancel(ctx context.Context, target CancelTarg
 	request.Header.Set("appsecret", config.AppSecret)
 	request.Header.Set("tr_id", "VTTC0013U")
 	request.Header.Set("custtype", "P")
-	return &preparedKISMockCancel{client: kismockread.NewPinnedHTTPClient(broker.Transport, config.Timeout), request: request}, ""
+	return &preparedKISMockCancel{
+		client:  kismockread.NewPinnedHTTPClient(broker.Transport, config.Timeout),
+		request: request,
+		masker:  newSecretMasker(config, token),
+	}, ""
 }
 
 type mockCancelRequest struct {
@@ -215,6 +223,7 @@ type mockCancelRequest struct {
 type preparedKISMockCancel struct {
 	client  *http.Client
 	request *http.Request
+	masker  *secretMasker
 	mu      sync.Mutex
 	sent    bool
 }
@@ -242,23 +251,24 @@ func (prepared *preparedKISMockCancel) SendCancel(ctx context.Context) CancelBro
 		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
 	}
 	defer response.Body.Close()
+	body, bodyErr := readBrokerBody(response.Body)
+	rejection := maskedRejection(response.StatusCode, body, prepared.masker)
 	if response.StatusCode == http.StatusNotFound {
-		return CancelBrokerResult{State: CancelStateNotFound, ErrorCode: ErrorCancelNotFound}
+		return CancelBrokerResult{State: CancelStateNotFound, ErrorCode: ErrorCancelNotFound, Rejection: rejection}
 	}
 	if response.StatusCode >= http.StatusInternalServerError {
-		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBroker5xx}
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBroker5xx, Rejection: rejection}
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
-	body, err := readBrokerBody(response.Body)
-	if err != nil {
-		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+	if bodyErr != nil {
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
 	rawCode, ok := body["rt_cd"]
 	var code string
 	if !ok || json.Unmarshal(rawCode, &code) != nil || code != "0" {
-		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown}
+		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
 	return CancelBrokerResult{State: CancelStateCancelled}
 }
@@ -266,6 +276,7 @@ func (prepared *preparedKISMockCancel) SendCancel(ctx context.Context) CancelBro
 type preparedKISMockBroker struct {
 	client  *http.Client
 	request *http.Request
+	masker  *secretMasker
 	mu      sync.Mutex
 	sent    bool
 }
@@ -296,28 +307,30 @@ func (prepared *preparedKISMockBroker) Send(ctx context.Context) BrokerResult {
 		return BrokerResult{ErrorCode: ErrorBrokerUnknown}
 	}
 	defer response.Body.Close()
+	body, bodyErr := readBrokerBody(response.Body)
+	// The broker answered: masked response fields are receipt diagnostics,
+	// never stored facts.
+	rejection := maskedRejection(response.StatusCode, body, prepared.masker)
 	if response.StatusCode >= http.StatusInternalServerError {
-		return BrokerResult{ErrorCode: ErrorBroker5xx}
+		return BrokerResult{ErrorCode: ErrorBroker5xx, Rejection: rejection}
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return BrokerResult{ErrorCode: ErrorBrokerUnknown}
+		return BrokerResult{ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
-
-	body, err := readBrokerBody(response.Body)
-	if err != nil {
-		return BrokerResult{ErrorCode: ErrorBrokerUnknown}
+	if bodyErr != nil {
+		return BrokerResult{ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
 	resultCode, present := body["rt_cd"]
 	if !present {
-		return BrokerResult{ErrorCode: ErrorBrokerUnknown}
+		return BrokerResult{ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
 	var resultCodeText string
 	if json.Unmarshal(resultCode, &resultCodeText) != nil || resultCodeText != "0" {
-		return BrokerResult{ErrorCode: ErrorBrokerUnknown}
+		return BrokerResult{ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
 	orderID := brokerOrderID(body)
 	if orderID == "" {
-		return BrokerResult{ErrorCode: ErrorBrokerUnknown}
+		return BrokerResult{ErrorCode: ErrorBrokerUnknown, Rejection: rejection}
 	}
 	return BrokerResult{Accepted: true, BrokerOrderID: orderID, KRXForwardOrderOrgNo: brokerForwardOrderOrgNo(body)}
 }

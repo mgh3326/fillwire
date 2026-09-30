@@ -15,6 +15,8 @@ import (
 	"time"
 
 	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
+	"github.com/mgh3326/broker-edge/internal/kismockedge"
+	"github.com/mgh3326/broker-edge/internal/kismockread"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -236,4 +238,212 @@ func TestFailureOutcomeVocabularyIsClosed(t *testing.T) {
 			t.Fatal("empty outcome")
 		}
 	}
+}
+
+func TestExecutePropagatesRejectionEvidence(t *testing.T) {
+	tests := []struct {
+		name        string
+		placeBody   string
+		cancelBody  string
+		wantOutcome string
+	}{
+		{
+			name:        "place rejected",
+			placeBody:   `{"disposition":"UNKNOWN","error_code":"broker_unknown","rejection":{"rt_cd":"1","msg_cd":"APBK0957","msg1":"refused","http_status":200}}`,
+			wantOutcome: OutcomePlaceNotAccepted,
+		},
+		{
+			name:        "cancel rejected",
+			placeBody:   `{"disposition":"ACCEPTED","broker_order_id":"9001"}`,
+			cancelBody:  `{"state":"UNKNOWN","error_code":"broker_5xx","rejection":{"rt_cd":"1","msg_cd":"EGW00201","msg1":"cancel refused","http_status":500}}`,
+			wantOutcome: OutcomeCancelNotCancelled,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("content-type", "application/json")
+				if request.URL.Path == "/v1/commands" {
+					_, _ = writer.Write([]byte(test.placeBody))
+					return
+				}
+				if test.cancelBody == "" {
+					t.Error("cancel must not be attempted after an unaccepted place")
+					return
+				}
+				_, _ = writer.Write([]byte(test.cancelBody))
+			}))
+			defer server.Close()
+			at := fixedKR(2026, time.September, 2, 10, 0)
+			got := execute(context.Background(), Config{EdgeURL: server.URL, KRSymbol: "005930", KRPrice: "1000"}, func() time.Time { return at }, server.Client())
+			if got.Outcome != test.wantOutcome {
+				t.Fatalf("outcome = %q, want %q", got.Outcome, test.wantOutcome)
+			}
+			if got.ErrorCode == "" || got.Rejection == nil {
+				t.Fatalf("missing evidence: %#v", got)
+			}
+			if got.Rejection.HTTPStatus == 0 || got.Rejection.RtCd != "1" || got.Rejection.MsgCd == "" || got.Rejection.Msg1 == "" {
+				t.Fatalf("rejection = %#v", got.Rejection)
+			}
+		})
+	}
+}
+
+// The success line is the contract every alert and journal reader parses.
+// Any new field must stay absent here.
+func TestSuccessResultJSONIsGolden(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("content-type", "application/json")
+		if request.URL.Path == "/v1/commands" {
+			_ = json.NewEncoder(writer).Encode(executioncontracts.ExecutionReceiptV1{Disposition: executioncontracts.DispositionAccepted, BrokerOrderID: "9001"})
+			return
+		}
+		_ = json.NewEncoder(writer).Encode(cancelReceipt{State: "CANCELLED"})
+	}))
+	defer server.Close()
+	at := fixedKR(2026, time.September, 2, 10, 0)
+	got := execute(context.Background(), Config{EdgeURL: server.URL, KRSymbol: "005930", KRPrice: "1000"}, func() time.Time { return at }, server.Client())
+	if got.Outcome != OutcomeOK {
+		t.Fatalf("outcome = %q", got.Outcome)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const golden = `{"scope":"kis_mock","outcome":"ok","timestamp":"2026-09-02T01:00:00Z"}`
+	if string(encoded) != golden {
+		t.Fatalf("success JSON changed: %s", encoded)
+	}
+}
+
+// The end-to-end AC: a KIS rejection body carrying an account number and a
+// token produces canary output containing neither. This drives a real edge
+// Service and handler; only the broker transport is faked.
+func TestRunMasksSecretsFromRealEdge(t *testing.T) {
+	const (
+		account = "12345678-01"
+		token   = "cached-token-for-test"
+		appKey  = "app-key-for-test"
+	)
+	kis := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := `{"rt_cd":"1","msg_cd":"APBK0957","msg1":"계좌 ` + account + ` 토큰 ` + token + ` 키 ` + appKey + ` 거부"}`
+		if strings.HasSuffix(request.URL.Path, "order-rvsecncl") {
+			body = `{"rt_cd":"1","msg_cd":"EGW00123","msg1":"cancel refused ` + account + ` ` + token + `"}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	store, err := kismockedge.OpenStore(filepath.Join(t.TempDir(), "edge.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	service := &kismockedge.Service{
+		Store:        store,
+		PlaceEnabled: true,
+		Brokers: map[string]kismockedge.Broker{
+			executioncontracts.AccountScopeKISMock: kismockedge.KISMockBroker{
+				Transport: kis,
+				LoadConfig: func() (kismockread.Config, string) {
+					return kismockread.Config{
+						BaseURL:   kismockread.MockBaseURL,
+						AppKey:    appKey,
+						AppSecret: "app-secret-for-test",
+						AccountNo: account,
+						Timeout:   time.Second,
+					}, ""
+				},
+				Tokens: stubTokenLoader{token: token},
+			},
+		},
+	}
+	server := httptest.NewServer(kismockedge.NewHandler(service))
+	defer server.Close()
+	directory := t.TempDir()
+	at := fixedKR(2026, time.September, 2, 10, 0)
+	var stdout strings.Builder
+	lookup := func(key string) string {
+		return map[string]string{"CANARY_EDGE_URL": server.URL, "CANARY_TEXTFILE_DIR": directory}[key]
+	}
+	code := Run(context.Background(), Options{Now: func() time.Time { return at }, Client: server.Client(), Stdout: &stdout, Stderr: io.Discard, Lookup: lookup})
+	if code != 1 {
+		t.Fatalf("Run() = %d, want rejection exit 1", code)
+	}
+	line := stdout.String()
+	for _, secret := range []string{"12345678", account, token, appKey, "app-secret-for-test"} {
+		if strings.Contains(line, secret) {
+			t.Fatalf("secret %q in output: %s", secret, line)
+		}
+	}
+	var result Result
+	if err := json.Unmarshal([]byte(line), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v", err)
+	}
+	if result.Outcome != OutcomePlaceNotAccepted || result.Rejection == nil {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.Rejection.RtCd != "1" || result.Rejection.MsgCd != "APBK0957" || result.Rejection.HTTPStatus != http.StatusOK {
+		t.Fatalf("rejection = %#v", result.Rejection)
+	}
+	if !strings.Contains(result.Rejection.Msg1, "[redacted]") {
+		t.Fatalf("unmasked msg1: %q", result.Rejection.Msg1)
+	}
+}
+
+// A rejected cancel must carry the same masked evidence as a rejected place.
+func TestRunMasksSecretsOnCancelRejection(t *testing.T) {
+	const account = "12345678-01"
+	kis := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(request.URL.Path, "order-rvsecncl") {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(`{"rt_cd":"1","msg_cd":"EGW00123","msg1":"no such order ` + account + `"}`))}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"rt_cd":"0","output":{"ODNO":"9001","KRX_FWDG_ORD_ORGNO":"00000"}}`))}, nil
+	})
+	store, err := kismockedge.OpenStore(filepath.Join(t.TempDir(), "edge.sqlite"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	service := &kismockedge.Service{
+		Store:        store,
+		PlaceEnabled: true,
+		Brokers: map[string]kismockedge.Broker{
+			executioncontracts.AccountScopeKISMock: kismockedge.KISMockBroker{
+				Transport: kis,
+				LoadConfig: func() (kismockread.Config, string) {
+					return kismockread.Config{BaseURL: kismockread.MockBaseURL, AppKey: "app-key-for-test", AppSecret: "app-secret-for-test", AccountNo: account, Timeout: time.Second}, ""
+				},
+				Tokens: stubTokenLoader{token: "cached-token-for-test"},
+			},
+		},
+	}
+	server := httptest.NewServer(kismockedge.NewHandler(service))
+	defer server.Close()
+	at := fixedKR(2026, time.September, 2, 10, 0)
+	var stdout strings.Builder
+	lookup := func(key string) string {
+		return map[string]string{"CANARY_EDGE_URL": server.URL, "CANARY_TEXTFILE_DIR": t.TempDir()}[key]
+	}
+	code := Run(context.Background(), Options{Now: func() time.Time { return at }, Client: server.Client(), Stdout: &stdout, Stderr: io.Discard, Lookup: lookup})
+	if code != 1 {
+		t.Fatalf("Run() = %d, want rejection exit 1", code)
+	}
+	line := stdout.String()
+	if strings.Contains(line, "12345678") {
+		t.Fatalf("account in output: %s", line)
+	}
+	var result Result
+	if err := json.Unmarshal([]byte(line), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v", err)
+	}
+	if result.Outcome != OutcomeCancelNotCancelled || result.Rejection == nil || result.Rejection.MsgCd != "EGW00123" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+type stubTokenLoader struct{ token string }
+
+func (loader stubTokenLoader) Load(context.Context, kismockread.Config) (string, string) {
+	return loader.token, ""
 }

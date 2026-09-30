@@ -112,6 +112,7 @@ func (broker KISMockUSBroker) prepareWithCredentials(
 	return &preparedKISMockBroker{
 		client:  kismockread.NewPinnedHTTPClient(broker.Transport, config.Timeout),
 		request: request,
+		masker:  newSecretMasker(config, token),
 	}, ""
 }
 
@@ -186,6 +187,7 @@ func (broker KISMockUSBroker) PrepareCancel(ctx context.Context, target CancelTa
 	return &preparedKISMockCancel{
 		client:  kismockread.NewPinnedHTTPClient(broker.Transport, config.Timeout),
 		request: request,
+		masker:  newSecretMasker(config, token),
 	}, ""
 }
 

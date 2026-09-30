@@ -137,11 +137,14 @@ func (state CancelState) Valid() bool {
 }
 
 // CancelReceipt is the replayable result of cancelling an accepted command.
+// Rejection is response-only evidence: the cancel_attempts columns are fixed
+// and can never persist it.
 type CancelReceipt struct {
-	CommandID  string      `json:"command_id"`
-	State      CancelState `json:"state"`
-	ErrorCode  string      `json:"error_code,omitempty"`
-	RecordedAt string      `json:"recorded_at"`
+	CommandID  string                                `json:"command_id"`
+	State      CancelState                           `json:"state"`
+	ErrorCode  string                                `json:"error_code,omitempty"`
+	RecordedAt string                                `json:"recorded_at"`
+	Rejection  *executioncontracts.BrokerRejectionV1 `json:"rejection,omitempty"`
 }
 
 // CancelTarget carries only the immutable facts needed to construct a cancel

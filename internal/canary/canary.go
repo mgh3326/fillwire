@@ -48,10 +48,18 @@ type Config struct {
 }
 
 // Result is the public, non-order-sensitive run record written to stdout.
+// ErrorCode and Rejection appear only when the edge produced a decodable
+// rejection receipt; they never affect the success shape.
 type Result struct {
 	Scope     string `json:"scope"`
 	Outcome   string `json:"outcome"`
 	Timestamp string `json:"timestamp"`
+	// ErrorCode is the edge's closed error vocabulary (e.g. broker_5xx,
+	// tick_mismatch, token_expired) distinguishing which layer refused.
+	ErrorCode string `json:"error_code,omitempty"`
+	// Rejection carries the broker's own failure fields, already masked by the
+	// edge so account numbers, tokens, and application keys cannot appear.
+	Rejection *executioncontracts.BrokerRejectionV1 `json:"rejection,omitempty"`
 }
 
 // Options makes the clock, HTTP client, and writers injectable for bounded tests.
@@ -64,7 +72,9 @@ type Options struct {
 }
 
 type cancelReceipt struct {
-	State string `json:"state"`
+	State     string                                `json:"state"`
+	ErrorCode string                                `json:"error_code,omitempty"`
+	Rejection *executioncontracts.BrokerRejectionV1 `json:"rejection,omitempty"`
 }
 
 // ConfigFromEnv returns safe defaults; endpoint validation happens before a request.
@@ -191,6 +201,10 @@ func execute(ctx context.Context, config Config, now func() time.Time, client *h
 	response.Body.Close()
 	if decodeErr != nil || response.StatusCode < 200 || response.StatusCode >= 300 || receipt.Disposition != executioncontracts.DispositionAccepted {
 		result.Outcome = OutcomePlaceNotAccepted
+		if decodeErr == nil {
+			result.ErrorCode = receipt.ErrorCode
+			result.Rejection = receipt.Rejection
+		}
 		return result
 	}
 	cancelRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/commands/"+url.PathEscape(commandID)+"/cancel", nil)
@@ -205,6 +219,10 @@ func execute(ctx context.Context, config Config, now func() time.Time, client *h
 	cancelResponse.Body.Close()
 	if decodeErr != nil || cancelResponse.StatusCode < 200 || cancelResponse.StatusCode >= 300 || cancelled.State != "CANCELLED" {
 		result.Outcome = OutcomeCancelNotCancelled
+		if decodeErr == nil {
+			result.ErrorCode = cancelled.ErrorCode
+			result.Rejection = cancelled.Rejection
+		}
 		return result
 	}
 	result.Outcome = OutcomeOK
