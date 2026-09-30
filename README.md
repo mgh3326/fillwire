@@ -178,11 +178,16 @@ with. So fillwire:
 - treats a token within 120 s of `expires_at` as absent, which is
   auto_trader's own buffer. With no usable token the reader does not dial; it
   re-reads the key at intervals that back off to at most 15 s.
-- after a handshake 401, never redials with that token. It keeps a bounded
-  set of refused-token fingerprints: SHA-256 hashes, never the token, at most
-  32 of them. It dials again only when the cache holds a token outside that
-  set, so a refused A, then a refused B, then A back in the cache does not
-  redial A.
+- after a handshake 401, does not redial with any token whose fingerprint it
+  still holds. It keeps a bounded set of refused-token fingerprints: SHA-256
+  hashes, never the token, the latest 32. It dials again only when the cache
+  holds a token outside that set, so a refused A, then a refused B, then A
+  back in the cache does not redial A.
+  The bound is a deliberate trade-off. A token refused before 32 later
+  refusals has been evicted, and it could be tried once more if the cache
+  rolled back to it while its `expires_at` still looks usable. That attempt
+  gets one more 401, the token is recorded again, and it does not repeat. It
+  never issues a token and never touches fills.
 
 The token is checked only at the handshake. Toss keeps an open connection
 alive after the token expires, so a valid token matters only when connecting

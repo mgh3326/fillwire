@@ -80,10 +80,12 @@ func (l *declareLimiter) reserve() (time.Duration, bool) {
 }
 
 // refusedTokens remembers fingerprints of tokens Toss refused with 401, so
-// the lane never redials with any of them. It holds a SHA-256 fingerprint,
-// never the token, and keeps at most maxRefusedTokens, dropping the oldest.
-// A refused token never becomes valid again, and the configured cache key is
-// fixed for the life of the process, so entries are never cleared otherwise.
+// the lane does not redial with any token it still remembers. It holds a
+// SHA-256 fingerprint, never the token, and keeps at most maxRefusedTokens,
+// dropping the oldest. A token evicted that way could be tried once more if
+// the cache rolled back to it; that costs one extra 401 and re-records it.
+// The configured cache key is fixed for the life of the process, so entries
+// are never cleared otherwise.
 type refusedTokens struct {
 	order []string
 	set   map[string]struct{}
