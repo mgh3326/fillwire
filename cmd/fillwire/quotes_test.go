@@ -365,7 +365,7 @@ func (d *isoDialer) count() int {
 const isoFills = 5
 
 func fillsFrame(index int) string {
-	return fmt.Sprintf("0|H0STCNI9|1|HTS_EXAMPLE^00000000^A12345678%d^0000000000^02^00^00^00^005930^%d^71200^09301%d^0^2", index, index+1, index)
+	return fmt.Sprintf("0|H0STCNI9|1|HTS_EXAMPLE^00000000^A12345678%d^0000000000^02^0^00^0^005930^%d^71200^09301%d^0^2^2^00000^%d^^0^1^Y^^10^^EXAMPLE^71500", index, index+1, index, index+5)
 }
 
 // fillsDialer answers the fills subscription and then delivers isoFills

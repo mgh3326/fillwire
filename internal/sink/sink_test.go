@@ -783,7 +783,7 @@ func jsonLogRecords(t *testing.T, raw string) []map[string]any {
 
 func fixtureRecord(index int) decode.Record {
 	orderID := fmt.Sprintf("ORDER-%03d", index)
-	fields := []string{"HTS_EXAMPLE", "00000000", orderID, "0000000000", "02", "00", "00", "00", "005930", "3", "71200", "093015", "0", "2"}
+	fields := []string{"HTS_EXAMPLE", "00000000", orderID, "0000000000", "02", "0", "00", "0", "005930", "3", "71200", "093015", "0", "2", "2", "00000", "5", "", "0", "1", "Y", "", "10", "", "EXAMPLE", "71500"}
 	return decode.Record{
 		Broker: "kis", AccountMode: "live", Venue: "krx", InstrumentType: "equity_kr",
 		Symbol: "005930", RawSymbol: "005930", Side: "buy", BrokerOrderID: orderID,
