@@ -1,0 +1,7 @@
+# holdings
+005930
+000660  # SK hynix
+# H6 allowlist
+0001A0
+
+035420

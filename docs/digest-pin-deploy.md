@@ -247,6 +247,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fillwire.service
 ```
 
+## Quote reader (optional, off by default)
+
+The quote reader (`[quotes]` in the TOML) is documented in the README section
+"Quote reader (off by default)": turning it on, the symbol file mount, how to verify
+`quotes:kis`, and turning it off. It uses its **own** KIS app key, so it does
+not change the one-session rule above for the fills key. Never give it the
+fills key or the at-kis-ws key.
+
 ## Health surface
 
 fillwire exposes **no** HTTP endpoint, port, or metrics surface — the README

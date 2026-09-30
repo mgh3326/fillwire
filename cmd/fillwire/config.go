@@ -74,6 +74,7 @@ type runtimeConfig struct {
 	appSecret      string
 	refreshMargin  time.Duration
 	alertRateLimit time.Duration
+	quotes         quoteSettings
 }
 
 func loadConfig(path string) (runtimeConfig, error) {
@@ -140,6 +141,8 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if cfg.appSecret, ok = os.LookupEnv(cfg.KIS.AppSecretEnv); !ok || cfg.appSecret == "" {
 		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
 	}
+	// The quote lane resolves last and cannot fail this function.
+	cfg.quotes = resolveQuoteSettings(contents, cfg)
 	return cfg, nil
 }
 

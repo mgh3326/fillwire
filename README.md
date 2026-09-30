@@ -6,7 +6,7 @@ It is a runtime, not a broker client: protocol code lives in separate libraries 
 
 ## Scope
 
-PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`.
+PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`. The optional [quote reader](#quote-reader-off-by-default) is a separate lane on its own socket and app key; it is off unless configured.
 
 The pipeline is deliberately single-consumer at the sink:
 
@@ -130,6 +130,166 @@ and reset on process restart.
 Ingest URLs must use HTTPS, except HTTP is allowed only for `localhost`, `127.0.0.1`, or `::1`. Redis URLs must use `rediss`, except loopback `redis` and `unix` socket URLs. These checks run before startup so neither the ingest token nor the cached approval key can be sent over a remote plaintext connection.
 
 If KIS returns `OPSP8996` (`ws.ErrSessionOccupied`) while subscribing, fillwire does not retry and exits with the named `ExitCodeSessionOccupied` code, `42`. This lets a future supervisor distinguish the session-holder condition from generic failure.
+
+## Quote reader (off by default)
+
+The quote reader subscribes KIS `H0STCNT0` (trade price) and `H0STASP0` (order
+book) for a configured list of at most 40 KRX symbols and appends every tick to
+the Redis Stream `quotes:kis`. It places no orders, applies no policy, and
+writes nothing to the execution ledger. It is off unless `[quotes] enabled =
+true`.
+
+### Isolation from the fills path
+
+KIS admits **one websocket session per app key**: a second socket on the same
+key is refused with `OPSP8996` (go-kis `kis/ws` package documentation; the
+auto_trader `docs/runbooks/ncp-pull-deploy.md` notes the same, and task 836
+records at-kis-ws deploys failing with "appkey in use" while fillwire held the
+session). A quote socket on the fills key would therefore either be refused or,
+if it connected while the fills socket was between reconnects, take the
+session and make fills exit 42. So the quote reader:
+
+- requires its own app key and secret under environment names distinct from
+  `[kis]`, and refuses to start when the quote key's value equals the fills
+  key's value;
+- issues its approval key through its own KIS REST client and caches it in
+  process only. It never reads or writes the fills approval cache
+  (`kis:websocket:approval_key*`) or its lock;
+- owns its websocket, dialer, reconnect loop, Redis client (a separate pool of
+  4 connections with 2s timeouts), and goroutines. A panic in the lane is
+  contained and stops only the lane;
+- never feeds fillwire's exit decision. A socket failure, `OPSP8996` on the
+  quote key, a Redis failure, or a reconnect storm is logged and retried with
+  backoff (5s doubling to 5m between window runs), and exit codes are
+  unchanged;
+- rejects a bad `[quotes]` table (wrong types, a malformed or over-long symbol
+  list, a missing credential) by logging `quote reader disabled:
+  configuration rejected` and running fills exactly as without the table.
+  `[quotes]` is decoded in a separate pass, so it cannot fail the fills
+  configuration.
+
+Tests start the real `runWithDependencies` with the quote lane off and then on
+under healthy traffic, a dial-failure storm, a go-kis reconnect storm,
+`OPSP8996`, and a panic. In every case the `fills:*` stream entries, the fills
+socket's requests, its single dial, and the fills approval cache are identical
+to the off run.
+
+**Limit not established by the repositories:** no source in fillwire, go-kis,
+or auto_trader states how many realtime registrations one KIS session accepts.
+40 symbols × 2 TRs is 80 registrations. A registration KIS refuses is logged
+with its `msg_cd`, counted, and skipped; the accepted ones keep streaming. Check
+`accepted` against `requested` in the log line below before relying on the full
+list. This is one reason the reader ships disabled.
+
+### Trading windows
+
+The socket is open only Monday to Friday, KST, during KRX regular trading
+09:00–15:30 and after-hours 16:00–20:00. Each window includes its closing
+minute, so the socket closes at 15:31:00 and 20:01:00. Outside a window the
+socket is closed with an unsubscribe for every registration. A tick whose own
+exchange time falls outside both windows is dropped. Exchange holidays are not
+modelled: on a holiday the socket opens and receives nothing. Whether KIS
+publishes after-hours prints on these two TR ids has not been verified here.
+If the 16:00–20:00 window stays empty on a trading day, check this first.
+
+### Symbol list file
+
+A plain-text file with one six-character KRX short code (`0-9`, `A-Z`) per
+line. Blank lines are ignored, and `#` starts a comment that runs to the end of
+the line. The file must contain 1 to 40 codes, with no duplicates, and be at
+most 64 KiB. Anything else refuses the quote reader (not fillwire) at startup.
+The desk builds it from current holdings plus the H6 allowlist:
+
+```text
+# holdings
+005930
+000660  # SK hynix
+# H6 allowlist
+0001A0
+```
+
+The file is read once at startup. Restart fillwire to apply a change.
+
+### Stream entries
+
+Each tick is one `XADD quotes:kis MAXLEN ~ <max_len> *` entry with exactly these
+fields, always all present:
+
+| field | value |
+|---|---|
+| `symbol` | KRX short code |
+| `ts` | RFC 3339 KST time: the receipt date plus the frame's exchange `HHMMSS`, for example `2026-09-30T13:15:02+09:00` |
+| `price` | last trade price (`H0STCNT0`); empty on order-book ticks |
+| `bid1`, `ask1` | best bid and ask (`H0STASP0`); empty on trade ticks |
+| `bid_qty`, `ask_qty` | best-level resting quantity (`H0STASP0`); empty on trade ticks |
+| `session` | `regular` or `after_hours` |
+
+Numbers are canonical non-negative decimal integers. No value is carried over
+from an earlier frame. Field positions follow the only layout source in the
+repositories, auto_trader `mock_scalping_ws/quote_protocol.py`. Because that
+source does not map the trade TR's own bid and ask, trade ticks leave them
+empty. Malformed, partial, unknown-symbol, and out-of-window records are
+dropped and counted. The quote lane is lossy by design: when Redis is slow,
+ticks are dropped and counted rather than stalling the quote socket.
+
+### Turning it on (desk)
+
+1. Obtain a KIS app key and secret **dedicated to this reader**. It must not
+   be the fills key, and no other websocket client may use it (at-kis-ws,
+   mock_scalping_ws, another fillwire). Choose `endpoint = "live"` or `"mock"`
+   to match that key.
+2. Add `KIS_QUOTE_APP_KEY` and `KIS_QUOTE_APP_SECRET` (or the names you set in
+   `app_key_env` and `app_secret_env`) to the host env file. Never put their
+   values in the TOML.
+3. Write the symbol list file on the host, for example
+   `/etc/fillwire/quote-symbols.txt`, and mount it read-only into the container
+   by adding
+   `--volume /etc/fillwire/quote-symbols.txt:/etc/fillwire/quote-symbols.txt:ro`
+   to the unit's `docker run` line.
+4. In the host TOML, set:
+
+   ```toml
+   [quotes]
+   enabled = true
+   endpoint = "live"
+   app_key_env = "KIS_QUOTE_APP_KEY"
+   app_secret_env = "KIS_QUOTE_APP_SECRET"
+   symbols_file = "/etc/fillwire/quote-symbols.txt"
+   stream_key = "quotes:kis" # default; must differ from [stream] key
+   max_len = 100000          # default; XADD MAXLEN ~ N
+   buffer = 1024             # default; ticks held for XADD before dropping
+   ```
+
+5. Restart fillwire the usual way (`docs/digest-pin-deploy.md`). A restart also
+   restarts the fills socket, so use the same window you would for a deploy.
+
+### Verifying
+
+```sh
+sudo journalctl -u fillwire.service -n 200 --no-pager | grep -E 'quote reader|KIS websocket initial subscription active'
+# expected: "KIS websocket initial subscription active" (fills, unchanged)
+#           "quote reader started" lane=quotes symbols=<n>
+#           during a window: "quote reader subscriptions active" accepted=<2n> requested=<2n>
+#           outside a window: "quote reader idle outside trading windows" next_open=...
+# must not appear: "quote reader disabled"
+redis-cli -u "$REDIS_URL" XLEN quotes:kis
+redis-cli -u "$REDIS_URL" XREVRANGE quotes:kis + - COUNT 3
+# expected during a window: a growing length; entries with exactly the eight fields above
+redis-cli -u "$REDIS_URL" XLEN fills:kis
+# fills keep flowing exactly as before
+```
+
+Here `$REDIS_URL` is the desk's own Redis connection, typed in the shell and
+not taken from this repository. At each window close, fillwire logs `quote
+reader window closed` with process-local counters: ticks written, and drops by
+reason (malformed, partial, unknown symbol, out of window, buffer full, XADD
+error, rejected subscription).
+
+### Turning it off
+
+Set `enabled = false` (or delete the `[quotes]` table) and restart fillwire.
+The env vars and mount can stay or go. Existing `quotes:kis` entries remain
+until trimmed by `MAXLEN` or deleted by the desk (`DEL quotes:kis`).
 
 ## Idempotency key
 
