@@ -197,10 +197,20 @@ or reconnecting.
 they block enabling the reader, not the code:
 
 1. **Token freshness owner.** Something must keep the cached token valid
-   during the quote windows: KR 08:00–20:00 KST, and US 04:00–20:00 ET. Today
-   auto_trader, or gatewayd in gatewayd mode, refreshes on demand only. If
-   nothing refreshes, the reader stays idle, fails closed, and logs
-   `token_unavailable`.
+   during the quote windows: KR 08:00–20:00 KST, and US 04:00–20:00 ET.
+   auto_trader, or gatewayd in gatewayd mode, refreshes on demand only. The
+   operator accepted on-demand refresh (Q-116 on task 1073).
+   - **Behaviour when the token is stale.** When the cached token is missing,
+     expired, or within 120 s of `expires_at`, the reader stalls and fails
+     closed: it does not dial, and it issues nothing. On every attempt it logs
+     the warning `quote reader window run failed; retrying` with reason
+     `quote: no usable cached Toss access token`, and it re-reads the key at
+     intervals that back off to 15 s. The `token_unavailable` counter grows
+     in the window-close and shutdown summaries.
+   - **Resuming.** The reader resumes as soon as the owner's next on-demand
+     refresh publishes a usable token.
+   - **Open connection.** A connection that is already open is not affected,
+     because Toss checks the token only at the handshake.
 2. **Toss allowed IP.** The fillwire host must be on the Toss allowed-IP list,
    the same list REST uses. Otherwise the handshake returns 403 and the reader
    retries every 5 minutes.
