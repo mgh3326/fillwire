@@ -1,18 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/quote"
-	"github.com/mgh3326/fillwire/internal/reader"
-	"github.com/mgh3326/go-kis/kis"
-	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -21,33 +18,30 @@ const (
 	defaultQuoteMaxLen = 100000
 	quoteStreamPrefix  = "quotes:"
 	defaultQuoteBuffer = 1024
-	// maxQuoteBuffer caps the tick and event buffers. An oversized value would
-	// be a fatal allocation failure, which recover cannot contain and which
-	// would take the fills pipeline down with the process.
+	// maxQuoteBuffer caps the tick buffer. An oversized value would be a
+	// fatal allocation failure, which recover cannot contain and which would
+	// take the fills pipeline down with the process.
 	maxQuoteBuffer = 65536
-	// quoteStopTimeout bounds the wait for the quote socket's unsubscribe and
-	// close at shutdown. go-kis bounds those writes at 5s.
+	// quoteStopTimeout bounds the wait for the quote socket's close at
+	// shutdown.
 	quoteStopTimeout = 7 * time.Second
 	// quoteRedisPoolSize keeps the quote lane on its own small connection
-	// pool, so quote writes can never occupy a connection the fills XADD or
-	// consumer group needs.
+	// pool, so quote reads and writes can never occupy a connection the fills
+	// XADD or consumer group needs.
 	quoteRedisPoolSize = 4
 	quoteRedisTimeout  = 2 * time.Second
 )
 
-// quoteFileConfig is decoded in a second pass over the same TOML, apart from
-// fileConfig, so no [quotes] content can change how the fills settings load.
+// quoteFileConfig is the [quotes] table. It is decoded strictly, apart from
+// fileConfig: an unknown key (for example a credential) rejects the lane.
 type quoteFileConfig struct {
-	Quotes struct {
-		Enabled      bool   `toml:"enabled"`
-		Endpoint     string `toml:"endpoint"`
-		AppKeyEnv    string `toml:"app_key_env"`
-		AppSecretEnv string `toml:"app_secret_env"`
-		SymbolsFile  string `toml:"symbols_file"`
-		StreamKey    string `toml:"stream_key"`
-		MaxLen       int64  `toml:"max_len"`
-		Buffer       int    `toml:"buffer"`
-	} `toml:"quotes"`
+	Enabled     bool   `toml:"enabled"`
+	Provider    string `toml:"provider"`
+	SymbolsFile string `toml:"symbols_file"`
+	TokenKey    string `toml:"token_key"`
+	StreamKey   string `toml:"stream_key"`
+	MaxLen      int64  `toml:"max_len"`
+	Buffer      int    `toml:"buffer"`
 }
 
 // quoteSettings is the resolved quote lane. When enabled is false the lane
@@ -56,10 +50,8 @@ type quoteFileConfig struct {
 type quoteSettings struct {
 	enabled   bool
 	err       error
-	endpoint  string
-	appKey    string
-	appSecret string
-	symbols   []string
+	symbols   []quote.Symbol
+	tokenKey  string
 	streamKey string
 	maxLen    int64
 	buffer    int
@@ -68,44 +60,45 @@ type quoteSettings struct {
 // resolveQuoteSettings never fails the fills configuration. It runs after the
 // fills settings are complete and only reads them.
 func resolveQuoteSettings(contents []byte, fills runtimeConfig) quoteSettings {
-	var file quoteFileConfig
-	if err := toml.Unmarshal(contents, &file); err != nil {
-		// A type error inside [quotes] cannot tell us whether the operator
-		// meant it on, so report it as a rejected lane.
-		return quoteSettings{enabled: true, err: errors.New("quotes: invalid [quotes] TOML")}
-	}
-	q := file.Quotes
-	if !q.Enabled {
-		return quoteSettings{}
-	}
-	settings := quoteSettings{enabled: true}
 	reject := func(reason string) quoteSettings {
 		return quoteSettings{enabled: true, err: errors.New("quotes: " + reason)}
 	}
-	if q.Endpoint != "live" && q.Endpoint != "mock" {
-		return reject("endpoint must be live or mock")
+	var document map[string]any
+	if err := toml.Unmarshal(contents, &document); err != nil {
+		return quoteSettings{}
 	}
-	settings.endpoint = q.Endpoint
-	if strings.TrimSpace(q.AppKeyEnv) == "" || strings.TrimSpace(q.AppSecretEnv) == "" {
-		return reject("app_key_env and app_secret_env are required")
+	rawTable, present := document["quotes"]
+	if !present {
+		return quoteSettings{}
 	}
-	if q.AppKeyEnv == fills.KIS.AppKeyEnv || q.AppSecretEnv == fills.KIS.AppSecretEnv {
-		return reject("quote credentials must use environment names distinct from [kis]")
+	table, ok := rawTable.(map[string]any)
+	if !ok {
+		return reject("[quotes] is not a table")
 	}
-	var ok bool
-	if settings.appKey, ok = os.LookupEnv(q.AppKeyEnv); !ok || settings.appKey == "" {
-		return reject(fmt.Sprintf("required environment variable %s is unset", q.AppKeyEnv))
+	switch enabled := table["enabled"].(type) {
+	case nil:
+		return quoteSettings{}
+	case bool:
+		if !enabled {
+			return quoteSettings{}
+		}
+	default:
+		return reject("enabled must be true or false")
 	}
-	if settings.appSecret, ok = os.LookupEnv(q.AppSecretEnv); !ok || settings.appSecret == "" {
-		return reject(fmt.Sprintf("required environment variable %s is unset", q.AppSecretEnv))
+	encoded, err := toml.Marshal(table)
+	if err != nil {
+		return reject("invalid [quotes] table")
 	}
-	// One KIS app key admits exactly one websocket session (go-kis ws
-	// package documentation; OPSP8996). A quote socket on the fills key would
-	// be refused while fills holds the session, and would take the session
-	// whenever fills is between reconnects, making fills exit 42.
-	if settings.appKey == fills.appKey {
-		return reject("quote app key must differ from the fills app key: one KIS app key admits one websocket session")
+	var q quoteFileConfig
+	decoder := toml.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&q); err != nil {
+		return reject("invalid or unknown [quotes] key")
 	}
+	if q.Provider != "toss" {
+		return reject("provider must be toss")
+	}
+	settings := quoteSettings{enabled: true}
 	if strings.TrimSpace(q.SymbolsFile) == "" {
 		return reject("symbols_file is required")
 	}
@@ -114,6 +107,12 @@ func resolveQuoteSettings(contents []byte, fills runtimeConfig) quoteSettings {
 		return reject(err.Error())
 	}
 	settings.symbols = symbols
+	// The lane reads this one cached token and nothing else; it holds no
+	// Toss client id or secret and can never issue or refresh a token.
+	if !quote.ValidTokenKey(q.TokenKey) {
+		return reject("token_key must be the cached token key toss:oauth:<16 hex>:access_token")
+	}
+	settings.tokenKey = q.TokenKey
 	settings.streamKey = q.StreamKey
 	if settings.streamKey == "" {
 		settings.streamKey = quote.DefaultStreamKey
@@ -149,8 +148,8 @@ type quoteLane struct {
 
 // startQuoteLane starts the quote reader if it is enabled and valid. It
 // shares nothing mutable with the fills pipeline: it builds its own Redis
-// client, KIS REST client, approval provider, and dialer, and it never
-// reports an error that could stop the process.
+// client, token reader, and dialer, and it never reports an error that could
+// stop the process.
 func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies) (lane quoteLane) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -177,44 +176,33 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	redisOptions.WriteTimeout = quoteRedisTimeout
 	redisClient := redis.NewClient(redisOptions)
 
-	endpoint, host := ws.EndpointLive, kis.HostLive
-	if settings.endpoint == "mock" {
-		endpoint, host = ws.EndpointVTS, kis.HostVTS
-	}
-	approval := dependencies.quoteApproval
-	if approval == nil {
-		client, err := kis.NewClient(kis.Config{
-			Host:           host,
-			AppKey:         settings.appKey,
-			AppSecret:      settings.appSecret,
-			RequestTimeout: reader.ApprovalIssueTimeout,
-		})
+	token := dependencies.quoteToken
+	if token == nil {
+		cached, err := quote.NewCachedToken(redisClient, settings.tokenKey, dependencies.quoteClock)
 		if err != nil {
 			_ = redisClient.Close()
-			logger.Error("quote reader disabled: KIS REST client")
+			logger.Error("quote reader disabled", "reason", err.Error())
 			return quoteLane{}
 		}
-		// In-process cache only. The fills approval cache in Redis belongs to
-		// the fills app key and is never read or written by this lane.
-		approval = ws.NewClientApprovalProvider(client)
+		token = cached
 	}
 	dialer := dependencies.quoteDialer
 	if dialer == nil {
-		dialer = ws.NewDialer()
+		dialer = quote.NewDialer()
 	}
 	runner, err := quote.NewRunner(quote.Config{
-		Endpoint:  endpoint,
-		Symbols:   settings.symbols,
-		Approval:  approval,
-		Dialer:    dialer,
-		Redis:     redisClient,
-		StreamKey: settings.streamKey,
-		MaxLen:    settings.maxLen,
-		Buffer:    settings.buffer,
-		Clock:     dependencies.quoteClock,
-		Logger:    logger,
-		RetryMin:  dependencies.quoteRetryMin,
-		Backoff:   dependencies.quoteBackoff,
+		Symbols:      settings.symbols,
+		Token:        token,
+		Dialer:       dialer,
+		Redis:        redisClient,
+		StreamKey:    settings.streamKey,
+		MaxLen:       settings.maxLen,
+		Buffer:       settings.buffer,
+		Clock:        dependencies.quoteClock,
+		Logger:       logger,
+		RetryMin:     dependencies.quoteRetryMin,
+		RetryMax:     dependencies.quoteRetryMax,
+		PingInterval: dependencies.quotePing,
 	})
 	if err != nil {
 		_ = redisClient.Close()
@@ -228,7 +216,7 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 		defer redisClient.Close()
 		runner.Run(ctx)
 	}()
-	logger.Info("quote reader started", "symbols", len(settings.symbols), "stream", settings.streamKey, "endpoint", settings.endpoint)
+	logger.Info("quote reader started", "provider", "toss", "symbols", len(settings.symbols), "stream", settings.streamKey)
 	return quoteLane{stop: stop, done: done}
 }
 

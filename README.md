@@ -6,7 +6,7 @@ It is a runtime, not a broker client: protocol code lives in separate libraries 
 
 ## Scope
 
-PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`. The optional [quote reader](#quote-reader-off-by-default) is a separate lane on its own socket and app key; it is off unless configured.
+PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`. The KIS websocket carries fills only. The optional [quote reader](#quote-reader-off-by-default) is a separate lane on the Toss Securities websocket; it is off unless configured.
 
 The pipeline is deliberately single-consumer at the sink:
 
@@ -133,171 +133,260 @@ If KIS returns `OPSP8996` (`ws.ErrSessionOccupied`) while subscribing, fillwire 
 
 ## Quote reader (off by default)
 
-The quote reader subscribes KIS `H0STCNT0` (trade price) and `H0STASP0` (order
-book) for a configured list of at most 40 KRX symbols and appends every tick to
-the Redis Stream `quotes:kis`. It places no orders, applies no policy, and
-writes nothing to the execution ledger. It is off unless `[quotes] enabled =
-true`.
+The quote reader subscribes the Toss Securities realtime websocket channels
+`trade:kr`, `orderbook:kr`, `trade:us`, and `orderbook:us` for a configured
+list of at most 40 symbols. It appends every tick to the Redis Stream
+`quotes:toss`. It places no orders, applies no policy, and writes nothing to
+the execution ledger. It is off unless `[quotes] enabled = true`. The KIS
+websocket stays dedicated to `fills:kis`; the quote reader never uses KIS.
+
+Protocol source: the Toss Open API realtime AsyncAPI document, version 1.2.2
+(`https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json`). The
+test fixtures in `internal/quote/testdata` follow it, and some are its own
+examples.
+
+### Contract: one Toss websocket connection
+
+Toss allows **two websocket connections per account**. When a third opens,
+Toss accepts it and closes the oldest one without a close code. So:
+
+- fillwire's quote reader is the only Toss websocket client and uses exactly
+  one connection. The second connection is a spare.
+- **auto_trader never opens the Toss websocket.** Any other client that needs
+  it must be agreed first, because two more connections would evict fillwire's.
+- fillwire enforces the one connection in process: its dialer refuses a second
+  dial while a connection is open, and every reconnect closes the old
+  connection before dialing (break before make).
+
+### Access token: read-only, never issued
+
+The websocket handshake uses the same Bearer access token as the Toss REST
+API. Toss allows one valid token per client, so a new token invalidates the
+current one (auto_trader `app/services/brokers/toss/auth.py`). A token issued
+or refreshed by fillwire would break the token auto_trader places orders
+with. So fillwire:
+
+- reads the one Redis key where auto_trader, or broker-edge gatewayd, caches
+  the token: `toss:oauth:<sha256(client_id)[:16]>:access_token`, JSON with
+  `access_token` and `expires_at`. It uses a single `GET` from its own Redis
+  client. The key must be in the Redis at `[redis] url`.
+- holds no Toss client id or secret, and has no code path to the token
+  endpoint. A test scans every non-test Go file for the OAuth path, the REST
+  host, and credential grant names, and pins the only Toss address to the
+  websocket endpoint. This is the non-owner contract auto_trader already
+  defines in `app/services/fill_watch_context/toss_token_boundary.py`.
+- treats a token within 120 s of `expires_at` as absent, which is
+  auto_trader's own buffer. With no usable token the reader does not dial; it
+  re-reads the key at intervals that back off to at most 15 s.
+- after a handshake 401, never redials with that same token. It waits until
+  the owner publishes a different one.
+
+The token is checked only at the handshake. Toss keeps an open connection
+alive after the token expires, so a valid token matters only when connecting
+or reconnecting.
+
+**Enablement prerequisites.** These are decisions for desk and the operator;
+they block enabling the reader, not the code:
+
+1. **Token freshness owner.** Something must keep the cached token valid
+   during the quote windows: KR 08:00–20:00 KST, and US 04:00–20:00 ET. Today
+   auto_trader, or gatewayd in gatewayd mode, refreshes on demand only. If
+   nothing refreshes, the reader stays idle, fails closed, and logs
+   `token_unavailable`.
+2. **Toss allowed IP.** The fillwire host must be on the Toss allowed-IP list,
+   the same list REST uses. Otherwise the handshake returns 403 and the reader
+   retries every 5 minutes.
 
 ### Isolation from the fills path
 
-KIS admits **one websocket session per app key**: a second socket on the same
-key is refused with `OPSP8996` (go-kis `kis/ws` package documentation; the
-auto_trader `docs/runbooks/ncp-pull-deploy.md` notes the same, and task 836
-records at-kis-ws deploys failing with "appkey in use" while fillwire held the
-session). A quote socket on the fills key would therefore either be refused or,
-if it connected while the fills socket was between reconnects, take the
-session and make fills exit 42. So the quote reader:
+- The quote reader owns its websocket, its dialer, and its goroutines. It also
+  owns a separate Redis client: a pool of 4 connections with 2 s timeouts. It
+  reads only the token key and writes only its `quotes:` stream.
+- It never feeds fillwire's exit decision. A socket failure, a Toss error
+  frame, a missing token, a Redis failure, or a reconnect storm is logged and
+  retried with backoff. Backoff starts at 1 s and doubles with jitter to
+  5 min. While waiting for a token, the interval is capped at 15 s. Exit
+  codes are unchanged.
+- A panic in the lane, or in its dialer, transport, or token reader, is
+  contained. It stops only the lane or becomes a retryable error.
+- `[quotes]` is decoded strictly, in a separate pass. A bad table disables
+  only the quote reader, with the log line `quote reader disabled:
+  configuration rejected`. Bad tables include an unknown key such as
+  `client_secret`, a wrong type, a malformed or over-long symbol list, or a
+  bad `token_key`. A disabled table, `enabled = false` or no table at all, is
+  not checked further and opens nothing.
+- The fills code gains only insertions: the lane starts after the fills
+  pipeline and is halted first at shutdown. Waiting for its socket to close
+  is bounded at 7 s after the fills shutdown.
 
-- requires its own app key and secret under environment names distinct from
-  `[kis]`, and refuses to start when the quote key's value equals the fills
-  key's value;
-- issues its approval key through its own KIS REST client and caches it in
-  process only. It never reads or writes the fills approval cache
-  (`kis:websocket:approval_key*`) or its lock;
-- owns its websocket, dialer, reconnect loop, Redis client (a separate pool of
-  4 connections with 2s timeouts), and goroutines. A panic in the lane is
-  contained and stops only the lane;
-- never feeds fillwire's exit decision. A socket failure, `OPSP8996` on the
-  quote key, a Redis failure, or a reconnect storm is logged and retried with
-  backoff (5s doubling to 5m between window runs), and exit codes are
-  unchanged;
-- writes only to a stream key that starts with `quotes:`, so it cannot touch
-  `fills:*` or the `kis:`/`kis_mock:` approval keys;
-- closes its socket when the window ends, including while a dial or
-  subscription is still pending, and within a minute of a wall-clock jump out
-  of the window;
-- wraps the dialer, transport, and approval provider that go-kis calls from
-  its own goroutines, so a panic in any of them becomes an ordinary retryable
-  error instead of a process crash;
-- rejects a bad `[quotes]` table (wrong types, a malformed or over-long symbol
-  list, a missing credential) by logging `quote reader disabled:
-  configuration rejected` and running fills exactly as without the table.
-  `[quotes]` is decoded in a separate pass, so it cannot fail the fills
-  configuration.
+Tests start the real `runWithDependencies`, first with the quote lane off and
+then with it on, under several conditions:
 
-Tests start the real `runWithDependencies` with the quote lane off and then on
-under healthy traffic, a dial-failure storm, a go-kis reconnect storm,
-`OPSP8996`, and a panic. In every case the `fills:*` stream entries, the fills
-socket's requests, its single dial, and the fills approval cache are identical
-to the off run.
+- healthy traffic
+- a dial-failure storm
+- a reconnect storm
+- `server-shutdown` frames
+- a refused token (401)
+- a missing token
+- a panic
 
-**Limit not established by the repositories:** no source in fillwire, go-kis,
-or auto_trader states how many realtime registrations one KIS session accepts.
-40 symbols × 2 TRs is 80 registrations. A registration KIS refuses is logged
-with its `msg_cd`, counted, and skipped; the accepted ones keep streaming. Check
-`accepted` against `requested` in the log line below before relying on the full
-list. This is one reason the reader ships disabled.
+In every case, these are identical to the off run: the `fills:*` stream
+entries, the fills socket's requests, its single dial, and the fills approval
+cache. The cached Toss token is never changed.
 
-### Trading windows
+### Limits
 
-The socket is open only Monday to Friday, KST, during KRX regular trading
-09:00–15:30 and after-hours 16:00–20:00. Each window includes its closing
-minute, so the socket closes at 15:31:00 and 20:01:00. Outside a window the
-socket is closed with an unsubscribe for every registration. A tick whose own
-exchange time falls outside both windows is dropped. Exchange holidays are not
-modelled: on a holiday the socket opens and receives nothing. Whether KIS
-publishes after-hours prints on these two TR ids has not been verified here.
-If the 16:00–20:00 window stays empty on a trading day, check this first.
+The limits come from the AsyncAPI document:
+
+- **100 subscriptions per connection.** Each symbol takes two
+  (trade and orderbook), so the 40-symbol cap uses at most 80.
+- **5 declarations per second.** The reader declares once per connection,
+  spaced at least 1 s apart even across reconnects, and waits 1 s before
+  redeclaring after `rate-limit-exceeded`.
+- **Keepalive.** Toss closes a connection after 180 s with no client frame.
+  The reader sends a text `PING` every 60 s.
+- **Rejected subscriptions.** A rejected entry in the subscription ack (for
+  example `stock-not-found`) is logged with its code and counted, and the
+  accepted entries keep streaming.
+
+### Lossy by design
+
+Toss trade and orderbook frames carry no sequence number. The server may drop
+frames and always favours the latest state. The reader adds its own loss
+point too: when Redis is slow, ticks are dropped and counted rather than
+stalling the socket. Use `quotes:toss` for triggers and touches. It is not a
+record of every print, and cumulative volume cannot be rebuilt from it.
+
+### Sessions
+
+The `session` field comes from each tick's own timestamp and market. Every
+window is Monday to Friday in the market's own time zone. Boundaries follow
+auto_trader: `classify_kr_accept_session` for KR and `us_market_session` for
+US. A window followed by a gap also includes its closing minute.
+
+| session | window |
+|---|---|
+| `nxt_pre` | 08:00–08:50 KST |
+| `krx_regular` | 09:00–15:30 KST |
+| `nxt_after` | 16:00–20:00 KST |
+| `us_pre` | 04:00–09:30 ET |
+| `us_regular` | 09:30–16:00 ET |
+| `us_after` | 16:00–20:00 ET |
+
+- Daylight saving applies to the ET windows, using the embedded tzdata.
+- Some ticks fall outside every window and are dropped and counted: those
+  between 15:31 and 16:00 KST (NXT's after-market opens at 15:40), US
+  day-market ticks, and anything on a weekend.
+- Exchange holidays and early closes are not modelled.
+
+The socket is open during the union of the configured markets' windows.
+Gaps shorter than 30 minutes are merged, so a KR-only list keeps one socket
+from 08:00 to 20:01 KST.
 
 ### Symbol list file
 
-A plain-text file with one six-character KRX short code (`0-9`, `A-Z`) per
-line. Blank lines are ignored, and `#` starts a comment that runs to the end of
-the line. The file must contain 1 to 40 codes, with no duplicates, and be at
-most 64 KiB. Anything else refuses the quote reader (not fillwire) at startup.
-The desk builds it from current holdings plus the H6 allowlist:
+A plain-text file with one `<market> <code>` pair per line, where market is
+`kr` or `us`:
+
+- a KR code is six characters of `0-9` and `A-Z`
+- a US code is an upper-case ticker of up to ten characters from `A-Z`,
+  `0-9`, `.` and `-`, starting with a letter, as the Toss master spells it
+
+Blank lines are ignored, and `#` starts a comment. The file must contain 1 to
+40 entries, with no duplicates, and be at most 64 KiB. Anything else refuses
+the quote reader (not fillwire) at startup. The desk builds it from current
+holdings plus the H6 allowlist:
 
 ```text
 # holdings
-005930
-000660  # SK hynix
+kr 005930
+kr 000660  # SK hynix
 # H6 allowlist
-0001A0
+us AAPL
 ```
 
 The file is read once at startup. Restart fillwire to apply a change.
 
 ### Stream entries
 
-Each tick is one `XADD quotes:kis MAXLEN ~ <max_len> *` entry with exactly these
-fields, always all present:
+Each tick is one `XADD quotes:toss MAXLEN ~ <max_len> *` entry. Every entry
+has exactly these fields, always all present:
 
 | field | value |
 |---|---|
-| `symbol` | KRX short code |
-| `ts` | RFC 3339 KST time: the receipt date plus the frame's exchange `HHMMSS`, for example `2026-09-30T13:15:02+09:00` |
-| `price` | last trade price (`H0STCNT0`); empty on order-book ticks |
-| `bid1`, `ask1` | best bid and ask (`H0STASP0`); empty on trade ticks |
-| `bid_qty`, `ask_qty` | best-level resting quantity (`H0STASP0`); empty on trade ticks |
-| `session` | `regular` or `after_hours` |
+| `symbol` | KR code or US ticker |
+| `ts` | the frame's own timestamp, RFC 3339 with milliseconds, for example `2026-09-30T13:15:02.123+09:00` |
+| `price` | trade price (`trade:*`); empty on orderbook ticks |
+| `bid1`, `bid_qty` | best bid price and volume, from `bids[0]` (`orderbook:*`); empty on trade ticks or an empty side |
+| `ask1`, `ask_qty` | best ask price and volume, from `asks[0]` (`orderbook:*`); empty on trade ticks or an empty side |
+| `session` | one of the session labels above |
 
-Numbers are canonical non-negative decimal integers. No value is carried over
-from an earlier frame. Field positions follow the only layout source in the
-repositories, auto_trader `mock_scalping_ws/quote_protocol.py`. Because that
-source does not map the trade TR's own bid and ask, trade ticks leave them
-empty. Malformed, partial, unknown-symbol, and out-of-window records are
-dropped and counted. The quote lane is lossy by design: when Redis is slow,
-ticks are dropped and counted rather than stalling the quote socket.
+- **Numbers** are the Toss decimal strings as sent, after validation. No value
+  is carried over from an earlier frame.
+- **Dropped and counted:** malformed frames, unknown topics or symbols,
+  orderbook frames with a null timestamp, and out-of-window ticks.
 
 ### Turning it on (desk)
 
-1. Obtain a KIS app key and secret **dedicated to this reader**. It must not
-   be the fills key, and no other websocket client may use it (at-kis-ws,
-   mock_scalping_ws, another fillwire). Choose `endpoint = "live"` or `"mock"`
-   to match that key.
-2. Add `KIS_QUOTE_APP_KEY` and `KIS_QUOTE_APP_SECRET` (or the names you set in
-   `app_key_env` and `app_secret_env`) to the host env file. Never put their
-   values in the TOML.
+1. Settle the two enablement prerequisites above.
+2. Find the cached token key. On the Redis at `[redis] url`, run
+   `redis-cli --scan --pattern 'toss:oauth:*:access_token'`. It prints the
+   key name only. Do not `GET` it.
 3. Write the symbol list file on the host, for example
-   `/etc/fillwire/quote-symbols.txt`, and mount it read-only into the container
+   `/etc/fillwire/quote-symbols.txt`. Mount it read-only into the container
    by adding
    `--volume /etc/fillwire/quote-symbols.txt:/etc/fillwire/quote-symbols.txt:ro`
-   to the unit's `docker run` line.
+   to the unit's `docker run` line. No new environment variable is needed.
 4. In the host TOML, set:
 
    ```toml
    [quotes]
    enabled = true
-   endpoint = "live"
-   app_key_env = "KIS_QUOTE_APP_KEY"
-   app_secret_env = "KIS_QUOTE_APP_SECRET"
+   provider = "toss"
    symbols_file = "/etc/fillwire/quote-symbols.txt"
-   stream_key = "quotes:kis" # default; must start with quotes:
-   max_len = 100000          # default; XADD MAXLEN ~ N
-   buffer = 1024             # default, at most 65536; ticks held for XADD before dropping
+   token_key = "toss:oauth:<16 hex>:access_token"
+   stream_key = "quotes:toss" # default; must start with quotes:
+   max_len = 100000           # default; XADD MAXLEN ~ N
+   buffer = 1024              # default, at most 65536
    ```
 
 5. Restart fillwire the usual way (`docs/digest-pin-deploy.md`). A restart also
-   restarts the fills socket, so use the same window you would for a deploy.
+   restarts the KIS fills socket, so use the same window you would for a
+   deploy.
 
 ### Verifying
 
 ```sh
-sudo journalctl -u fillwire.service -n 200 --no-pager | grep -E 'quote reader|KIS websocket initial subscription active'
+sudo journalctl -u fillwire.service -n 200 --no-pager | grep -E 'quote reader|quote subscription|KIS websocket initial subscription active'
 # expected: "KIS websocket initial subscription active" (fills, unchanged)
-#           "quote reader started" lane=quotes symbols=<n>
-#           during a window: "quote reader subscriptions active" accepted=<2n> requested=<2n>
+#           "quote reader started" lane=quotes provider=toss symbols=<n>
+#           during a window: "quote reader subscriptions active" subscribed=<2n> rejected=0
 #           outside a window: "quote reader idle outside trading windows" next_open=...
-# must not appear: "quote reader disabled"
-redis-cli -u "$REDIS_URL" XLEN quotes:kis
-redis-cli -u "$REDIS_URL" XREVRANGE quotes:kis + - COUNT 3
+# must not appear: "quote reader disabled"; investigate any "quote subscription rejected"
+redis-cli -u "$REDIS_URL" XLEN quotes:toss
+redis-cli -u "$REDIS_URL" XREVRANGE quotes:toss + - COUNT 3
 # expected during a window: a growing length; entries with exactly the eight fields above
 redis-cli -u "$REDIS_URL" XLEN fills:kis
 # fills keep flowing exactly as before
 ```
 
 Here `$REDIS_URL` is the desk's own Redis connection, typed in the shell and
-not taken from this repository. At each window close, fillwire logs `quote
-reader window closed` with process-local counters: ticks written, and drops by
-reason (malformed, partial, unknown symbol, out of window, buffer full, XADD
-error, rejected subscription).
+not taken from this repository. At each window close, and at shutdown,
+fillwire logs process-local counters. They include:
+
+- frames and ticks written
+- drops by reason
+- rejected subscriptions and error frames
+- `token_unavailable` and `token_rejected`
+
+Growing `token_unavailable` means prerequisite 1 is not met. A handshake 403
+in the retry log means prerequisite 2 is not met.
 
 ### Turning it off
 
-Set `enabled = false` (or delete the `[quotes]` table) and restart fillwire.
-The env vars and mount can stay or go. Existing `quotes:kis` entries remain
-until trimmed by `MAXLEN` or deleted by the desk (`DEL quotes:kis`).
+Set `enabled = false`, or delete the `[quotes]` table, and restart fillwire.
+The mount can stay or go. Existing `quotes:toss` entries remain until trimmed
+by `MAXLEN` or deleted by the desk (`DEL quotes:toss`).
 
 ## Idempotency key
 

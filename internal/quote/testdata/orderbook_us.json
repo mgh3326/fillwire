@@ -1,0 +1,1 @@
+{"type":"message","topic":"orderbook:us:AAPL","data":{"timestamp":"2026-09-30T23:30:00.000+09:00","currency":"USD","asks":[{"price":"243.30","volume":"200"}],"bids":[{"price":"243.25","volume":"150"}]}}

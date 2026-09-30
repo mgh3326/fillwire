@@ -1,12 +1,13 @@
 package quote
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -46,127 +46,191 @@ func (c *laneClock) After(d time.Duration) <-chan time.Time {
 	return time.After(min(d, 2*time.Millisecond))
 }
 
-type request struct{ trType, tr, key string }
-
-type fakeTransport struct {
-	in     chan []byte
-	closed chan struct{}
-	once   sync.Once
-	mu     sync.Mutex
-	writes []request
-	ack    func(request) string
+// fakeConn is one fake Toss websocket.
+type fakeConn struct {
+	token   string
+	in      chan []byte
+	closed  chan struct{}
+	once    sync.Once
+	onClose func()
+	mu      sync.Mutex
+	writes  [][]byte
+	onWrite func(*fakeConn, []byte)
+	panicOn string
 }
 
-func (t *fakeTransport) Read(ctx context.Context) ([]byte, error) {
+func (c *fakeConn) Read(ctx context.Context) ([]byte, error) {
+	if c.panicOn == "read" {
+		panic("fixture read panic")
+	}
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-t.closed:
+	case <-c.closed:
 		return nil, io.EOF
-	case frame := <-t.in:
+	case frame := <-c.in:
 		return frame, nil
 	}
 }
 
-func (t *fakeTransport) Write(_ context.Context, raw []byte) error {
-	var frame struct {
-		Header struct {
-			TRType string `json:"tr_type"`
-		} `json:"header"`
-		Body struct {
-			Input struct {
-				TRID  string `json:"tr_id"`
-				TRKey string `json:"tr_key"`
-			} `json:"input"`
-		} `json:"body"`
+func (c *fakeConn) Write(_ context.Context, data []byte) error {
+	select {
+	case <-c.closed:
+		return io.ErrClosedPipe
+	default:
 	}
-	if err := json.Unmarshal(raw, &frame); err != nil {
-		return err
-	}
-	req := request{trType: frame.Header.TRType, tr: frame.Body.Input.TRID, key: frame.Body.Input.TRKey}
-	t.mu.Lock()
-	t.writes = append(t.writes, req)
-	t.mu.Unlock()
-	if req.trType == "1" && t.ack != nil {
-		if reply := t.ack(req); reply != "" {
-			t.push(reply)
-		}
+	c.mu.Lock()
+	c.writes = append(c.writes, append([]byte(nil), data...))
+	c.mu.Unlock()
+	if c.onWrite != nil {
+		c.onWrite(c, data)
 	}
 	return nil
 }
 
-func (t *fakeTransport) WriteControl(context.Context, int, []byte) error { return nil }
-func (t *fakeTransport) Close() error {
-	t.once.Do(func() { close(t.closed) })
+func (c *fakeConn) Close() error {
+	c.once.Do(func() {
+		close(c.closed)
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
 	return nil
 }
-func (t *fakeTransport) isClosed() bool {
+
+func (c *fakeConn) isClosed() bool {
 	select {
-	case <-t.closed:
+	case <-c.closed:
 		return true
 	default:
 		return false
 	}
 }
-func (t *fakeTransport) push(frame string) {
+
+func (c *fakeConn) push(frame []byte) {
 	select {
-	case t.in <- []byte(frame):
-	case <-t.closed:
+	case c.in <- frame:
+	case <-c.closed:
 	}
 }
-func (t *fakeTransport) requests() []request {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return append([]request(nil), t.writes...)
+
+func (c *fakeConn) sent() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]byte(nil), c.writes...)
 }
 
-func ackOK(req request) string {
-	return `{"header":{"tr_id":"` + req.tr + `"},"body":{"rt_cd":"0","msg_cd":"OPSP0000","msg1":"SUBSCRIBE SUCCESS","output":{}}}`
+func (c *fakeConn) count(prefix string) int {
+	n := 0
+	for _, write := range c.sent() {
+		if bytes.HasPrefix(write, []byte(prefix)) {
+			n++
+		}
+	}
+	return n
 }
 
-func ackCode(req request, rtCD, msgCD string) string {
-	return `{"header":{"tr_id":"` + req.tr + `"},"body":{"rt_cd":"` + rtCD + `","msg_cd":"` + msgCD + `","msg1":"fixture","output":{}}}`
+// ackAll answers a declaration by subscribing every requested key.
+func ackAll(c *fakeConn, data []byte) {
+	if !bytes.HasPrefix(data, []byte("[")) {
+		return
+	}
+	var declared []struct {
+		Type  string   `json:"type"`
+		Codes []string `json:"codes"`
+	}
+	if json.Unmarshal(data, &declared) != nil {
+		return
+	}
+	var subscribed []string
+	for _, entry := range declared {
+		for _, code := range entry.Codes {
+			subscribed = append(subscribed, entry.Type+":"+code)
+		}
+	}
+	raw, _ := json.Marshal(map[string]any{"type": "subscriptions", "id": "fillwire-quotes", "subscribed": subscribed, "rejected": []any{}})
+	go c.push(raw)
 }
 
 type fakeDialer struct {
-	mu         sync.Mutex
-	transports []*fakeTransport
-	ack        func(request) string
-	panics     bool
-	dialed     chan *fakeTransport
+	mu        sync.Mutex
+	conns     []*fakeConn
+	tokens    []string
+	endpoints []string
+	open      atomic.Int32
+	maxOpen   atomic.Int32
+	dialed    chan *fakeConn
+	onWrite   func(*fakeConn, []byte)
+	refuse    func(token string) error
+	panics    bool
+	panicOn   string
 }
 
-func newFakeDialer(ack func(request) string) *fakeDialer {
-	return &fakeDialer{ack: ack, dialed: make(chan *fakeTransport, 1024)}
+func newFakeDialer(onWrite func(*fakeConn, []byte)) *fakeDialer {
+	return &fakeDialer{onWrite: onWrite, dialed: make(chan *fakeConn, 1024)}
 }
 
-func (d *fakeDialer) Dial(context.Context, string) (ws.Transport, error) {
+func (d *fakeDialer) Dial(_ context.Context, endpoint, token string) (Transport, error) {
 	if d.panics {
 		panic("fixture dialer panic")
 	}
-	transport := &fakeTransport{in: make(chan []byte, 1024), closed: make(chan struct{}), ack: d.ack}
 	d.mu.Lock()
-	d.transports = append(d.transports, transport)
+	d.tokens = append(d.tokens, token)
+	d.endpoints = append(d.endpoints, endpoint)
+	refuse := d.refuse
 	d.mu.Unlock()
-	d.dialed <- transport
-	return transport, nil
+	if refuse != nil {
+		if err := refuse(token); err != nil {
+			return nil, err
+		}
+	}
+	conn := &fakeConn{token: token, in: make(chan []byte, 1024), closed: make(chan struct{}), onWrite: d.onWrite, panicOn: d.panicOn}
+	if now := d.open.Add(1); now > d.maxOpen.Load() {
+		d.maxOpen.Store(now)
+	}
+	conn.onClose = func() { d.open.Add(-1) }
+	d.mu.Lock()
+	d.conns = append(d.conns, conn)
+	d.mu.Unlock()
+	d.dialed <- conn
+	return conn, nil
 }
 
-func (d *fakeDialer) count() int {
+func (d *fakeDialer) dials() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return len(d.transports)
+	return len(d.tokens)
 }
 
-type fakeApproval struct{ calls atomic.Int32 }
-
-func (a *fakeApproval) ApprovalKey(context.Context) (string, error) {
-	a.calls.Add(1)
-	return "quote-fixture-key", nil
+func (d *fakeDialer) usedTokens() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.tokens...)
 }
-func (a *fakeApproval) Reissue(context.Context) (string, error) {
-	a.calls.Add(1)
-	return "quote-fixture-key-2", nil
+
+// switchToken is a TokenSource whose answer tests can change.
+type switchToken struct {
+	mu    sync.Mutex
+	token string
+	err   error
+	calls atomic.Int32
+	panic bool
+}
+
+func (s *switchToken) Token(context.Context) (string, error) {
+	s.calls.Add(1)
+	if s.panic {
+		panic("fixture token panic")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token, s.err
+}
+
+func (s *switchToken) set(token string, err error) {
+	s.mu.Lock()
+	s.token, s.err = token, err
+	s.mu.Unlock()
 }
 
 type argsHook struct {
@@ -190,39 +254,42 @@ func (h *argsHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.Pro
 type lane struct {
 	runner *Runner
 	dialer *fakeDialer
+	token  *switchToken
 	mini   *miniredis.Miniredis
-	client *redis.Client
+	client *redis.Client // the lane's own client, audited by hook
+	reader *redis.Client // a separate client for test assertions
 	hook   *argsHook
 	clock  *laneClock
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-func startLane(t *testing.T, at time.Time, ack func(request) string, mutate func(*Config)) *lane {
+func startLane(t *testing.T, at time.Time, onWrite func(*fakeConn, []byte), mutate func(*Config, *lane)) *lane {
 	t.Helper()
 	mini := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	hook := &argsHook{}
 	client.AddHook(hook)
-	l := &lane{dialer: newFakeDialer(ack), mini: mini, client: client, hook: hook, clock: newLaneClock(at), done: make(chan struct{})}
+	reader := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = reader.Close() })
+	l := &lane{dialer: newFakeDialer(onWrite), token: &switchToken{token: "cached-token-1"}, mini: mini, client: client, reader: reader, hook: hook, clock: newLaneClock(at), done: make(chan struct{})}
 	cfg := Config{
-		Endpoint:  ws.EndpointLive,
-		Symbols:   []string{"005930", "000660"},
-		Approval:  &fakeApproval{},
-		Dialer:    l.dialer,
-		Redis:     client,
-		StreamKey: DefaultStreamKey,
-		MaxLen:    500,
-		Buffer:    64,
-		Clock:     l.clock,
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		RetryMin:  time.Millisecond,
-		RetryMax:  5 * time.Millisecond,
-		Backoff:   ws.BackoffConfig{Min: time.Millisecond, Max: 2 * time.Millisecond, Jitter: -1},
+		Symbols:      testSymbols,
+		Token:        l.token,
+		Dialer:       l.dialer,
+		Redis:        client,
+		StreamKey:    DefaultStreamKey,
+		MaxLen:       500,
+		Buffer:       64,
+		Clock:        l.clock,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RetryMin:     time.Millisecond,
+		RetryMax:     5 * time.Millisecond,
+		PingInterval: 10 * time.Millisecond,
 	}
 	if mutate != nil {
-		mutate(&cfg)
+		mutate(&cfg, l)
 	}
 	runner, err := NewRunner(cfg)
 	if err != nil {
@@ -259,299 +326,326 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-func subscribed(transport *fakeTransport, n int) func() bool {
-	return func() bool {
-		count := 0
-		for _, req := range transport.requests() {
-			if req.trType == "1" {
-				count++
-			}
-		}
-		return count >= n
-	}
-}
-
+// Wednesday 30 September 2026, 13:15 KST: KRX regular session.
 var wednesdayMidday = time.Date(2026, time.September, 30, 13, 15, 0, 0, KST)
 
-func TestRunnerStreamsFixtureFramesWithExactFields(t *testing.T) {
-	l := startLane(t, wednesdayMidday, ackOK, nil)
-	transport := <-l.dialer.dialed
-	waitFor(t, "four subscriptions", subscribed(transport, 4))
-	transport.push(readFrame(t, "h0stcnt0.frame"))
-	transport.push(readFrame(t, "h0stasp0.frame"))
-	transport.push(strings.Replace(readFrame(t, "h0stcnt0.frame"), "005930", "035420", 1)) // unconfigured
-	transport.push("0|H0STCNT0|001|005930^1315")                                           // partial
-	waitFor(t, "two stream entries", func() bool { return l.client.XLen(context.Background(), "quotes:kis").Val() == 2 })
+func krOnly(cfg *Config, _ *lane) { cfg.Symbols = []Symbol{{MarketKR, "005930"}, {MarketKR, "000660"}} }
+
+func TestRunnerStreamsFramesWithExactFields(t *testing.T) {
+	l := startLane(t, wednesdayMidday, ackAll, nil)
+	conn := <-l.dialer.dialed
+	waitFor(t, "declaration", func() bool { return conn.count("[") == 1 })
+	wantDeclaration := `[{"id":"fillwire-quotes"},{"codes":["005930","000660"],"type":"trade:kr"},{"codes":["005930","000660"],"type":"orderbook:kr"},{"codes":["AAPL"],"type":"trade:us"},{"codes":["AAPL"],"type":"orderbook:us"}]`
+	if got := string(conn.sent()[0]); got != wantDeclaration {
+		t.Fatalf("declaration = %s\nwant %s", got, wantDeclaration)
+	}
+	if conn.token != "cached-token-1" || l.dialer.endpoints[0] != Endpoint {
+		t.Fatalf("dial token=%q endpoint=%q", conn.token, l.dialer.endpoints[0])
+	}
+	conn.push(fixture(t, "trade_kr.json"))
+	conn.push(fixture(t, "orderbook_kr.json"))
+	conn.push([]byte(`{"type":"message","topic":"trade:kr:035420","data":{"price":"1","timestamp":"2026-09-30T13:15:02.000+09:00"}}`))
+	conn.push([]byte(`{"type":"message","topic":"trade:kr:005930","data":{"price":"x"}}`))
+	conn.push([]byte(`{"type":"pong"}`))
+	waitFor(t, "two stream entries", func() bool { return l.reader.XLen(context.Background(), "quotes:toss").Val() == 2 })
 	waitFor(t, "drop counters", func() bool {
-		return l.runner.Counters().DropUnknownSymbol.Load() == 1 && l.runner.Counters().DropPartial.Load() == 1
+		c := l.runner.Counters()
+		return c.DropUnknownSymbol.Load() == 1 && c.DropMalformed.Load() == 1
 	})
-
-	got := transport.requests()
-	sort.Slice(got, func(i, j int) bool { return got[i].tr+got[i].key < got[j].tr+got[j].key })
-	want := []request{{"1", "H0STASP0", "000660"}, {"1", "H0STASP0", "005930"}, {"1", "H0STCNT0", "000660"}, {"1", "H0STCNT0", "005930"}}
-	if len(got) != len(want) {
-		t.Fatalf("socket requests = %+v, want %+v", got, want)
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("socket requests = %+v, want %+v", got, want)
-		}
-	}
-
-	entries, err := l.client.XRange(context.Background(), "quotes:kis", "-", "+").Result()
+	entries, err := l.reader.XRange(context.Background(), "quotes:toss", "-", "+").Result()
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantValues := []map[string]string{
-		{"symbol": "005930", "ts": "2026-09-30T13:15:02+09:00", "price": "70500", "bid1": "", "ask1": "", "bid_qty": "", "ask_qty": "", "session": "regular"},
-		{"symbol": "005930", "ts": "2026-09-30T13:15:02+09:00", "price": "", "bid1": "70500", "ask1": "70600", "bid_qty": "2300", "ask_qty": "1200", "session": "regular"},
+	want := []map[string]string{
+		{"symbol": "005930", "ts": "2026-09-30T13:15:02.123+09:00", "price": "72000", "bid1": "", "ask1": "", "bid_qty": "", "ask_qty": "", "session": "krx_regular"},
+		{"symbol": "005930", "ts": "2026-09-30T13:15:02.456+09:00", "price": "", "bid1": "72000", "ask1": "72100", "bid_qty": "12000", "ask_qty": "8500", "session": "krx_regular"},
 	}
 	for index, entry := range entries {
 		if len(entry.Values) != len(StreamFields) {
-			t.Fatalf("entry %d has %d fields, want exactly %v: %v", index, len(entry.Values), StreamFields, entry.Values)
+			t.Fatalf("entry %d has %d fields: %v", index, len(entry.Values), entry.Values)
 		}
-		for name, value := range wantValues[index] {
+		for name, value := range want[index] {
 			if entry.Values[name] != value {
 				t.Fatalf("entry %d %s = %v, want %q", index, name, entry.Values[name], value)
 			}
 		}
 	}
-
 	l.hook.mu.Lock()
 	defer l.hook.mu.Unlock()
-	xadds := 0
 	for _, args := range l.hook.args {
-		if strings.EqualFold(args[0].(string), "xadd") {
-			xadds++
-			if got := strings.ToLower(fmt.Sprint(args[:6])); got != "[xadd quotes:kis maxlen ~ 500 *]" {
-				t.Fatalf("XADD args = %s, want MAXLEN ~ 500 on quotes:kis", got)
-			}
-			var names []interface{}
-			for index := 6; index < len(args); index += 2 {
-				names = append(names, args[index])
-			}
-			if got := fmt.Sprint(names); got != fmt.Sprint(StreamFields) {
-				t.Fatalf("XADD field names = %s, want %v", got, StreamFields)
-			}
+		name := strings.ToLower(fmt.Sprint(args[0]))
+		if name == "hello" || name == "client" {
+			continue // connection handshake
+		}
+		if name != "xadd" {
+			t.Fatalf("lane Redis client issued %s; only XADD expected", name)
+		}
+		if got := strings.ToLower(fmt.Sprint(args[:6])); got != "[xadd quotes:toss maxlen ~ 500 *]" {
+			t.Fatalf("XADD args = %s", got)
+		}
+		var names []interface{}
+		for index := 6; index < len(args); index += 2 {
+			names = append(names, args[index])
+		}
+		if fmt.Sprint(names) != fmt.Sprint(StreamFields) {
+			t.Fatalf("XADD field names = %v", names)
 		}
 	}
-	if xadds != 2 {
-		t.Fatalf("XADD count = %d, want 2", xadds)
+}
+
+func TestRunnerSendsTextPing(t *testing.T) {
+	l := startLane(t, wednesdayMidday, ackAll, nil)
+	conn := <-l.dialer.dialed
+	waitFor(t, "two pings", func() bool { return conn.count("PING") >= 2 })
+	for _, write := range conn.sent() {
+		if s := string(write); s != "PING" && !strings.HasPrefix(s, "[") {
+			t.Fatalf("unexpected client frame %q", s)
+		}
 	}
 }
 
 func TestRunnerStaysOffOutsideTradingWindows(t *testing.T) {
 	for name, at := range map[string]time.Time{
-		"before open":      time.Date(2026, time.September, 30, 8, 30, 0, 0, KST),
-		"between sessions": time.Date(2026, time.September, 30, 15, 45, 0, 0, KST),
-		"night":            time.Date(2026, time.September, 30, 20, 30, 0, 0, KST),
-		"saturday":         time.Date(2026, time.October, 3, 10, 0, 0, 0, KST),
+		"before KR open": time.Date(2026, time.September, 30, 7, 30, 0, 0, KST),
+		"KR night":       time.Date(2026, time.September, 30, 21, 0, 0, 0, KST),
+		"saturday":       time.Date(2026, time.October, 3, 12, 0, 0, 0, KST),
 	} {
 		t.Run(name, func(t *testing.T) {
-			approval := &fakeApproval{}
-			l := startLane(t, at, ackOK, func(cfg *Config) { cfg.Approval = approval })
-			time.Sleep(50 * time.Millisecond)
-			if l.dialer.count() != 0 || approval.calls.Load() != 0 {
-				t.Fatalf("outside window: dials=%d approvals=%d, want 0", l.dialer.count(), approval.calls.Load())
+			l := startLane(t, at, ackAll, krOnly)
+			time.Sleep(40 * time.Millisecond)
+			if l.dialer.dials() != 0 || l.token.calls.Load() != 0 {
+				t.Fatalf("outside window: dials=%d token reads=%d, want 0", l.dialer.dials(), l.token.calls.Load())
 			}
 		})
 	}
 }
 
 func TestRunnerClosesSocketWhenWindowCloses(t *testing.T) {
-	l := startLane(t, time.Date(2026, time.September, 30, 15, 30, 50, 0, KST), ackOK, nil)
-	transport := <-l.dialer.dialed
-	waitFor(t, "four subscriptions", subscribed(transport, 4))
-	l.clock.set(time.Date(2026, time.September, 30, 15, 31, 0, 0, KST))
-	waitFor(t, "socket close", transport.isClosed)
-	unsubscribes := 0
-	for _, req := range transport.requests() {
-		if req.trType == "2" {
-			unsubscribes++
-		}
-	}
-	if unsubscribes != 4 {
-		t.Fatalf("unsubscribe frames = %d, want 4", unsubscribes)
-	}
+	l := startLane(t, time.Date(2026, time.September, 30, 20, 0, 50, 0, KST), ackAll, krOnly)
+	conn := <-l.dialer.dialed
+	waitFor(t, "declaration", func() bool { return conn.count("[") == 1 })
+	l.clock.set(time.Date(2026, time.September, 30, 20, 1, 0, 0, KST))
+	waitFor(t, "socket close at window end", conn.isClosed)
 	time.Sleep(30 * time.Millisecond)
-	if l.dialer.count() != 1 {
-		t.Fatalf("dials after window close = %d, want 1", l.dialer.count())
-	}
-	// Reopen at after-hours: one new socket.
-	l.clock.set(time.Date(2026, time.September, 30, 16, 0, 0, 0, KST))
-	next := <-l.dialer.dialed
-	waitFor(t, "after-hours subscriptions", subscribed(next, 4))
-}
-
-func TestRunnerKeepsStreamingWhenOneSubscriptionIsRejected(t *testing.T) {
-	ack := func(req request) string {
-		if req.tr == ws.TRQuoteBook && req.key == "000660" {
-			return ackCode(req, "1", "OPSP0008")
-		}
-		return ackOK(req)
-	}
-	l := startLane(t, wednesdayMidday, ack, nil)
-	transport := <-l.dialer.dialed
-	waitFor(t, "four subscribe attempts", subscribed(transport, 4))
-	transport.push(readFrame(t, "h0stcnt0.frame"))
-	waitFor(t, "one entry", func() bool { return l.client.XLen(context.Background(), "quotes:kis").Val() == 1 })
-	if got := l.runner.Counters().SubscribeRejected.Load(); got != 1 {
-		t.Fatalf("rejected subscriptions = %d, want 1", got)
-	}
-	if transport.isClosed() || l.dialer.count() != 1 {
-		t.Fatalf("rejection closed=%t dials=%d, want the socket kept", transport.isClosed(), l.dialer.count())
-	}
-}
-
-func TestRunnerRetriesSessionOccupiedWithoutReturning(t *testing.T) {
-	l := startLane(t, wednesdayMidday, func(req request) string { return ackCode(req, "1", "OPSP8996") }, nil)
-	waitFor(t, "repeated dials", func() bool { return l.dialer.count() >= 3 })
-	select {
-	case <-l.done:
-		t.Fatal("quote runner returned on OPSP8996; it must keep retrying on its own lane")
-	default:
-	}
-}
-
-func TestRunnerRedisFailureNeverStallsSocket(t *testing.T) {
-	l := startLane(t, wednesdayMidday, ackOK, func(cfg *Config) { cfg.Buffer = 4 })
-	transport := <-l.dialer.dialed
-	waitFor(t, "four subscriptions", subscribed(transport, 4))
-	l.mini.SetError("ERR synthetic redis failure")
-	const frames = 300
-	go func() {
-		for index := 0; index < frames; index++ {
-			transport.push(readFrame(t, "h0stcnt0.frame"))
-		}
-	}()
-	waitFor(t, "all frames drained", func() bool { return l.runner.Counters().Events.Load() == frames })
-	counters := l.runner.Counters()
-	if counters.XAddErrors.Load() == 0 {
-		t.Fatal("no XADD error observed")
-	}
-	if counters.XAddErrors.Load()+counters.DropBufferFull.Load()+counters.TicksWritten.Load() > frames {
-		t.Fatalf("tick accounting exceeds frames: %+v", counters.logArgs())
-	}
-}
-
-func TestRunnerContainsDialerPanic(t *testing.T) {
-	l := startLane(t, wednesdayMidday, ackOK, func(cfg *Config) {
-		cfg.Dialer.(*fakeDialer).panics = true
-	})
-	// Contained as a failed dial and retried; the lane neither crashes nor
-	// stops on its own.
-	time.Sleep(30 * time.Millisecond)
-	select {
-	case <-l.done:
-		t.Fatal("quote lane stopped on a contained dialer panic")
-	default:
-	}
-}
-
-// panicTransport panics inside Read, which go-kis calls from its own reader
-// goroutine, beyond the lane's guard.
-type panicTransport struct{ *fakeTransport }
-
-func (panicTransport) Read(context.Context) ([]byte, error) { panic("fixture transport panic") }
-
-type panicReadDialer struct{ dials atomic.Int32 }
-
-func (d *panicReadDialer) Dial(context.Context, string) (ws.Transport, error) {
-	d.dials.Add(1)
-	return panicTransport{&fakeTransport{in: make(chan []byte), closed: make(chan struct{})}}, nil
-}
-
-type panicApproval struct{}
-
-func (panicApproval) ApprovalKey(context.Context) (string, error) { panic("fixture approval panic") }
-func (panicApproval) Reissue(context.Context) (string, error)     { panic("fixture approval panic") }
-
-func TestRunnerContainsPanicsInGoKISGoroutines(t *testing.T) {
-	dialer := &panicReadDialer{}
-	l := startLane(t, wednesdayMidday, ackOK, func(cfg *Config) { cfg.Dialer = dialer })
-	waitFor(t, "redials after contained read panics", func() bool { return dialer.dials.Load() >= 3 })
-	select {
-	case <-l.done:
-		t.Fatal("quote lane stopped")
-	default:
-	}
-
-	approval := startLane(t, wednesdayMidday, ackOK, func(cfg *Config) { cfg.Approval = panicApproval{} })
-	time.Sleep(30 * time.Millisecond)
-	if approval.dialer.count() != 0 {
-		t.Fatalf("dialled %d times without an approval key", approval.dialer.count())
+	if l.dialer.dials() != 1 {
+		t.Fatalf("dials after window close = %d, want 1", l.dialer.dials())
 	}
 }
 
 func TestRunnerClosesSocketOnBackwardClockJump(t *testing.T) {
-	l := startLane(t, wednesdayMidday, ackOK, nil)
-	transport := <-l.dialer.dialed
-	waitFor(t, "four subscriptions", subscribed(transport, 4))
-	l.clock.set(time.Date(2026, time.September, 30, 8, 30, 0, 0, KST))
-	waitFor(t, "socket close after the clock left the window", transport.isClosed)
+	l := startLane(t, wednesdayMidday, ackAll, krOnly)
+	conn := <-l.dialer.dialed
+	l.clock.set(time.Date(2026, time.September, 30, 6, 0, 0, 0, KST))
+	waitFor(t, "socket close after the clock left the window", conn.isClosed)
 	time.Sleep(20 * time.Millisecond)
-	if l.dialer.count() != 1 {
-		t.Fatalf("dials = %d outside the window, want 1", l.dialer.count())
+	if l.dialer.dials() != 1 {
+		t.Fatalf("dials outside the window = %d, want 1", l.dialer.dials())
 	}
 }
 
-func TestRunnerWindowCloseCancelsPendingSubscribe(t *testing.T) {
-	silent := func(request) string { return "" }
-	l := startLane(t, time.Date(2026, time.September, 30, 15, 30, 50, 0, KST), silent, nil)
-	transport := <-l.dialer.dialed
-	waitFor(t, "first subscribe awaiting its ACK", subscribed(transport, 1))
-	l.clock.set(time.Date(2026, time.September, 30, 15, 31, 0, 0, KST))
-	waitFor(t, "socket close while a subscribe was pending", transport.isClosed)
+func TestRunnerWaitsForCachedTokenWithoutDialing(t *testing.T) {
+	l := startLane(t, wednesdayMidday, ackAll, func(_ *Config, l *lane) { l.token.set("", ErrTokenUnavailable) })
+	waitFor(t, "repeated token reads", func() bool { return l.token.calls.Load() >= 3 })
+	if l.dialer.dials() != 0 {
+		t.Fatalf("dialled %d times without a token", l.dialer.dials())
+	}
+	l.token.set("cached-token-2", nil)
+	conn := <-l.dialer.dialed
+	if conn.token != "cached-token-2" {
+		t.Fatalf("dial token = %q", conn.token)
+	}
 }
 
-func TestRunnerStopsSubscribingOnceWindowCloses(t *testing.T) {
-	var clock *laneClock
-	var once sync.Once
-	ack := func(req request) string {
-		once.Do(func() { clock.set(time.Date(2026, time.September, 30, 15, 31, 0, 0, KST)) })
-		return ackOK(req)
+func TestRunnerNeverRedialsWithARefusedToken(t *testing.T) {
+	l := startLane(t, wednesdayMidday, ackAll, func(_ *Config, l *lane) {
+		l.dialer.refuse = func(token string) error {
+			if token == "cached-token-1" {
+				return ErrUnauthorized
+			}
+			return nil
+		}
+	})
+	waitFor(t, "token re-reads after the refusal", func() bool { return l.token.calls.Load() >= 4 })
+	if got := l.dialer.dials(); got != 1 {
+		t.Fatalf("dials with the refused token = %d, want exactly 1", got)
 	}
-	l := startLane(t, time.Date(2026, time.September, 30, 15, 30, 50, 0, KST), ack, func(cfg *Config) { clock = cfg.Clock.(*laneClock) })
-	transport := <-l.dialer.dialed
-	waitFor(t, "socket close", transport.isClosed)
-	subscribes := 0
-	for _, req := range transport.requests() {
-		if req.trType == "1" {
-			subscribes++
+	if l.runner.Counters().TokenRejected.Load() != 1 {
+		t.Fatalf("token_rejected = %d", l.runner.Counters().TokenRejected.Load())
+	}
+	// The owner publishes a new token: the lane uses it.
+	l.token.set("cached-token-2", nil)
+	conn := <-l.dialer.dialed
+	if conn.token != "cached-token-2" {
+		t.Fatalf("dial token = %q", conn.token)
+	}
+	if tokens := l.dialer.usedTokens(); len(tokens) != 2 {
+		t.Fatalf("dial tokens = %v", tokens)
+	}
+}
+
+func TestRunnerReconnectsAfterServerShutdownWithOneConnection(t *testing.T) {
+	var shutdowns atomic.Int32
+	onWrite := func(c *fakeConn, data []byte) {
+		ackAll(c, data)
+		if bytes.HasPrefix(data, []byte("[")) && shutdowns.Add(1) <= 5 {
+			go func() {
+				c.push(fixture(t, "error_server_shutdown.json"))
+			}()
 		}
 	}
-	// The first ACK moves the clock past the close; no further subscribe.
-	if subscribes != 1 {
-		t.Fatalf("sent %d subscribes after the window closed", subscribes)
+	l := startLane(t, wednesdayMidday, onWrite, nil)
+	waitFor(t, "six dials", func() bool { return l.dialer.dials() >= 6 })
+	if got := l.dialer.maxOpen.Load(); got != 1 {
+		t.Fatalf("maximum simultaneously open Toss connections = %d, want 1", got)
+	}
+	if l.runner.Counters().ErrorFrames.Load() < 5 {
+		t.Fatalf("error frames = %d", l.runner.Counters().ErrorFrames.Load())
+	}
+}
+
+func TestRunnerRedeclaresAfterRateLimitNoSoonerThanOneSecond(t *testing.T) {
+	var first atomic.Bool
+	var times sync.Map
+	var declarations atomic.Int32
+	l := startLane(t, wednesdayMidday, func(c *fakeConn, data []byte) {
+		if !bytes.HasPrefix(data, []byte("[")) {
+			return
+		}
+		times.Store(declarations.Add(1), time.Now())
+		if first.CompareAndSwap(false, true) {
+			go c.push(fixture(t, "error_rate_limit.json"))
+			return
+		}
+		ackAll(c, data)
+	}, nil)
+	conn := <-l.dialer.dialed
+	waitFor(t, "redeclaration", func() bool { return conn.count("[") == 2 })
+	t1, _ := times.Load(int32(1))
+	t2, _ := times.Load(int32(2))
+	if gap := t2.(time.Time).Sub(t1.(time.Time)); gap < 900*time.Millisecond {
+		t.Fatalf("redeclared after %s, want about 1s", gap)
+	}
+	if l.dialer.dials() != 1 {
+		t.Fatalf("rate limit caused a redial: %d", l.dialer.dials())
+	}
+}
+
+func TestRunnerKeepsSocketOnPartialRejection(t *testing.T) {
+	l := startLane(t, wednesdayMidday, func(c *fakeConn, data []byte) {
+		if bytes.HasPrefix(data, []byte("[")) {
+			go c.push([]byte(`{"type":"subscriptions","subscribed":["trade:kr:005930"],"rejected":[{"target":"trade:us:AAPL","code":"stock-not-found","message":"x"}]}`))
+		}
+	}, nil)
+	conn := <-l.dialer.dialed
+	waitFor(t, "rejection counted", func() bool { return l.runner.Counters().SubscribeRejected.Load() == 1 })
+	conn.push(fixture(t, "trade_kr.json"))
+	waitFor(t, "one entry", func() bool { return l.reader.XLen(context.Background(), "quotes:toss").Val() == 1 })
+	if conn.isClosed() || l.dialer.dials() != 1 {
+		t.Fatalf("partial rejection closed=%t dials=%d", conn.isClosed(), l.dialer.dials())
+	}
+}
+
+func TestRunnerRedisFailureNeverStallsSocket(t *testing.T) {
+	l := startLane(t, wednesdayMidday, ackAll, func(cfg *Config, _ *lane) { cfg.Buffer = 4 })
+	conn := <-l.dialer.dialed
+	l.mini.SetError("ERR synthetic redis failure")
+	const frames = 300
+	go func() {
+		for index := 0; index < frames; index++ {
+			conn.push(fixture(t, "trade_kr.json"))
+		}
+	}()
+	waitFor(t, "all frames read", func() bool { return l.runner.Counters().Frames.Load() >= frames })
+	c := l.runner.Counters()
+	if c.XAddErrors.Load() == 0 {
+		t.Fatal("no XADD error observed")
+	}
+	if c.XAddErrors.Load()+c.DropBufferFull.Load()+c.TicksWritten.Load() > frames {
+		t.Fatalf("tick accounting exceeds frames: %v", c.logArgs())
+	}
+}
+
+func TestRunnerContainsPanics(t *testing.T) {
+	for name, mutate := range map[string]func(*Config, *lane){
+		"dialer": func(_ *Config, l *lane) { l.dialer.panics = true },
+		"read":   func(_ *Config, l *lane) { l.dialer.panicOn = "read" },
+		"token":  func(_ *Config, l *lane) { l.token.panic = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := startLane(t, wednesdayMidday, ackAll, mutate)
+			time.Sleep(40 * time.Millisecond)
+			if name == "read" {
+				// A read panic is contained as a failed read; the lane redials.
+				waitFor(t, "redials after contained read panics", func() bool { return l.dialer.dials() >= 2 })
+			}
+			select {
+			case <-l.done:
+				if name != "read" {
+					return // a supervisor-side panic stops only the lane
+				}
+				t.Fatal("lane stopped on a contained read panic")
+			default:
+			}
+		})
+	}
+}
+
+func TestSingleConnectionRefusesASecondDial(t *testing.T) {
+	inner := newFakeDialer(nil)
+	guard := &singleConnection{dialer: inner}
+	first, err := guard.Dial(context.Background(), Endpoint, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guard.Dial(context.Background(), Endpoint, "t"); !errors.Is(err, errSecondConnection) {
+		t.Fatalf("second dial = %v, want errSecondConnection", err)
+	}
+	_ = first.Close()
+	second, err := guard.Dial(context.Background(), Endpoint, "t")
+	if err != nil {
+		t.Fatalf("dial after close = %v", err)
+	}
+	_ = second.Close()
+	if inner.dials() != 2 {
+		t.Fatalf("inner dials = %d, want 2", inner.dials())
 	}
 }
 
 func TestNewRunnerRejectsUnsafeConfig(t *testing.T) {
-	valid := Config{Endpoint: ws.EndpointLive, Symbols: []string{"005930"}, Approval: &fakeApproval{}, Dialer: newFakeDialer(ackOK), Redis: redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"}), StreamKey: "quotes:kis", MaxLen: 1, Buffer: 1}
-	defer valid.Redis.Close()
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
+	defer client.Close()
+	valid := Config{Symbols: testSymbols, Token: &switchToken{}, Dialer: newFakeDialer(nil), Redis: client, StreamKey: "quotes:toss", MaxLen: 1, Buffer: 1}
 	if _, err := NewRunner(valid); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
-	many := make([]string, MaxSymbols+1)
+	many := make([]Symbol, MaxSymbols+1)
 	for index := range many {
-		many[index] = "005930"
+		many[index] = Symbol{MarketKR, fmt.Sprintf("%06d", index)}
 	}
 	for name, mutate := range map[string]func(*Config){
-		"41 symbols":       func(c *Config) { c.Symbols = many },
-		"no symbols":       func(c *Config) { c.Symbols = nil },
-		"invalid symbol":   func(c *Config) { c.Symbols = []string{"5930"} },
-		"foreign endpoint": func(c *Config) { c.Endpoint = "ws://example.invalid:21000" },
-		"no approval":      func(c *Config) { c.Approval = nil },
-		"no dialer":        func(c *Config) { c.Dialer = nil },
-		"no redis":         func(c *Config) { c.Redis = nil },
-		"no stream key":    func(c *Config) { c.StreamKey = " " },
-		"zero max len":     func(c *Config) { c.MaxLen = 0 },
-		"zero buffer":      func(c *Config) { c.Buffer = 0 },
+		"41 symbols":        func(c *Config) { c.Symbols = many },
+		"no symbols":        func(c *Config) { c.Symbols = nil },
+		"invalid symbol":    func(c *Config) { c.Symbols = []Symbol{{MarketKR, "5930"}} },
+		"duplicate symbol":  func(c *Config) { c.Symbols = []Symbol{{MarketKR, "005930"}, {MarketKR, "005930"}} },
+		"no token source":   func(c *Config) { c.Token = nil },
+		"no dialer":         func(c *Config) { c.Dialer = nil },
+		"no redis":          func(c *Config) { c.Redis = nil },
+		"fills stream key":  func(c *Config) { c.StreamKey = "fills:kis" },
+		"approval key area": func(c *Config) { c.StreamKey = "kis:websocket:approval_key" },
+		"zero max len":      func(c *Config) { c.MaxLen = 0 },
+		"zero buffer":       func(c *Config) { c.Buffer = 0 },
 	} {
 		cfg := valid
 		mutate(&cfg)
 		if _, err := NewRunner(cfg); err == nil {
 			t.Fatalf("%s accepted", name)
 		}
+	}
+	over := make([]Symbol, 51)
+	for index := range over {
+		over[index] = Symbol{MarketKR, fmt.Sprintf("%06d", index)}
+	}
+	if _, _, err := buildDeclaration(over); err == nil {
+		t.Fatal("102 subscriptions accepted by buildDeclaration")
 	}
 }

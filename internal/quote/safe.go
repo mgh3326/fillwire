@@ -4,29 +4,27 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-
-	"github.com/mgh3326/go-kis/kis/ws"
+	"sync"
 )
 
 // errContainedPanic replaces a panic raised by the lane's injected dialer,
-// transport, or approval provider.
+// transport, or token source.
 var errContainedPanic = errors.New("quote: panic contained in websocket dependency")
 
-// go-kis calls the dialer, transport, and approval provider from its own
-// reader and reconnect goroutines, where the lane's guard cannot reach. These
-// wrappers turn a panic in any of them into an ordinary error, which go-kis
-// already handles as a failed dial, read, write, or approval, so it cannot
-// crash the process and take the fills pipeline down. A panic inside go-kis
-// itself is outside this boundary.
+// errSecondConnection refuses a dial while the lane still holds a connection.
+var errSecondConnection = errors.New("quote: refusing a second Toss websocket while one is open")
+
+// The wrappers below turn a panic in an injected dependency into an ordinary
+// error, so it cannot crash the process and take the fills pipeline down.
 
 type safeDialer struct {
-	dialer ws.Dialer
+	dialer Dialer
 	logger *slog.Logger
 }
 
-func (d safeDialer) Dial(ctx context.Context, endpoint string) (transport ws.Transport, err error) {
+func (d safeDialer) Dial(ctx context.Context, endpoint, token string) (transport Transport, err error) {
 	defer contain(d.logger, "dial", &err)
-	inner, err := d.dialer.Dial(ctx, endpoint)
+	inner, err := d.dialer.Dial(ctx, endpoint, token)
 	if err != nil || inner == nil {
 		if err == nil {
 			err = errors.New("quote: dialer returned no transport")
@@ -37,7 +35,7 @@ func (d safeDialer) Dial(ctx context.Context, endpoint string) (transport ws.Tra
 }
 
 type safeTransport struct {
-	transport ws.Transport
+	transport Transport
 	logger    *slog.Logger
 }
 
@@ -51,36 +49,70 @@ func (t safeTransport) Write(ctx context.Context, data []byte) (err error) {
 	return t.transport.Write(ctx, data)
 }
 
-func (t safeTransport) WriteControl(ctx context.Context, kind int, data []byte) (err error) {
-	defer contain(t.logger, "write control", &err)
-	return t.transport.WriteControl(ctx, kind, data)
-}
-
 func (t safeTransport) Close() (err error) {
 	defer contain(t.logger, "close", &err)
 	return t.transport.Close()
 }
 
-type safeApproval struct {
-	provider ws.ApprovalKeyProvider
-	logger   *slog.Logger
+type safeToken struct {
+	source TokenSource
+	logger *slog.Logger
 }
 
-func (a safeApproval) ApprovalKey(ctx context.Context) (key string, err error) {
-	defer contain(a.logger, "approval", &err)
-	return a.provider.ApprovalKey(ctx)
-}
-
-func (a safeApproval) Reissue(ctx context.Context) (key string, err error) {
-	defer contain(a.logger, "approval reissue", &err)
-	return a.provider.Reissue(ctx)
+func (s safeToken) Token(ctx context.Context) (token string, err error) {
+	defer contain(s.logger, "token", &err)
+	return s.source.Token(ctx)
 }
 
 func contain(logger *slog.Logger, operation string, err *error) {
 	if recovered := recover(); recovered != nil {
 		if logger != nil {
-			logger.Error("quote websocket dependency panic contained", "operation", operation)
+			logger.Error("quote dependency panic contained", "operation", operation)
 		}
 		*err = errContainedPanic
 	}
+}
+
+// singleConnection enforces that the lane holds at most one Toss websocket.
+// Toss allows two connections per account and closes the oldest when a third
+// opens; fillwire uses exactly one and leaves the other as a spare. A dial is
+// refused until the previous transport is closed (break before make).
+type singleConnection struct {
+	dialer Dialer
+	mu     sync.Mutex
+	open   bool
+}
+
+func (s *singleConnection) Dial(ctx context.Context, endpoint, token string) (Transport, error) {
+	s.mu.Lock()
+	if s.open {
+		s.mu.Unlock()
+		return nil, errSecondConnection
+	}
+	s.open = true
+	s.mu.Unlock()
+	transport, err := s.dialer.Dial(ctx, endpoint, token)
+	if err != nil {
+		s.release()
+		return nil, err
+	}
+	return &releasingTransport{Transport: transport, release: s.release}, nil
+}
+
+func (s *singleConnection) release() {
+	s.mu.Lock()
+	s.open = false
+	s.mu.Unlock()
+}
+
+type releasingTransport struct {
+	Transport
+	once    sync.Once
+	release func()
+}
+
+func (t *releasingTransport) Close() error {
+	err := t.Transport.Close()
+	t.once.Do(t.release)
+	return err
 }

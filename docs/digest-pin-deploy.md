@@ -250,10 +250,12 @@ sudo systemctl enable --now fillwire.service
 ## Quote reader (optional, off by default)
 
 The quote reader (`[quotes]` in the TOML) is documented in the README section
-"Quote reader (off by default)": turning it on, the symbol file mount, how to verify
-`quotes:kis`, and turning it off. It uses its **own** KIS app key, so it does
-not change the one-session rule above for the fills key. Never give it the
-fills key or the at-kis-ws key.
+"Quote reader (off by default)". That section covers the two enablement
+prerequisites, turning it on, the symbol file mount, how to verify
+`quotes:toss`, and turning it off. It uses the Toss Securities websocket, not
+KIS, so it does not change the KIS one-session rule above. It reads the cached
+Toss token read-only and opens exactly one of the two Toss connections the
+account allows.
 
 ## Health surface
 

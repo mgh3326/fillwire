@@ -1,7 +1,8 @@
 # holdings
-005930
-000660  # SK hynix
+kr 005930
+kr 000660  # SK hynix
 # H6 allowlist
-0001A0
+kr 0001A0
 
-035420
+us AAPL
+us BRK.B

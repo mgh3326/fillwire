@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,8 @@ import (
 )
 
 // --- configuration -------------------------------------------------------
+
+const testTokenKey = "toss:oauth:0123456789abcdef:access_token"
 
 func shippedConfig(t *testing.T) string {
 	t.Helper()
@@ -71,7 +74,7 @@ func symbolFile(t *testing.T, n int) string {
 	t.Helper()
 	var builder strings.Builder
 	for index := 0; index < n; index++ {
-		fmt.Fprintf(&builder, "%06d\n", index+1)
+		fmt.Fprintf(&builder, "kr %06d\n", index+1)
 	}
 	return writeTemp(t, "symbols.txt", builder.String())
 }
@@ -79,11 +82,10 @@ func symbolFile(t *testing.T, n int) string {
 func enabledQuotes(symbolsPath string) string {
 	return fmt.Sprintf(`[quotes]
 enabled = true
-endpoint = "live"
-app_key_env = "KIS_QUOTE_APP_KEY"
-app_secret_env = "KIS_QUOTE_APP_SECRET"
+provider = "toss"
 symbols_file = %q
-stream_key = "quotes:kis"
+token_key = "toss:oauth:0123456789abcdef:access_token"
+stream_key = "quotes:toss"
 max_len = 50000
 buffer = 512
 `, symbolsPath)
@@ -94,54 +96,51 @@ func fillsOnly(cfg runtimeConfig) runtimeConfig {
 	return cfg
 }
 
+type panicDialer struct{}
+
+func (panicDialer) Dial(context.Context, string, string) (quote.Transport, error) {
+	panic("a disabled quote lane must never dial")
+}
+
+type panicToken struct{}
+
+func (panicToken) Token(context.Context) (string, error) {
+	panic("a disabled quote lane must never read a token")
+}
+
 func TestQuoteReaderDefaultOff(t *testing.T) {
 	setFillsEnv(t)
 	shipped := shippedConfig(t)
 	if !strings.Contains(shipped, "[quotes]\nenabled = false\n") {
 		t.Fatal("shipped fillwire.toml must show the quote reader disabled")
 	}
-	cfg, err := loadConfig(writeTemp(t, "fillwire.toml", shipped))
-	if err != nil {
-		t.Fatal(err)
+	for name, text := range map[string]string{
+		"shipped":            shipped,
+		"no [quotes] table":  withQuotes(t, shipped, ""),
+		"enabled omitted":    withQuotes(t, shipped, "[quotes]\nprovider = \"toss\"\n"),
+		"disabled with junk": withQuotes(t, shipped, "[quotes]\nenabled = false\nprovider = 7\nclient_secret = \"x\"\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "no [quotes] table" && strings.Contains(text, "[quotes]") {
+				t.Fatal("fixture mutation failed")
+			}
+			cfg, err := loadConfig(writeTemp(t, "fillwire.toml", text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.quotes.enabled || cfg.quotes.err != nil {
+				t.Fatalf("quotes = %+v, want off", cfg.quotes)
+			}
+			lane := startQuoteLane(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), runDependencies{quoteDialer: panicDialer{}, quoteToken: panicToken{}})
+			if lane.done != nil || lane.stop != nil {
+				t.Fatal("disabled quote reader started a lane")
+			}
+		})
 	}
-	if cfg.quotes.enabled || cfg.quotes.err != nil {
-		t.Fatalf("shipped quotes = %+v, want disabled", cfg.quotes)
-	}
-	// A pre-upgrade file without the table is also off.
-	index := strings.Index(shipped, "\n[quotes]\n")
-	legacy := withQuotes(t, shipped, "")
-	if index < 0 || strings.Contains(legacy, "[quotes]") {
-		t.Fatal("fixture mutation failed")
-	}
-	legacyCfg, err := loadConfig(writeTemp(t, "fillwire.toml", legacy))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if legacyCfg.quotes.enabled {
-		t.Fatal("config without [quotes] enabled the quote reader")
-	}
-	// enabled omitted inside the table is off too.
-	omitted, err := loadConfig(writeTemp(t, "fillwire.toml", withQuotes(t, shipped, "[quotes]\nendpoint = \"live\"\n")))
-	if err != nil || omitted.quotes.enabled {
-		t.Fatalf("omitted enabled = %+v, %v; want off", omitted.quotes, err)
-	}
-	// Off means no quote startup at all.
-	lane := startQuoteLane(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), runDependencies{quoteDialer: &panicDialer{}})
-	if lane.done != nil || lane.stop != nil {
-		t.Fatal("disabled quote reader started a lane")
-	}
-}
-
-type panicDialer struct{}
-
-func (panicDialer) Dial(context.Context, string) (ws.Transport, error) {
-	panic("a disabled quote lane must never dial")
 }
 
 func TestQuoteSectionNeverChangesFillsConfig(t *testing.T) {
 	setFillsEnv(t)
-	t.Setenv("KIS_QUOTE_APP_KEY", "fixture-quote-app")
-	t.Setenv("KIS_QUOTE_APP_SECRET", "fixture-quote-secret")
 	shipped := shippedConfig(t)
 	baseline, err := loadConfig(writeTemp(t, "fillwire.toml", withQuotes(t, shipped, "")))
 	if err != nil {
@@ -153,9 +152,15 @@ func TestQuoteSectionNeverChangesFillsConfig(t *testing.T) {
 		"too many symbols":     enabledQuotes(symbolFile(t, 41)),
 		"type error in quotes": "[quotes]\nenabled = \"yes\"\nmax_len = \"many\"\n",
 		"unknown quote keys":   "[quotes]\nenabled = true\nsurprise = 1\n",
+		"quotes not a table":   "quotes = 3\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			cfg, err := loadConfig(writeTemp(t, "fillwire.toml", withQuotes(t, shipped, body)))
+			text := withQuotes(t, shipped, body)
+			if name == "quotes not a table" {
+				// A top-level key must precede the first table header.
+				text = body + withQuotes(t, shipped, "")
+			}
+			cfg, err := loadConfig(writeTemp(t, "fillwire.toml", text))
 			if err != nil {
 				t.Fatalf("[quotes] content failed the fills config: %v", err)
 			}
@@ -168,8 +173,6 @@ func TestQuoteSectionNeverChangesFillsConfig(t *testing.T) {
 
 func TestQuoteSettingsResolution(t *testing.T) {
 	setFillsEnv(t)
-	t.Setenv("KIS_QUOTE_APP_KEY", "fixture-quote-app")
-	t.Setenv("KIS_QUOTE_APP_SECRET", "fixture-quote-secret")
 	shipped := shippedConfig(t)
 	load := func(t *testing.T, body string) quoteSettings {
 		t.Helper()
@@ -180,65 +183,58 @@ func TestQuoteSettingsResolution(t *testing.T) {
 		return cfg.quotes
 	}
 
-	if capped := load(t, strings.Replace(enabledQuotes(symbolFile(t, 1)), "buffer = 512", "buffer = 65536", 1)); capped.err != nil || capped.buffer != 65536 {
-		t.Fatalf("buffer at the cap = %+v, want accepted", capped)
-	}
 	valid := load(t, enabledQuotes(symbolFile(t, 40)))
-	if !valid.enabled || valid.err != nil || len(valid.symbols) != 40 || valid.streamKey != "quotes:kis" || valid.maxLen != 50000 || valid.buffer != 512 || valid.endpoint != "live" {
+	if !valid.enabled || valid.err != nil || len(valid.symbols) != 40 || valid.streamKey != "quotes:toss" || valid.maxLen != 50000 || valid.buffer != 512 || valid.tokenKey != testTokenKey {
 		t.Fatalf("valid quote settings = %+v", valid)
 	}
-	defaults := load(t, strings.NewReplacer("stream_key = \"quotes:kis\"\n", "", "max_len = 50000\n", "", "buffer = 512\n", "").Replace(enabledQuotes(symbolFile(t, 1))))
+	defaults := load(t, strings.NewReplacer("stream_key = \"quotes:toss\"\n", "", "max_len = 50000\n", "", "buffer = 512\n", "").Replace(enabledQuotes(symbolFile(t, 1))))
 	if defaults.err != nil || defaults.streamKey != quote.DefaultStreamKey || defaults.maxLen != defaultQuoteMaxLen || defaults.buffer != defaultQuoteBuffer {
 		t.Fatalf("defaulted quote settings = %+v", defaults)
 	}
+	if capped := load(t, strings.Replace(enabledQuotes(symbolFile(t, 1)), "buffer = 512", "buffer = 65536", 1)); capped.err != nil || capped.buffer != 65536 {
+		t.Fatalf("buffer at the cap = %+v, want accepted", capped)
+	}
 
-	malformed := writeTemp(t, "bad.txt", "005930\n5930\n")
+	malformed := writeTemp(t, "bad.txt", "kr 005930\nkr 5930\n")
+	one := enabledQuotes(symbolFile(t, 1))
+	replace := func(old, new string) string { return strings.Replace(one, old, new, 1) }
 	for name, body := range map[string]string{
-		"41 symbols":                         enabledQuotes(symbolFile(t, 41)),
-		"malformed list":                     enabledQuotes(malformed),
-		"missing list file":                  enabledQuotes(filepath.Join(t.TempDir(), "absent.txt")),
-		"no symbols_file":                    strings.Replace(enabledQuotes("x"), "symbols_file = \"x\"\n", "", 1),
-		"bad endpoint":                       strings.Replace(enabledQuotes(symbolFile(t, 1)), "endpoint = \"live\"", "endpoint = \"prod\"", 1),
-		"fills app key env":                  strings.Replace(enabledQuotes(symbolFile(t, 1)), "KIS_QUOTE_APP_KEY", "KIS_APP_KEY", 1),
-		"fills app secret env":               strings.Replace(enabledQuotes(symbolFile(t, 1)), "KIS_QUOTE_APP_SECRET", "KIS_APP_SECRET", 1),
-		"unset key env":                      strings.Replace(enabledQuotes(symbolFile(t, 1)), "KIS_QUOTE_APP_KEY", "FILLWIRE_TEST_UNSET_QUOTE_KEY", 1),
-		"fills stream key":                   strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"fills:kis\"", 1),
-		"padded stream key":                  strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \" quotes:kis\"", 1),
-		"stream key approval cache key":      strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"kis:websocket:approval_key\"", 1),
-		"stream key approval lock key":       strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"kis:websocket:approval_key:lock\"", 1),
-		"stream key mock approval cache key": strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"kis_mock:websocket:approval_key\"", 1),
-		"stream key mock approval lock key":  strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"kis_mock:websocket:approval_key:lock\"", 1),
-		"stream key bare prefix":             strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"quotes:\"", 1),
-		"stream key trailing space":          strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"quotes:kis \"", 1),
-		"stream key other namespace":         strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \"prices:kis\"", 1),
-		"negative max_len":                   strings.Replace(enabledQuotes(symbolFile(t, 1)), "max_len = 50000", "max_len = -1", 1),
-		"negative buffer":                    strings.Replace(enabledQuotes(symbolFile(t, 1)), "buffer = 512", "buffer = -1", 1),
-		"oversized buffer":                   strings.Replace(enabledQuotes(symbolFile(t, 1)), "buffer = 512", "buffer = 65537", 1),
-		"type error in enabled":              "[quotes]\nenabled = \"yes\"\n",
+		"41 symbols":             enabledQuotes(symbolFile(t, 41)),
+		"malformed list":         enabledQuotes(malformed),
+		"missing list file":      enabledQuotes(filepath.Join(t.TempDir(), "absent.txt")),
+		"no symbols_file":        replace("symbols_file = ", "# symbols_file = "),
+		"provider kis":           replace(`provider = "toss"`, `provider = "kis"`),
+		"no provider":            replace(`provider = "toss"`, ""),
+		"no token_key":           replace("token_key = ", "# token_key = "),
+		"token lock key":         replace(testTokenKey, "toss:oauth:0123456789abcdef:lock"),
+		"kis approval key":       replace(testTokenKey, "kis:websocket:approval_key"),
+		"upper-case fingerprint": replace(testTokenKey, "toss:oauth:0123456789ABCDEF:access_token"),
+		"client_secret key":      one + "client_secret = \"x\"\n",
+		"client_id key":          one + "client_id = \"x\"\n",
+		"unknown key":            one + "endpoint = \"wss://example.invalid\"\n",
+		"fills stream key":       replace(`stream_key = "quotes:toss"`, `stream_key = "fills:kis"`),
+		"approval stream key":    replace(`stream_key = "quotes:toss"`, `stream_key = "kis:websocket:approval_key"`),
+		"token stream key":       replace(`stream_key = "quotes:toss"`, `stream_key = "toss:oauth:0123456789abcdef:access_token"`),
+		"bare prefix":            replace(`stream_key = "quotes:toss"`, `stream_key = "quotes:"`),
+		"padded stream key":      replace(`stream_key = "quotes:toss"`, `stream_key = " quotes:toss"`),
+		"negative max_len":       replace("max_len = 50000", "max_len = -1"),
+		"negative buffer":        replace("buffer = 512", "buffer = -1"),
+		"oversized buffer":       replace("buffer = 512", "buffer = 65537"),
+		"wrong type max_len":     replace("max_len = 50000", `max_len = "many"`),
+		"type error in enabled":  "[quotes]\nenabled = \"yes\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			settings := load(t, body)
 			if !settings.enabled || settings.err == nil {
 				t.Fatalf("%s: settings = %+v, want enabled with a rejection", name, settings)
 			}
-			for _, secret := range []string{"fixture-quote-app", "fixture-quote-secret", "fixture-fills-app"} {
+			for _, secret := range []string{"fixture-fills-app", "fixture-fills-secret", "fixture-ingest"} {
 				if strings.Contains(settings.err.Error(), secret) {
 					t.Fatalf("rejection leaked a credential: %v", settings.err)
 				}
 			}
 		})
 	}
-
-	t.Run("same app key value as fills", func(t *testing.T) {
-		t.Setenv("KIS_QUOTE_APP_KEY", "fixture-fills-app")
-		settings := load(t, enabledQuotes(symbolFile(t, 1)))
-		if settings.err == nil || !strings.Contains(settings.err.Error(), "one KIS app key admits one websocket session") {
-			t.Fatalf("shared app key settings = %+v, want rejection", settings)
-		}
-		if strings.Contains(settings.err.Error(), "fixture-fills-app") {
-			t.Fatal("rejection leaked the app key")
-		}
-	})
 }
 
 func TestRejectedQuoteSettingsNeverStartALane(t *testing.T) {
@@ -250,7 +246,7 @@ func TestRejectedQuoteSettingsNeverStartALane(t *testing.T) {
 		return logs.Write(p)
 	}), nil))
 	cfg := runtimeConfig{quotes: quoteSettings{enabled: true, err: errors.New("quotes: symbol list rejected")}}
-	lane := startQuoteLane(cfg, logger, runDependencies{quoteDialer: &panicDialer{}})
+	lane := startQuoteLane(cfg, logger, runDependencies{quoteDialer: panicDialer{}, quoteToken: panicToken{}})
 	if lane.done != nil {
 		t.Fatal("rejected quote settings started a lane")
 	}
@@ -390,105 +386,190 @@ func fillsDialer() *isoDialer {
 	}}
 }
 
-type quoteScenario struct {
-	name    string
-	dialer  func() *isoDialer
-	settled func(*isoDialer, *miniredis.Miniredis) bool
+// --- Toss fakes for the quote lane --------------------------------------------
+
+type tossConn struct {
+	token   string
+	in      chan []byte
+	closed  chan struct{}
+	once    sync.Once
+	onWrite func(*tossConn, []byte)
+	release func()
 }
 
+func (c *tossConn) Read(ctx context.Context) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closed:
+		return nil, io.EOF
+	case frame := <-c.in:
+		return frame, nil
+	}
+}
+
+func (c *tossConn) Write(_ context.Context, data []byte) error {
+	select {
+	case <-c.closed:
+		return io.ErrClosedPipe
+	default:
+	}
+	if c.onWrite != nil {
+		c.onWrite(c, data)
+	}
+	return nil
+}
+
+func (c *tossConn) Close() error {
+	c.once.Do(func() {
+		close(c.closed)
+		if c.release != nil {
+			c.release()
+		}
+	})
+	return nil
+}
+
+func (c *tossConn) push(frame string) {
+	select {
+	case c.in <- []byte(frame):
+	case <-c.closed:
+	}
+}
+
+func tossAck(c *tossConn, data []byte) {
+	if bytes.HasPrefix(data, []byte("[")) {
+		go c.push(`{"type":"subscriptions","subscribed":["trade:kr:005930","orderbook:kr:005930"],"rejected":[]}`)
+	}
+}
+
+type tossDialer struct {
+	mu        sync.Mutex
+	endpoints []string
+	tokens    []string
+	open      atomic.Int32
+	maxOpen   atomic.Int32
+	dial      func(*tossDialer, string) (quote.Transport, error)
+}
+
+func (d *tossDialer) Dial(_ context.Context, endpoint, token string) (quote.Transport, error) {
+	d.mu.Lock()
+	d.endpoints = append(d.endpoints, endpoint)
+	d.tokens = append(d.tokens, token)
+	d.mu.Unlock()
+	return d.dial(d, token)
+}
+
+func (d *tossDialer) conn(onWrite func(*tossConn, []byte)) *tossConn {
+	if now := d.open.Add(1); now > d.maxOpen.Load() {
+		d.maxOpen.Store(now)
+	}
+	return &tossConn{in: make(chan []byte, 1024), closed: make(chan struct{}), onWrite: onWrite, release: func() { d.open.Add(-1) }}
+}
+
+func (d *tossDialer) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.endpoints)
+}
+
+type quoteScenario struct {
+	name    string
+	dialer  func() *tossDialer
+	token   func(*miniredis.Miniredis)
+	settled func(*tossDialer, *miniredis.Miniredis) bool
+}
+
+const tossTrade = `{"type":"message","topic":"trade:kr:005930","data":{"price":"72000","volume":"1","timestamp":"2026-09-30T13:15:02.000+09:00","currency":"KRW"}}`
+
 func quoteScenarios() []quoteScenario {
-	quoteTrade := "0|H0STCNT0|001|005930^131502^70500"
 	return []quoteScenario{
 		{
 			name: "healthy quote traffic",
-			dialer: func() *isoDialer {
-				return &isoDialer{dial: func(d *isoDialer) (ws.Transport, error) {
-					return d.add(newIsoTransport(func(t *isoTransport, req isoRequest) {
-						if req.trType != "1" {
-							return
-						}
-						t.push(isoAck(req.tr, "0", "OPSP0000"))
-						if req.tr == ws.TRQuoteBook {
+			dialer: func() *tossDialer {
+				return &tossDialer{dial: func(d *tossDialer, _ string) (quote.Transport, error) {
+					return d.conn(func(c *tossConn, data []byte) {
+						tossAck(c, data)
+						if bytes.HasPrefix(data, []byte("[")) {
 							go func() {
 								for index := 0; index < 200; index++ {
-									t.push(quoteTrade)
+									c.push(tossTrade)
 								}
 							}()
 						}
-					})), nil
+					}), nil
 				}}
 			},
-			settled: func(_ *isoDialer, mini *miniredis.Miniredis) bool {
-				entries, _ := mini.Stream("quotes:kis")
+			settled: func(_ *tossDialer, mini *miniredis.Miniredis) bool {
+				entries, _ := mini.Stream("quotes:toss")
 				return len(entries) >= 50
 			},
 		},
 		{
 			name: "quote dial failure storm",
-			dialer: func() *isoDialer {
-				return &isoDialer{dial: func(*isoDialer) (ws.Transport, error) {
-					return nil, errors.New("synthetic quote dial failure")
+			dialer: func() *tossDialer {
+				return &tossDialer{dial: func(*tossDialer, string) (quote.Transport, error) {
+					return nil, errors.New("synthetic Toss dial failure")
 				}}
 			},
-			// The lane's own retry delay doubles from 1ms, so dials slow down.
-			settled: func(d *isoDialer, _ *miniredis.Miniredis) bool { return d.count() >= 8 },
+			settled: func(d *tossDialer, _ *miniredis.Miniredis) bool { return d.count() >= 8 },
 		},
 		{
 			name: "quote socket reconnect storm",
-			dialer: func() *isoDialer {
-				return &isoDialer{dial: func(d *isoDialer) (ws.Transport, error) {
-					var acked atomic.Int32
-					return d.add(newIsoTransport(func(t *isoTransport, req isoRequest) {
-						if req.trType != "1" {
-							return
-						}
-						t.push(isoAck(req.tr, "0", "OPSP0000"))
-						// Drop every socket once all four subscriptions are
-						// restored, driving go-kis's own reconnect loop.
-						if acked.Add(1) == 4 {
-							go func() { _ = t.Close() }()
-						}
-					})), nil
+			dialer: func() *tossDialer {
+				return &tossDialer{dial: func(d *tossDialer, _ string) (quote.Transport, error) {
+					return d.conn(func(c *tossConn, data []byte) {
+						tossAck(c, data)
+						go func() { _ = c.Close() }()
+					}), nil
 				}}
 			},
-			settled: func(d *isoDialer, _ *miniredis.Miniredis) bool { return d.count() >= 30 },
+			// Declarations are spaced a second apart, even across reconnects.
+			settled: func(d *tossDialer, _ *miniredis.Miniredis) bool { return d.count() >= 3 },
 		},
 		{
-			name: "quote app key occupied",
-			dialer: func() *isoDialer {
-				return &isoDialer{dial: func(d *isoDialer) (ws.Transport, error) {
-					return d.add(newIsoTransport(func(t *isoTransport, req isoRequest) {
-						if req.trType == "1" {
-							t.push(isoAck(req.tr, "1", "OPSP8996"))
-						}
-					})), nil
+			name: "server-shutdown frames",
+			dialer: func() *tossDialer {
+				return &tossDialer{dial: func(d *tossDialer, _ string) (quote.Transport, error) {
+					return d.conn(func(c *tossConn, data []byte) {
+						tossAck(c, data)
+						go c.push(`{"type":"error","error":{"code":"server-shutdown","message":"x"}}`)
+					}), nil
 				}}
 			},
-			settled: func(d *isoDialer, _ *miniredis.Miniredis) bool { return d.count() >= 5 },
+			settled: func(d *tossDialer, _ *miniredis.Miniredis) bool { return d.count() >= 3 },
 		},
 		{
-			name: "quote lane panic",
-			dialer: func() *isoDialer {
-				return &isoDialer{dial: func(*isoDialer) (ws.Transport, error) { panic("synthetic quote panic") }}
+			name: "cached token refused (401)",
+			dialer: func() *tossDialer {
+				return &tossDialer{dial: func(*tossDialer, string) (quote.Transport, error) {
+					return nil, quote.ErrUnauthorized
+				}}
 			},
-			settled: func(*isoDialer, *miniredis.Miniredis) bool { return true },
+			settled: func(d *tossDialer, _ *miniredis.Miniredis) bool { return d.count() >= 1 },
+		},
+		{
+			name: "no cached token",
+			dialer: func() *tossDialer {
+				return &tossDialer{dial: func(*tossDialer, string) (quote.Transport, error) { panic("dial without a token") }}
+			},
+			token: func(mini *miniredis.Miniredis) { mini.Del(testTokenKey) },
+			settled: func(*tossDialer, *miniredis.Miniredis) bool {
+				return true
+			},
+		},
+		{
+			name: "quote dialer panic",
+			dialer: func() *tossDialer {
+				return &tossDialer{dial: func(*tossDialer, string) (quote.Transport, error) { panic("synthetic quote panic") }}
+			},
+			settled: func(d *tossDialer, _ *miniredis.Miniredis) bool { return d.count() >= 3 },
 		},
 	}
 }
 
-type quoteApprovalCounter struct{ calls atomic.Int32 }
-
-func (a *quoteApprovalCounter) ApprovalKey(context.Context) (string, error) {
-	a.calls.Add(1)
-	return "quote-lane-key", nil
-}
-func (a *quoteApprovalCounter) Reissue(context.Context) (string, error) {
-	a.calls.Add(1)
-	return "quote-lane-key", nil
-}
-
 // quoteClockAt runs at real speed from a fixed Wednesday 13:15 KST, inside
-// the regular window, and caps sleeps so retries run quickly.
+// the KRX regular session, and caps sleeps so retries run quickly.
 type quoteClockAt struct{ base, real time.Time }
 
 func (c quoteClockAt) Now() time.Time { return c.base.Add(time.Since(c.real)) }
@@ -504,13 +585,16 @@ type fillsRun struct {
 	approvalKeys map[string]string
 	writes       int32
 	mainKeys     []string
+	tokenValue   string
 	quoteDials   int
-	quoteKeys    int32
+	maxOpen      int32
 	err          error
 }
 
 // runFills runs the real runWithDependencies until isoFills fills are in
-// the fills stream and the quote scenario (if any) has settled.
+// the fills stream and the quote scenario (if any) has settled. The quote
+// lane reads its token through the real cached-token path from the same
+// Redis as the fills stream.
 func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 	t.Helper()
 	mainRedis := miniredis.RunT(t)
@@ -524,6 +608,10 @@ func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 	ingest := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(ingest.Close)
 
+	clock := quoteClockAt{base: time.Date(2026, time.September, 30, 13, 15, 0, 0, quote.KST), real: time.Now()}
+	tokenValue := fmt.Sprintf(`{"access_token": "toss-live-token", "expires_at": %d}`, clock.base.Add(time.Hour).Unix())
+	mainRedis.Set(testTokenKey, tokenValue)
+
 	cfg := cacheOnlyRuntimeConfig(mainRedis.Addr(), ingest.URL)
 	cfg.Stream.MaxLen = 1000
 	cfg.Channel.Buffer = 16
@@ -531,16 +619,18 @@ func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 	cfg.KIS.DupTrackMax = 100
 	fills := fillsDialer()
 	deps := runDependencies{approvalRedis: approvalClient, approvalFallback: &runApprovalFallback{}, dialer: fills}
-	var quotes *isoDialer
-	quoteApproval := &quoteApprovalCounter{}
+	var quotes *tossDialer
 	if scenario != nil {
 		quotes = scenario.dialer()
-		cfg.quotes = quoteSettings{enabled: true, endpoint: "mock", appKey: "quote-app", appSecret: "quote-secret", symbols: []string{"005930", "000660"}, streamKey: "quotes:kis", maxLen: 1000, buffer: 64}
+		if scenario.token != nil {
+			scenario.token(mainRedis)
+		}
+		cfg.quotes = quoteSettings{enabled: true, symbols: []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}}, tokenKey: testTokenKey, streamKey: "quotes:toss", maxLen: 1000, buffer: 64}
 		deps.quoteDialer = quotes
-		deps.quoteApproval = quoteApproval
-		deps.quoteClock = quoteClockAt{base: time.Date(2026, time.September, 30, 13, 15, 0, 0, quote.KST), real: time.Now()}
+		deps.quoteClock = clock
 		deps.quoteRetryMin = time.Millisecond
-		deps.quoteBackoff = ws.BackoffConfig{Min: time.Millisecond, Max: 2 * time.Millisecond, Jitter: -1}
+		deps.quoteRetryMax = 5 * time.Millisecond
+		deps.quotePing = 5 * time.Millisecond
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -565,9 +655,12 @@ func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out: fills=%d quote dials=%v", len(entries), quotes != nil && quotes.count() > 0)
+			t.Fatalf("timed out: fills=%d", len(entries))
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	if scenario != nil {
+		time.Sleep(30 * time.Millisecond) // let the quote scenario keep churning
 	}
 	// The fills socket must still be open while the quote lane churned.
 	var result fillsRun
@@ -603,14 +696,20 @@ func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 	result.writes = writes.writes.Load()
 	result.mainKeys = mainRedis.Keys()
 	sort.Strings(result.mainKeys)
+	result.tokenValue, _ = mainRedis.Get(testTokenKey)
+	if scenario != nil && scenario.token == nil && result.tokenValue != tokenValue {
+		t.Fatalf("the cached Toss token changed: %q", result.tokenValue)
+	}
 	if quotes != nil {
 		result.quoteDials = quotes.count()
-		result.quoteKeys = quoteApproval.calls.Load()
-		for _, endpoint := range quotes.endpoints {
-			if endpoint != ws.EndpointVTS {
-				t.Fatalf("quote lane dialled %q", endpoint)
+		result.maxOpen = quotes.maxOpen.Load()
+		quotes.mu.Lock()
+		for index, endpoint := range quotes.endpoints {
+			if endpoint != quote.Endpoint || quotes.tokens[index] != "toss-live-token" {
+				t.Fatalf("quote lane dialled %q with an unexpected token", endpoint)
 			}
 		}
+		quotes.mu.Unlock()
 	}
 	return result
 }
@@ -657,21 +756,25 @@ func TestFillsStreamIdenticalWithQuoteReaderOnAndOff(t *testing.T) {
 			if !reflect.DeepEqual(on.fillsReqs, off.fillsReqs) {
 				t.Fatalf("fills socket requests on=%v off=%v", on.fillsReqs, off.fillsReqs)
 			}
-			for _, req := range on.fillsReqs {
-				if req.tr == ws.TRQuotePrice || req.tr == ws.TRQuoteBook {
-					t.Fatalf("a quote subscription reached the fills socket: %+v", req)
-				}
-			}
 			if !reflect.DeepEqual(on.approvalKeys, off.approvalKeys) || on.writes != 0 || off.writes != 0 {
 				t.Fatalf("fills approval cache on=%v (writes %d) off=%v (writes %d)", on.approvalKeys, on.writes, off.approvalKeys, off.writes)
 			}
 			for _, key := range on.mainKeys {
-				if key != "fills:test" && key != "quotes:kis" {
+				if key != "fills:test" && key != "quotes:toss" && key != testTokenKey {
 					t.Fatalf("unexpected Redis key %q with the quote lane on", key)
 				}
 			}
-			if scenario.name != "quote lane panic" && (on.quoteDials == 0 || on.quoteKeys == 0) {
-				t.Fatalf("quote lane dials=%d own approval calls=%d; the scenario did not exercise its own socket and key", on.quoteDials, on.quoteKeys)
+			if on.maxOpen > 1 {
+				t.Fatalf("the quote lane held %d Toss connections at once", on.maxOpen)
+			}
+			if scenario.name == "no cached token" && on.quoteDials != 0 {
+				t.Fatalf("dialled %d times without a cached token", on.quoteDials)
+			}
+			if scenario.name == "cached token refused (401)" && on.quoteDials != 1 {
+				t.Fatalf("redialled with a refused token: %d dials", on.quoteDials)
+			}
+			if scenario.name != "no cached token" && on.quoteDials == 0 {
+				t.Fatal("quote lane never dialled; the scenario did not exercise it")
 			}
 		})
 	}

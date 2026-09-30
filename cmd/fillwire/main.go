@@ -14,6 +14,7 @@ import (
 
 	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/decode"
+	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
@@ -66,11 +67,12 @@ type runDependencies struct {
 	alerter          alert.Alerter
 
 	// Quote lane test seams. They are never shared with the fills fields above.
-	quoteApproval ws.ApprovalKeyProvider
-	quoteDialer   ws.Dialer
-	quoteClock    kis.Clock
+	quoteToken    quote.TokenSource
+	quoteDialer   quote.Dialer
+	quoteClock    quote.Clock
 	quoteRetryMin time.Duration
-	quoteBackoff  ws.BackoffConfig
+	quoteRetryMax time.Duration
+	quotePing     time.Duration
 }
 
 type kisApprovalIssuer struct{ client *kis.Client }

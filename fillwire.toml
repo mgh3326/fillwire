@@ -47,16 +47,17 @@ factor = 2
 [alerts]
 rate_limit = "10m" # per failure class, per process
 
-# Quote reader (KIS H0STCNT0 trade price + H0STASP0 order book -> quotes:kis).
-# Off unless enabled = true. It needs its own KIS app key: one app key admits
-# exactly one websocket session, so the quote key must differ from [kis] and
-# must not be used by any other websocket client. See README "Quote reader".
+# Quote reader (Toss Securities realtime websocket: trade + orderbook ->
+# quotes:toss). Off unless enabled = true. It reads the Toss access token that
+# auto_trader keeps in Redis at [redis] url, read-only; it holds no Toss client
+# id or secret and never issues or refreshes a token. It opens exactly one of
+# the two Toss websocket connections the account allows. Unknown keys in this
+# table reject the reader. See README "Quote reader".
 [quotes]
 enabled = false
-endpoint = "live" # live or mock; must match the quote app key
-app_key_env = "KIS_QUOTE_APP_KEY"
-app_secret_env = "KIS_QUOTE_APP_SECRET"
-symbols_file = "/etc/fillwire/quote-symbols.txt" # one KRX code per line, at most 40
-stream_key = "quotes:kis" # must start with quotes:
+provider = "toss"
+symbols_file = "/etc/fillwire/quote-symbols.txt" # "<kr|us> <code>" per line, at most 40
+token_key = "toss:oauth:0000000000000000:access_token" # the cached token key; replace the 16-hex fingerprint
+stream_key = "quotes:toss" # must start with quotes:
 max_len = 100000 # XADD MAXLEN ~ N
-buffer = 1024
+buffer = 1024 # at most 65536
