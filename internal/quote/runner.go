@@ -318,7 +318,6 @@ func (r *Runner) waitUntil(ctx context.Context, deadline time.Time) {
 // control carries ack and error frames from the reader to the connection loop.
 type control struct {
 	frame Frame
-	at    time.Time // when the reader read the frame
 }
 
 // runWindow owns one Toss websocket from open to window close. It returns
@@ -411,9 +410,8 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 					if redeclares > maxRedeclares {
 						return errTooManyRedeclare
 					}
-					// Wait out the documented window from the moment the frame
-					// arrived, however late it arrived.
-					r.limiter.coolDown(message.at.Add(rateLimitCoolDown))
+					// readLoop already installed the cool-down from this frame's
+					// receipt, before queueing it.
 					if err := r.declare(windowCtx, transport); err != nil {
 						if windowCtx.Err() != nil {
 							return r.windowEnded(ctx)
@@ -481,8 +479,15 @@ func (r *Runner) readLoop(ctx context.Context, transport Transport, controls cha
 				r.counters.DropBufferFull.Add(1)
 			}
 		case FrameSubscriptions, FrameError:
+			if frame.Kind == FrameError && frame.ErrorCode == "rate-limit-exceeded" {
+				// Install the cool-down here, at receipt and before queueing,
+				// so a declaration already waiting in the limiter and the
+				// first declaration on a replacement connection both observe
+				// it, however the supervisor handles the frame.
+				r.limiter.coolDown(received.Add(rateLimitCoolDown))
+			}
 			select {
-			case controls <- control{frame: frame, at: received}:
+			case controls <- control{frame: frame}:
 			case <-ctx.Done():
 				return ctx.Err()
 			}

@@ -248,8 +248,11 @@ The limits come from the AsyncAPI document:
   (trade and orderbook), so the 40-symbol cap uses at most 80.
 - **5 declarations per second.** The reader declares once per connection. A
   limiter admits at most five declarations in any rolling second, across
-  reconnects. After a `rate-limit-exceeded` frame, no declaration is sent
-  until at least 1 s after that frame was read, however late it arrived.
+  reconnects. Every `rate-limit-exceeded` frame sets a cool-down when it is
+  read, and no declaration is sent until at least 1 s after the latest such
+  frame. This covers a late frame, a frame read while a declaration is
+  already waiting, and the frame that exhausts the redeclarations and forces
+  a reconnect.
 - **Keepalive.** Toss closes a connection after 180 s with no client frame.
   The reader sends a text `PING` every 60 s.
 - **Rejected subscriptions.** A rejected entry in the subscription ack (for
