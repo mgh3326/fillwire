@@ -82,6 +82,7 @@ type Counters struct {
 	DropUnknownTopic  atomic.Uint64
 	DropUnknownSymbol atomic.Uint64
 	DropNoTimestamp   atomic.Uint64
+	DropEmptyBook     atomic.Uint64
 	DropOutOfSession  atomic.Uint64
 	DropBufferFull    atomic.Uint64
 	UnknownFrames     atomic.Uint64
@@ -106,6 +107,8 @@ func (c *Counters) drop(reason DropReason) {
 		c.DropUnknownSymbol.Add(1)
 	case DropNoTimestamp:
 		c.DropNoTimestamp.Add(1)
+	case DropEmptyBook:
+		c.DropEmptyBook.Add(1)
 	case DropOutOfSession:
 		c.DropOutOfSession.Add(1)
 	}
@@ -119,6 +122,7 @@ func (c *Counters) logArgs() []any {
 		"drop_unknown_topic", c.DropUnknownTopic.Load(),
 		"drop_unknown_symbol", c.DropUnknownSymbol.Load(),
 		"drop_no_timestamp", c.DropNoTimestamp.Load(),
+		"drop_empty_book", c.DropEmptyBook.Load(),
 		"drop_out_of_session", c.DropOutOfSession.Load(),
 		"drop_buffer_full", c.DropBufferFull.Load(),
 		"unknown_frames", c.UnknownFrames.Load(),

@@ -16,7 +16,8 @@ var StreamFields = []string{"symbol", "ts", "price", "bid1", "ask1", "bid_qty", 
 //
 //   - trade frames fill price; bid1, ask1, bid_qty, and ask_qty are "".
 //   - orderbook frames fill bid1 and bid_qty from bids[0] and ask1 and ask_qty
-//     from asks[0]; price is "". An empty side leaves its two fields "".
+//     from asks[0]; price is "". An empty side leaves its two fields "", and a
+//     frame with both sides empty is dropped.
 //
 // Values are never carried over from an earlier frame. Toss trade and
 // orderbook frames carry no sequence number and may be dropped by the server
@@ -59,6 +60,7 @@ const (
 	DropUnknownTopic DropReason = "unknown_topic"
 	DropUnknownSym   DropReason = "unknown_symbol"
 	DropNoTimestamp  DropReason = "no_timestamp"
+	DropEmptyBook    DropReason = "empty_book"
 	DropOutOfSession DropReason = "out_of_session"
 )
 
@@ -198,6 +200,11 @@ func (d *Decoder) decodeMessage(wire wireFrame) (Tick, DropReason) {
 		}
 		if tick.Bid1, tick.BidQty, ok = best(data.Bids); !ok {
 			return Tick{}, DropMalformed
+		}
+		if len(data.Asks) == 0 && len(data.Bids) == 0 {
+			// Nothing to quote: an entry with only symbol, ts, and session
+			// would read as a quote with no usable value.
+			return Tick{}, DropEmptyBook
 		}
 		if data.Timestamp == nil {
 			// AsyncAPI: the orderbook timestamp is null when no data is

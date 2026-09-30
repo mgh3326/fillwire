@@ -216,8 +216,11 @@ they block enabling the reader, not the code:
   bad `token_key`. A disabled table, `enabled = false` or no table at all, is
   not checked further and opens nothing.
 - The fills code gains only insertions: the lane starts after the fills
-  pipeline and is halted first at shutdown. Waiting for its socket to close
-  is bounded at 7 s after the fills shutdown.
+  pipeline and is halted first at shutdown. The wait for its socket to close
+  has a 7 s deadline counted from that halt, running alongside the fills
+  shutdown. It is checked only after the fills shutdown finishes, so it adds
+  at most 7 s minus the time the fills shutdown took, and nothing once that
+  reaches 7 s.
 
 Tests start the real `runWithDependencies`, first with the quote lane off and
 then with it on, under several conditions:
@@ -324,7 +327,8 @@ has exactly these fields, always all present:
 - **Numbers** are the Toss decimal strings as sent, after validation. No value
   is carried over from an earlier frame.
 - **Dropped and counted:** malformed frames, unknown topics or symbols,
-  orderbook frames with a null timestamp, and out-of-window ticks.
+  orderbook frames with a null timestamp or with both sides empty, and
+  out-of-window ticks.
 
 ### Turning it on (desk)
 
