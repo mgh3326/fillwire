@@ -162,6 +162,14 @@ session and make fills exit 42. So the quote reader:
   quote key, a Redis failure, or a reconnect storm is logged and retried with
   backoff (5s doubling to 5m between window runs), and exit codes are
   unchanged;
+- writes only to a stream key that starts with `quotes:`, so it cannot touch
+  `fills:*` or the `kis:`/`kis_mock:` approval keys;
+- closes its socket when the window ends, including while a dial or
+  subscription is still pending, and within a minute of a wall-clock jump out
+  of the window;
+- wraps the dialer, transport, and approval provider that go-kis calls from
+  its own goroutines, so a panic in any of them becomes an ordinary retryable
+  error instead of a process crash;
 - rejects a bad `[quotes]` table (wrong types, a malformed or over-long symbol
   list, a missing credential) by logging `quote reader disabled:
   configuration rejected` and running fills exactly as without the table.
@@ -255,7 +263,7 @@ ticks are dropped and counted rather than stalling the quote socket.
    app_key_env = "KIS_QUOTE_APP_KEY"
    app_secret_env = "KIS_QUOTE_APP_SECRET"
    symbols_file = "/etc/fillwire/quote-symbols.txt"
-   stream_key = "quotes:kis" # default; must differ from [stream] key
+   stream_key = "quotes:kis" # default; must start with quotes:
    max_len = 100000          # default; XADD MAXLEN ~ N
    buffer = 1024             # default, at most 65536; ticks held for XADD before dropping
    ```

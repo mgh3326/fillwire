@@ -434,14 +434,95 @@ func TestRunnerRedisFailureNeverStallsSocket(t *testing.T) {
 	}
 }
 
-func TestRunnerContainsPanic(t *testing.T) {
+func TestRunnerContainsDialerPanic(t *testing.T) {
 	l := startLane(t, wednesdayMidday, ackOK, func(cfg *Config) {
 		cfg.Dialer.(*fakeDialer).panics = true
 	})
+	// Contained as a failed dial and retried; the lane neither crashes nor
+	// stops on its own.
+	time.Sleep(30 * time.Millisecond)
 	select {
 	case <-l.done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("panicking quote lane did not stop")
+		t.Fatal("quote lane stopped on a contained dialer panic")
+	default:
+	}
+}
+
+// panicTransport panics inside Read, which go-kis calls from its own reader
+// goroutine, beyond the lane's guard.
+type panicTransport struct{ *fakeTransport }
+
+func (panicTransport) Read(context.Context) ([]byte, error) { panic("fixture transport panic") }
+
+type panicReadDialer struct{ dials atomic.Int32 }
+
+func (d *panicReadDialer) Dial(context.Context, string) (ws.Transport, error) {
+	d.dials.Add(1)
+	return panicTransport{&fakeTransport{in: make(chan []byte), closed: make(chan struct{})}}, nil
+}
+
+type panicApproval struct{}
+
+func (panicApproval) ApprovalKey(context.Context) (string, error) { panic("fixture approval panic") }
+func (panicApproval) Reissue(context.Context) (string, error)     { panic("fixture approval panic") }
+
+func TestRunnerContainsPanicsInGoKISGoroutines(t *testing.T) {
+	dialer := &panicReadDialer{}
+	l := startLane(t, wednesdayMidday, ackOK, func(cfg *Config) { cfg.Dialer = dialer })
+	waitFor(t, "redials after contained read panics", func() bool { return dialer.dials.Load() >= 3 })
+	select {
+	case <-l.done:
+		t.Fatal("quote lane stopped")
+	default:
+	}
+
+	approval := startLane(t, wednesdayMidday, ackOK, func(cfg *Config) { cfg.Approval = panicApproval{} })
+	time.Sleep(30 * time.Millisecond)
+	if approval.dialer.count() != 0 {
+		t.Fatalf("dialled %d times without an approval key", approval.dialer.count())
+	}
+}
+
+func TestRunnerClosesSocketOnBackwardClockJump(t *testing.T) {
+	l := startLane(t, wednesdayMidday, ackOK, nil)
+	transport := <-l.dialer.dialed
+	waitFor(t, "four subscriptions", subscribed(transport, 4))
+	l.clock.set(time.Date(2026, time.September, 30, 8, 30, 0, 0, KST))
+	waitFor(t, "socket close after the clock left the window", transport.isClosed)
+	time.Sleep(20 * time.Millisecond)
+	if l.dialer.count() != 1 {
+		t.Fatalf("dials = %d outside the window, want 1", l.dialer.count())
+	}
+}
+
+func TestRunnerWindowCloseCancelsPendingSubscribe(t *testing.T) {
+	silent := func(request) string { return "" }
+	l := startLane(t, time.Date(2026, time.September, 30, 15, 30, 50, 0, KST), silent, nil)
+	transport := <-l.dialer.dialed
+	waitFor(t, "first subscribe awaiting its ACK", subscribed(transport, 1))
+	l.clock.set(time.Date(2026, time.September, 30, 15, 31, 0, 0, KST))
+	waitFor(t, "socket close while a subscribe was pending", transport.isClosed)
+}
+
+func TestRunnerStopsSubscribingOnceWindowCloses(t *testing.T) {
+	var clock *laneClock
+	var once sync.Once
+	ack := func(req request) string {
+		once.Do(func() { clock.set(time.Date(2026, time.September, 30, 15, 31, 0, 0, KST)) })
+		return ackOK(req)
+	}
+	l := startLane(t, time.Date(2026, time.September, 30, 15, 30, 50, 0, KST), ack, func(cfg *Config) { clock = cfg.Clock.(*laneClock) })
+	transport := <-l.dialer.dialed
+	waitFor(t, "socket close", transport.isClosed)
+	subscribes := 0
+	for _, req := range transport.requests() {
+		if req.trType == "1" {
+			subscribes++
+		}
+	}
+	// The first ACK moves the clock past the close; no further subscribe.
+	if subscribes != 1 {
+		t.Fatalf("sent %d subscribes after the window closed", subscribes)
 	}
 }
 

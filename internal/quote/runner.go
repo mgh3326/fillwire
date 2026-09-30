@@ -237,12 +237,21 @@ func (r *Runner) waitUntil(ctx context.Context, deadline time.Time) {
 // runWindow owns one quote socket from open to window close. It returns nil
 // when the window closes or ctx ends and an error when the socket failed.
 func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, session string, closes time.Time) error {
+	// windowCtx ends when the window closes, including a wall-clock jump out
+	// of it, so a pending dial or subscribe never outlives the window.
+	windowCtx, closeWindow := context.WithCancel(ctx)
+	defer closeWindow()
+	go r.guard("window watcher", stopLane, func() {
+		r.watchWindow(windowCtx, closes)
+		closeWindow()
+	})
+
 	r.counters.Dials.Add(1)
-	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
+	dialCtx, cancelDial := context.WithTimeout(windowCtx, dialTimeout)
 	conn, err := ws.Dial(dialCtx, ws.Config{
 		Endpoint:    r.cfg.Endpoint,
-		Approval:    r.cfg.Approval,
-		Dialer:      r.cfg.Dialer,
+		Approval:    safeApproval{provider: r.cfg.Approval, logger: r.cfg.Logger},
+		Dialer:      safeDialer{dialer: r.cfg.Dialer, logger: r.cfg.Logger},
 		EventBuffer: r.cfg.Buffer,
 		Backoff:     r.cfg.Backoff,
 		Clock:       r.cfg.Clock,
@@ -256,6 +265,9 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, ses
 	})
 	cancelDial()
 	if err != nil {
+		if windowCtx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	// Close sends an unsubscribe for every subscription before dropping the
@@ -273,7 +285,10 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, ses
 	accepted := 0
 	for _, symbol := range r.cfg.Symbols {
 		for _, tr := range []string{ws.TRQuotePrice, ws.TRQuoteBook} {
-			subscribeCtx, cancel := context.WithTimeout(ctx, subscribeTimeout)
+			if windowCtx.Err() != nil || !r.windowOpen(closes) {
+				return r.windowEnded(ctx, session)
+			}
+			subscribeCtx, cancel := context.WithTimeout(windowCtx, subscribeTimeout)
 			err := conn.Subscribe(subscribeCtx, tr, symbol)
 			cancel()
 			var rejected *ws.SubscribeError
@@ -285,8 +300,8 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, ses
 				r.counters.SubscribeRejected.Add(1)
 				r.cfg.Logger.Warn("quote subscription rejected", "tr", tr, "symbol", symbol, "msg_cd", rejected.MsgCD)
 			default:
-				if ctx.Err() != nil {
-					return nil
+				if windowCtx.Err() != nil {
+					return r.windowEnded(ctx, session)
 				}
 				return err
 			}
@@ -297,20 +312,43 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, ses
 	}
 	r.cfg.Logger.Info("quote reader subscriptions active", "session", session, "accepted", accepted, "requested", 2*len(r.cfg.Symbols), "stream", r.cfg.StreamKey)
 
-	for {
-		remaining := closes.Sub(r.cfg.Clock.Now())
-		if remaining <= 0 {
-			r.cfg.Logger.Info("quote reader window closed", append([]any{"session", session}, r.counters.logArgs()...)...)
-			return nil
+	select {
+	case <-windowCtx.Done():
+		return r.windowEnded(ctx, session)
+	case <-drained:
+		if windowCtx.Err() != nil {
+			return r.windowEnded(ctx, session)
 		}
+		return errStreamStopped
+	}
+}
+
+// windowEnded reports a normal end of one window run.
+func (r *Runner) windowEnded(ctx context.Context, session string) error {
+	if ctx.Err() == nil {
+		r.cfg.Logger.Info("quote reader window closed", append([]any{"session", session}, r.counters.logArgs()...)...)
+	}
+	return nil
+}
+
+// watchWindow returns once the lane clock is no longer inside the window
+// that closes at closes, or when ctx ends. It rechecks at least once a
+// minute, so a wall-clock jump in either direction is noticed.
+func (r *Runner) watchWindow(ctx context.Context, closes time.Time) {
+	for ctx.Err() == nil && r.windowOpen(closes) {
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-drained:
-			return errStreamStopped
-		case <-r.cfg.Clock.After(min(remaining, maxWaitSlice)):
+			return
+		case <-r.cfg.Clock.After(min(closes.Sub(r.cfg.Clock.Now()), maxWaitSlice)):
 		}
 	}
+}
+
+// windowOpen reports whether the lane clock is still inside the window that
+// closes at closes.
+func (r *Runner) windowOpen(closes time.Time) bool {
+	_, current, open := SessionAt(r.cfg.Clock.Now())
+	return open && current.Equal(closes)
 }
 
 // drain decodes events until the connection closes Events. Ticks are offered

@@ -19,6 +19,7 @@ import (
 
 const (
 	defaultQuoteMaxLen = 100000
+	quoteStreamPrefix  = "quotes:"
 	defaultQuoteBuffer = 1024
 	// maxQuoteBuffer caps the tick and event buffers. An oversized value would
 	// be a fatal allocation failure, which recover cannot contain and which
@@ -117,8 +118,11 @@ func resolveQuoteSettings(contents []byte, fills runtimeConfig) quoteSettings {
 	if settings.streamKey == "" {
 		settings.streamKey = quote.DefaultStreamKey
 	}
-	if strings.TrimSpace(settings.streamKey) != settings.streamKey || settings.streamKey == fills.Stream.Key {
-		return reject("stream_key must have no surrounding spaces and must differ from the fills stream key")
+	// The prefix keeps the quote lane out of every key the fills path owns:
+	// its stream and the kis: and kis_mock: approval cache and lock keys.
+	if !strings.HasPrefix(settings.streamKey, quoteStreamPrefix) || len(settings.streamKey) == len(quoteStreamPrefix) ||
+		strings.TrimSpace(settings.streamKey) != settings.streamKey || settings.streamKey == fills.Stream.Key {
+		return reject("stream_key must start with " + quoteStreamPrefix + " and must differ from the fills stream key")
 	}
 	settings.maxLen = q.MaxLen
 	if settings.maxLen == 0 {
