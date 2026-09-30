@@ -626,44 +626,82 @@ func (store *Store) pendingResolutions(ctx context.Context, scopes ...string) ([
 	defer rows.Close()
 	var pending []PendingResolution
 	for rows.Next() {
-		var item PendingResolution
-		var brokerOrderID, errorCode, side, stockCode, quantity, price, sentAt, clientOrderID sql.NullString
-		if err := rows.Scan(&item.Receipt.SchemaVersion, &item.Receipt.CommandID, &item.Receipt.Disposition,
-			&brokerOrderID, &errorCode, &item.Receipt.RecordedAt, &item.AccountScope,
-			&side, &stockCode, &quantity, &price, &sentAt, &clientOrderID); err != nil {
+		item, err := scanPendingResolution(rows)
+		if err != nil {
 			return nil, err
-		}
-		if brokerOrderID.Valid {
-			item.Receipt.BrokerOrderID = brokerOrderID.String
-		}
-		if errorCode.Valid {
-			item.Receipt.ErrorCode = errorCode.String
-		}
-		if clientOrderID.Valid {
-			item.ClientOrderID = clientOrderID.String
-		}
-		if !validReceipt(item.Receipt) {
-			return nil, errors.New("invalid stored receipt")
-		}
-		item.ContextPresent = side.Valid && stockCode.Valid && quantity.Valid && price.Valid && sentAt.Valid
-		if item.ContextPresent {
-			item.Side, item.StockCode = side.String, stockCode.String
-			item.Quantity, item.Price = quantity.String, price.String
-			var parseErr error
-			item.SentAt, parseErr = time.Parse(time.RFC3339Nano, sentAt.String)
-			if parseErr != nil {
-				return nil, errors.New("invalid stored command context")
-			}
-		} else {
-			var parseErr error
-			item.SentAt, parseErr = time.Parse(time.RFC3339Nano, item.Receipt.RecordedAt)
-			if parseErr != nil {
-				return nil, errors.New("invalid stored receipt")
-			}
 		}
 		pending = append(pending, item)
 	}
 	return pending, rows.Err()
+}
+
+// FindPendingResolution returns the still-unresolved UNKNOWN record for one
+// command ID, including its immutable send facts. A conclusive or missing
+// command is indistinguishable here and returns found=false; callers that need
+// the effective receipt regardless of state use Find first.
+func (store *Store) FindPendingResolution(ctx context.Context, commandID string) (PendingResolution, bool, error) {
+	if store == nil || store.db == nil {
+		return PendingResolution{}, false, errors.New("store unavailable")
+	}
+	rows, err := store.db.QueryContext(ctx, `
+		SELECT c.schema_version, c.command_id, c.disposition, c.broker_order_id, c.error_code, c.recorded_at,
+			c.account_scope, x.side, x.stock_code, x.quantity, x.price, x.sent_at, x.client_order_id
+		FROM commands c
+		LEFT JOIN command_contexts x ON x.command_id = c.command_id
+		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
+		WHERE c.command_id = ? AND c.disposition = 'UNKNOWN' AND r.command_id IS NULL
+	`, commandID)
+	if err != nil {
+		return PendingResolution{}, false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return PendingResolution{}, false, rows.Err()
+	}
+	item, err := scanPendingResolution(rows)
+	if err != nil {
+		return PendingResolution{}, false, err
+	}
+	return item, true, rows.Err()
+}
+
+func scanPendingResolution(rows *sql.Rows) (PendingResolution, error) {
+	var item PendingResolution
+	var brokerOrderID, errorCode, side, stockCode, quantity, price, sentAt, clientOrderID sql.NullString
+	if err := rows.Scan(&item.Receipt.SchemaVersion, &item.Receipt.CommandID, &item.Receipt.Disposition,
+		&brokerOrderID, &errorCode, &item.Receipt.RecordedAt, &item.AccountScope,
+		&side, &stockCode, &quantity, &price, &sentAt, &clientOrderID); err != nil {
+		return PendingResolution{}, err
+	}
+	if brokerOrderID.Valid {
+		item.Receipt.BrokerOrderID = brokerOrderID.String
+	}
+	if errorCode.Valid {
+		item.Receipt.ErrorCode = errorCode.String
+	}
+	if clientOrderID.Valid {
+		item.ClientOrderID = clientOrderID.String
+	}
+	if !validReceipt(item.Receipt) {
+		return PendingResolution{}, errors.New("invalid stored receipt")
+	}
+	item.ContextPresent = side.Valid && stockCode.Valid && quantity.Valid && price.Valid && sentAt.Valid
+	if item.ContextPresent {
+		item.Side, item.StockCode = side.String, stockCode.String
+		item.Quantity, item.Price = quantity.String, price.String
+		var parseErr error
+		item.SentAt, parseErr = time.Parse(time.RFC3339Nano, sentAt.String)
+		if parseErr != nil {
+			return PendingResolution{}, errors.New("invalid stored command context")
+		}
+	} else {
+		var parseErr error
+		item.SentAt, parseErr = time.Parse(time.RFC3339Nano, item.Receipt.RecordedAt)
+		if parseErr != nil {
+			return PendingResolution{}, errors.New("invalid stored receipt")
+		}
+	}
+	return item, nil
 }
 
 // ResolveUnknown appends a conclusive reconciliation record and returns the

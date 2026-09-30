@@ -127,6 +127,31 @@ type PriceBandV1 struct {
 	BasePrice     string `json:"base_price,omitempty"`
 }
 
+// CommandCheckV1SchemaVersion identifies the bounded single-command evidence
+// answer returned by the edge's per-command resolve endpoint.
+const CommandCheckV1SchemaVersion = "command-check/v1"
+
+// CommandCheckV1 is the edge's answer for one command's post-send evidence
+// check. It carries the command's effective disposition plus count-only
+// evidence fields; it never carries order, account, or token values.
+type CommandCheckV1 struct {
+	SchemaVersion string               `json:"schema_version"`
+	CommandID     string               `json:"command_id"`
+	Disposition   ExecutionDisposition `json:"disposition"`
+	BrokerOrderID string               `json:"broker_order_id,omitempty"`
+	ErrorCode     string               `json:"error_code,omitempty"`
+	// EvidenceRead is "completed" when the broker day read ran, "not_needed"
+	// when the stored disposition was already conclusive, and "unavailable"
+	// when no evidence source can address this command.
+	EvidenceRead string `json:"evidence_read"`
+	// OrdersSeen is the number of orders the completed day read returned. It
+	// stays 0 for the Alpaca by-client-order-id read and for any state where
+	// no read ran.
+	OrdersSeen int `json:"orders_seen"`
+	// Matched is the number of orders matching this command's stored facts.
+	Matched int `json:"matched"`
+}
+
 // TokenLeaseView exposes validity metadata only. It intentionally never carries
 // a token value.
 type TokenLeaseView struct {

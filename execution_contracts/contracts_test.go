@@ -90,6 +90,43 @@ func TestExecutionReceiptDispositionIsClosed(t *testing.T) {
 	}
 }
 
+func TestCommandCheckV1HasOnlyApprovedWireFields(t *testing.T) {
+	check := CommandCheckV1{
+		SchemaVersion: CommandCheckV1SchemaVersion,
+		CommandID:     "command-1",
+		Disposition:   DispositionUnknown,
+		EvidenceRead:  "completed",
+		OrdersSeen:    3,
+		Matched:       1,
+	}
+	raw, err := json.Marshal(check)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"command_id", "disposition", "evidence_read", "matched",
+		"orders_seen", "schema_version",
+	}
+	got := make([]string, 0, len(fields))
+	for key := range fields {
+		got = append(got, key)
+	}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("command check fields = %v, want %v", got, want)
+	}
+	if _, present := fields["broker_order_id"]; present {
+		t.Fatal("empty optional broker_order_id was encoded")
+	}
+	if _, present := fields["error_code"]; present {
+		t.Fatal("empty optional error_code was encoded")
+	}
+}
+
 func TestAccountScopesAreNamedPaperBackends(t *testing.T) {
 	if AccountScopeKISMock != "kis_mock" {
 		t.Fatalf("KIS account scope = %q", AccountScopeKISMock)

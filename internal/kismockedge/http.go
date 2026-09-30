@@ -116,6 +116,24 @@ func NewHandler(service *Service) http.Handler {
 		writer.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(writer).Encode(band)
 	})
+	mux.HandleFunc("POST /v1/commands/{command_id}/resolve", func(writer http.ResponseWriter, request *http.Request) {
+		check, code := service.ResolveCommand(request.Context(), request.PathValue("command_id"))
+		if code != "" {
+			status := http.StatusBadGateway
+			switch code {
+			case ErrorInvalidCommand:
+				status = http.StatusBadRequest
+			case ErrorCommandNotFound:
+				status = http.StatusNotFound
+			case ErrorStorageFailure:
+				status = http.StatusInternalServerError
+			}
+			writeShadowError(writer, status, code)
+			return
+		}
+		writer.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(writer).Encode(check)
+	})
 	mux.HandleFunc("POST /v1/commands/{command_id}/cancel", func(writer http.ResponseWriter, request *http.Request) {
 		receipt, err := service.Cancel(request.Context(), request.PathValue("command_id"))
 		if err != nil {

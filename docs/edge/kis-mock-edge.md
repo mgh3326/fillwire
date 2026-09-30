@@ -9,7 +9,8 @@ command name; it does not change Python ownership of `order_send_intents`,
 redirect Python traffic, or modify `auto_trader`.
 
 The receiver exposes `POST /v1/commands`,
-`POST /v1/commands/{command_id}/cancel`, and the read-only
+`POST /v1/commands/{command_id}/cancel`, the bounded
+`POST /v1/commands/{command_id}/resolve`, and the read-only
 `GET /v1/price-band`, and binds to `127.0.0.1:8080` by
 default. `BROKER_EDGE_LISTEN_ADDR` may select another loopback address (for
 example `127.0.0.1:0` in tests), but cannot expose the unauthenticated receiver
@@ -91,6 +92,23 @@ period. Query failure, ambiguous matches, and an unexpired grace period remain
 `UNKNOWN` without a resolution record. Legacy receipt rows that predate stored
 command facts are resolved absent only when the successful day query contains
 zero orders.
+
+`POST /v1/commands/{command_id}/resolve` applies the same machinery to one
+command on demand. It exists for callers — notably the canary — that must
+learn whether their own command's possibly-sent order is resting before they
+decide to cancel. The answer is a `CommandCheckV1` (`command-check/v1`):
+`disposition` is the command's effective disposition after the check,
+`broker_order_id` appears only when the disposition is `ACCEPTED`,
+`evidence_read` reports `completed`, `not_needed` (the stored disposition was
+already conclusive), or `unavailable` (no evidence source can address the
+command), and `orders_seen`/`matched` carry counts only. Matching is by the
+command's own stored facts — a same-symbol foreign order never satisfies it —
+and the only possible write is the same additive `command_resolutions` row the
+scheduled resolver appends. An unknown command answers `404`, an invalid ID
+`400`, a store failure `500`, and an evidence-read failure `502` with the
+reader's closed code. The endpoint never issues a broker mutation; the canary
+combines it with the existing command-id cancel to clean up exactly its own
+proven-resting order.
 
 ## Read-only price band
 

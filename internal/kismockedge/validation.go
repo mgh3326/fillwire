@@ -35,6 +35,12 @@ const (
 	ErrorCancelNotFound       = "cancel_not_found"
 	ErrorCancelSendPending    = "cancel_send_pending"
 	ErrorScopeDisabled        = "scope_disabled"
+	// ErrorCommandNotFound answers a resolve request for a command ID the edge
+	// never stored.
+	ErrorCommandNotFound = "command_not_found"
+	// ErrorReadFailed answers a resolve request whose bounded evidence read
+	// failed without a reader-specific closed code.
+	ErrorReadFailed = "read_failed"
 )
 
 // ValidateCommand checks the closed command vocabulary before a broker request

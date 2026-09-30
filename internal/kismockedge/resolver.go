@@ -2,6 +2,7 @@ package kismockedge
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"sort"
 	"strings"
@@ -290,6 +291,177 @@ var errResolverUnavailable = &resolverError{}
 type resolverError struct{}
 
 func (*resolverError) Error() string { return "resolver unavailable" }
+
+// ResolveOne runs the bounded per-command evidence check behind
+// POST /v1/commands/{command_id}/resolve. It applies the existing resolver
+// machinery to exactly one stored command: read-only toward the broker, and
+// the only possible write is the additive command_resolutions row a
+// conclusive read already defines. Match evidence is selected by the
+// command's own stored facts — never by symbol alone — so a foreign order
+// can never produce a resolution for this command.
+func (resolver Resolver) ResolveOne(ctx context.Context, commandID string) (executioncontracts.CommandCheckV1, string) {
+	check := executioncontracts.CommandCheckV1{
+		SchemaVersion: executioncontracts.CommandCheckV1SchemaVersion,
+		CommandID:     commandID,
+	}
+	if !validCommandID(commandID) {
+		return check, ErrorInvalidCommand
+	}
+	if resolver.Store == nil {
+		return check, ErrorStorageFailure
+	}
+	receipt, found, err := resolver.Store.Find(ctx, commandID)
+	if err != nil {
+		return check, ErrorStorageFailure
+	}
+	if !found {
+		return check, ErrorCommandNotFound
+	}
+	check.Disposition = receipt.Disposition
+	check.BrokerOrderID = receipt.BrokerOrderID
+	check.ErrorCode = receipt.ErrorCode
+	if receipt.Disposition != executioncontracts.DispositionUnknown {
+		check.EvidenceRead = evidenceReadNotNeeded
+		return check, ""
+	}
+	item, found, err := resolver.Store.FindPendingResolution(ctx, commandID)
+	if err != nil {
+		return check, ErrorStorageFailure
+	}
+	if !found {
+		// An effective UNKNOWN without a pending row cannot be evidenced here.
+		check.EvidenceRead = evidenceReadUnavailable
+		return check, ""
+	}
+	now := time.Now
+	if resolver.Now != nil {
+		now = resolver.Now
+	}
+	grace := resolver.Grace
+	if grace == 0 {
+		grace = DefaultResolutionGrace
+	}
+	window := resolver.MatchWindow
+	if window == 0 {
+		window = defaultMatchWindow
+	}
+	day := kisTradingDay(item.SentAt)
+	switch item.AccountScope {
+	case executioncontracts.AccountScopeKISMock:
+		if resolver.Reader == nil {
+			check.EvidenceRead = evidenceReadUnavailable
+			return check, ""
+		}
+		orders, readErr := resolver.Reader.DomesticOrderHistory(ctx, day)
+		if readErr != nil {
+			return check, resolveReadCode(readErr)
+		}
+		check.OrdersSeen = len(orders)
+		return resolver.applyMatch(ctx, check, item, now, grace, len(orders), domesticMatchIDs(matchingOrders(item, orders, window)))
+	case executioncontracts.AccountScopeKISMockUS:
+		overseasReader, available := resolver.Reader.(OverseasOrderHistoryReader)
+		if !available {
+			check.EvidenceRead = evidenceReadUnavailable
+			return check, ""
+		}
+		orders, readErr := overseasReader.OverseasOrderHistory(ctx, day)
+		if readErr != nil {
+			return check, resolveReadCode(readErr)
+		}
+		check.OrdersSeen = len(orders)
+		return resolver.applyMatch(ctx, check, item, now, grace, len(orders), overseasMatchIDs(matchingOverseasOrders(item, orders, window)))
+	case executioncontracts.AccountScopeAlpacaPaperCrypto:
+		// Same guard as the batch path: a receipt without the persisted
+		// client-order-id mapping cannot be evidenced by that read at all.
+		if !item.ContextPresent || item.ClientOrderID != item.Receipt.CommandID ||
+			!validCommandID(item.ClientOrderID) || resolver.AlpacaReader == nil {
+			check.EvidenceRead = evidenceReadUnavailable
+			return check, ""
+		}
+		evidence, foundOrder, readErr := resolver.AlpacaReader.OrderByClientOrderID(ctx, item.ClientOrderID)
+		if readErr != nil {
+			return check, resolveReadCode(readErr)
+		}
+		check.EvidenceRead = evidenceReadCompleted
+		switch {
+		case foundOrder && evidence.BrokerOrderID != "":
+			check.Matched = 1
+			return resolver.concludeOne(ctx, check, item, executioncontracts.DispositionAccepted, evidence.BrokerOrderID, "", now)
+		case !now().Before(item.SentAt.Add(grace)):
+			return resolver.concludeOne(ctx, check, item, executioncontracts.DispositionNotCreated, "", ErrorResolvedAbsent, now)
+		default:
+			return check, ""
+		}
+	default:
+		check.EvidenceRead = evidenceReadUnavailable
+		return check, ""
+	}
+}
+
+// applyMatch folds a completed KIS day read into the shared resolveEvidence
+// conclusion for a single pending record: a unique match resolves ACCEPTED,
+// an empty proven day resolves absent only after grace, and anything else —
+// zero or ambiguous matches — remains UNKNOWN and is never resolved.
+func (resolver Resolver) applyMatch(
+	ctx context.Context,
+	check executioncontracts.CommandCheckV1,
+	item PendingResolution,
+	now func() time.Time,
+	grace time.Duration,
+	orderCount int,
+	matched []string,
+) (executioncontracts.CommandCheckV1, string) {
+	check.EvidenceRead = evidenceReadCompleted
+	check.Matched = len(matched)
+	resolved, _, err := resolver.resolveEvidence(ctx, []PendingResolution{item}, now, grace, orderCount,
+		func(PendingResolution) []string { return matched })
+	if err != nil {
+		return check, ErrorStorageFailure
+	}
+	if len(resolved) == 1 {
+		check.Disposition = resolved[0].Disposition
+		check.BrokerOrderID = resolved[0].BrokerOrderID
+		check.ErrorCode = resolved[0].ErrorCode
+	}
+	return check, ""
+}
+
+// concludeOne applies a conclusion the caller already chose (the Alpaca
+// by-client-order-id evidence path) to one pending record.
+func (resolver Resolver) concludeOne(
+	ctx context.Context,
+	check executioncontracts.CommandCheckV1,
+	item PendingResolution,
+	disposition executioncontracts.ExecutionDisposition,
+	brokerOrderID, errorCode string,
+	now func() time.Time,
+) (executioncontracts.CommandCheckV1, string) {
+	receipt, err := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, disposition, brokerOrderID, errorCode, now())
+	if err != nil {
+		return check, ErrorStorageFailure
+	}
+	check.Disposition = receipt.Disposition
+	check.BrokerOrderID = receipt.BrokerOrderID
+	check.ErrorCode = receipt.ErrorCode
+	return check, ""
+}
+
+const (
+	evidenceReadCompleted   = "completed"
+	evidenceReadNotNeeded   = "not_needed"
+	evidenceReadUnavailable = "unavailable"
+)
+
+// resolveReadCode maps a reader failure to the closed code the endpoint
+// answers with. Reader SafeErrors carry their own closed vocabulary; anything
+// else collapses to a generic failure code.
+func resolveReadCode(err error) string {
+	var safe *kismockread.SafeError
+	if errors.As(err, &safe) && safe != nil && safe.Code != "" {
+		return string(safe.Code)
+	}
+	return ErrorReadFailed
+}
 
 func kisTradingDay(value time.Time) string {
 	return value.In(time.FixedZone("KST", 9*60*60)).Format("20060102")

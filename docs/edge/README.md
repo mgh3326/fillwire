@@ -105,7 +105,8 @@ loopback `GET /metrics` with standard Go/process collectors and a bounded
 ## Mock placement edge: `kis-mock-edge`
 
 `kis-mock-edge` accepts `POST /v1/commands`,
-`POST /v1/commands/{command_id}/cancel`, and Prometheus-format `GET /metrics`
+`POST /v1/commands/{command_id}/cancel`,
+`POST /v1/commands/{command_id}/resolve`, and Prometheus-format `GET /metrics`
 on `127.0.0.1:8080` by default. The listener rejects non-loopback overrides.
 `account_scope` is closed
 to `kis_mock`, `kis_mock_us`, `alpaca_paper_crypto`, and `kis_live`. The mock
@@ -203,6 +204,12 @@ read. A matching echoed client order ID appends `ACCEPTED`; a completed 404
 after grace appends `NOT_CREATED/resolved_absent`; failures remain `UNKNOWN`.
 Historical Alpaca rows without a persisted client-order-id mapping remain
 `UNKNOWN`, because absence cannot be proven for them.
+
+`POST /v1/commands/{command_id}/resolve` applies the same single-command
+check on demand and answers a `command-check/v1` object: the effective
+disposition, whether an evidence read ran (`completed`, `not_needed`,
+`unavailable`), and match counts. The canary uses it after an ambiguous place
+to decide whether its own timed-out order is resting before cancelling it.
 
 See [the edge boundary](docs/kis-mock-edge.md) for the command, receipt, and
 failure contract. Repository tests use fake transport responses and do not

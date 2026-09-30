@@ -35,7 +35,13 @@ type Service struct {
 	// It is deliberately separate from Brokers: a quoter can never build a
 	// mutation request.
 	Quoters map[string]Quoter
-	Now     func() time.Time
+	// OrderReader and AlpacaOrderReader supply the read-only broker evidence
+	// for the bounded per-command resolve endpoint. They are the same readers
+	// the scheduled resolver uses; a service without them can still answer but
+	// reports evidence_read=unavailable for pending commands.
+	OrderReader       OrderHistoryReader
+	AlpacaOrderReader AlpacaOrderReader
+	Now               func() time.Time
 	// Metrics is optional for direct library callers. NewHandler installs one
 	// when needed, and the daemon constructor installs one up front.
 	Metrics *Metrics
@@ -96,6 +102,8 @@ func NewEnvironmentService(store *Store, lookup func(string) string, transport h
 				},
 			},
 		},
+		OrderReader:       environmentOrderHistoryReader{lookup: lookup},
+		AlpacaOrderReader: environmentAlpacaOrderReader{lookup: lookup},
 	}
 }
 
@@ -196,6 +204,23 @@ func (service *Service) brokerForScope(scope string) Broker {
 		return nil
 	}
 	return service.Brokers[scope]
+}
+
+// ResolveCommand answers the bounded evidence check for one stored command.
+// It is the only Service surface the canary's post-timeout cleanup uses: a
+// single read-only broker inquiry plus at most one additive resolution row,
+// always keyed to this command's own stored facts.
+func (service *Service) ResolveCommand(ctx context.Context, commandID string) (executioncontracts.CommandCheckV1, string) {
+	resolver := Resolver{}
+	if service != nil {
+		resolver = Resolver{
+			Store:        service.Store,
+			Reader:       service.OrderReader,
+			AlpacaReader: service.AlpacaOrderReader,
+			Now:          service.Now,
+		}
+	}
+	return resolver.ResolveOne(ctx, commandID)
 }
 
 func (service *Service) storeFinal(ctx context.Context, commandID string, disposition executioncontracts.ExecutionDisposition, code string) (executioncontracts.ExecutionReceiptV1, error) {
