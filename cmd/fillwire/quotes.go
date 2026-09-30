@@ -20,6 +20,10 @@ import (
 const (
 	defaultQuoteMaxLen = 100000
 	defaultQuoteBuffer = 1024
+	// maxQuoteBuffer caps the tick and event buffers. An oversized value would
+	// be a fatal allocation failure, which recover cannot contain and which
+	// would take the fills pipeline down with the process.
+	maxQuoteBuffer = 65536
 	// quoteStopTimeout bounds the wait for the quote socket's unsubscribe and
 	// close at shutdown. go-kis bounds those writes at 5s.
 	quoteStopTimeout = 7 * time.Second
@@ -126,6 +130,9 @@ func resolveQuoteSettings(contents []byte, fills runtimeConfig) quoteSettings {
 	}
 	if settings.maxLen < 0 || settings.buffer < 0 {
 		return reject("max_len and buffer must be positive")
+	}
+	if settings.buffer > maxQuoteBuffer {
+		return reject(fmt.Sprintf("buffer must be at most %d", maxQuoteBuffer))
 	}
 	return settings
 }

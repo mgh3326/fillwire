@@ -257,7 +257,7 @@ ticks are dropped and counted rather than stalling the quote socket.
    symbols_file = "/etc/fillwire/quote-symbols.txt"
    stream_key = "quotes:kis" # default; must differ from [stream] key
    max_len = 100000          # default; XADD MAXLEN ~ N
-   buffer = 1024             # default; ticks held for XADD before dropping
+   buffer = 1024             # default, at most 65536; ticks held for XADD before dropping
    ```
 
 5. Restart fillwire the usual way (`docs/digest-pin-deploy.md`). A restart also

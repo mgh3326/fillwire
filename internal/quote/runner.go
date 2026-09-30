@@ -102,6 +102,8 @@ func (c *Counters) logArgs() []any {
 		"drop_buffer_full", c.DropBufferFull.Load(),
 		"xadd_errors", c.XAddErrors.Load(),
 		"subscribe_rejected", c.SubscribeRejected.Load(),
+		"dials", c.Dials.Load(),
+		"window_runs", c.WindowRuns.Load(),
 	}
 }
 

@@ -180,6 +180,9 @@ func TestQuoteSettingsResolution(t *testing.T) {
 		return cfg.quotes
 	}
 
+	if capped := load(t, strings.Replace(enabledQuotes(symbolFile(t, 1)), "buffer = 512", "buffer = 65536", 1)); capped.err != nil || capped.buffer != 65536 {
+		t.Fatalf("buffer at the cap = %+v, want accepted", capped)
+	}
 	valid := load(t, enabledQuotes(symbolFile(t, 40)))
 	if !valid.enabled || valid.err != nil || len(valid.symbols) != 40 || valid.streamKey != "quotes:kis" || valid.maxLen != 50000 || valid.buffer != 512 || valid.endpoint != "live" {
 		t.Fatalf("valid quote settings = %+v", valid)
@@ -203,6 +206,7 @@ func TestQuoteSettingsResolution(t *testing.T) {
 		"padded stream key":     strings.Replace(enabledQuotes(symbolFile(t, 1)), "stream_key = \"quotes:kis\"", "stream_key = \" quotes:kis\"", 1),
 		"negative max_len":      strings.Replace(enabledQuotes(symbolFile(t, 1)), "max_len = 50000", "max_len = -1", 1),
 		"negative buffer":       strings.Replace(enabledQuotes(symbolFile(t, 1)), "buffer = 512", "buffer = -1", 1),
+		"oversized buffer":      strings.Replace(enabledQuotes(symbolFile(t, 1)), "buffer = 512", "buffer = 65537", 1),
 		"type error in enabled": "[quotes]\nenabled = \"yes\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
