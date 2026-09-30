@@ -524,7 +524,7 @@ func quoteScenarios() []quoteScenario {
 					}), nil
 				}}
 			},
-			// Declarations are spaced a second apart, even across reconnects.
+			// Declarations are limited to five per rolling second, across reconnects.
 			settled: func(d *tossDialer, _ *miniredis.Miniredis) bool { return d.count() >= 3 },
 		},
 		{

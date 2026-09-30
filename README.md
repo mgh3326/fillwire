@@ -178,8 +178,11 @@ with. So fillwire:
 - treats a token within 120 s of `expires_at` as absent, which is
   auto_trader's own buffer. With no usable token the reader does not dial; it
   re-reads the key at intervals that back off to at most 15 s.
-- after a handshake 401, never redials with that same token. It waits until
-  the owner publishes a different one.
+- after a handshake 401, never redials with that token. It keeps a bounded
+  set of refused-token fingerprints: SHA-256 hashes, never the token, at most
+  32 of them. It dials again only when the cache holds a token outside that
+  set, so a refused A, then a refused B, then A back in the cache does not
+  redial A.
 
 The token is checked only at the handshake. Toss keeps an open connection
 alive after the token expires, so a valid token matters only when connecting
@@ -243,9 +246,10 @@ The limits come from the AsyncAPI document:
 
 - **100 subscriptions per connection.** Each symbol takes two
   (trade and orderbook), so the 40-symbol cap uses at most 80.
-- **5 declarations per second.** The reader declares once per connection,
-  spaced at least 1 s apart even across reconnects, and waits 1 s before
-  redeclaring after `rate-limit-exceeded`.
+- **5 declarations per second.** The reader declares once per connection. A
+  limiter admits at most five declarations in any rolling second, across
+  reconnects. After a `rate-limit-exceeded` frame, no declaration is sent
+  until at least 1 s after that frame was read, however late it arrived.
 - **Keepalive.** Toss closes a connection after 180 s with no client frame.
   The reader sends a text `PING` every 60 s.
 - **Rejected subscriptions.** A rejected entry in the subscription ack (for

@@ -29,11 +29,8 @@ const (
 	closeTimeout = 5 * time.Second
 	// pingInterval is the AsyncAPI recommendation; the server closes a
 	// connection that has sent nothing for 180s.
-	pingInterval = 60 * time.Second
-	// declareSpacing keeps declarations far below the 5 per second limit and
-	// is the wait the AsyncAPI asks for after rate-limit-exceeded.
-	declareSpacing = time.Second
-	maxRedeclares  = 3
+	pingInterval  = 60 * time.Second
+	maxRedeclares = 3
 	// maxWaitSlice caps every sleep so a wall-clock jump (suspend, NTP step)
 	// is noticed within a minute rather than after a whole overnight wait.
 	maxWaitSlice = time.Minute
@@ -148,9 +145,9 @@ type Runner struct {
 	token       TokenSource
 	declaration []byte
 
-	// Lane-local state owned by the supervisor goroutine.
-	rejectedToken string
-	lastDeclare   time.Time
+	limiter *declareLimiter
+	// refused is owned by the supervisor goroutine.
+	refused refusedTokens
 }
 
 // NewRunner validates cfg.
@@ -199,6 +196,7 @@ func NewRunner(cfg Config) (*Runner, error) {
 		dialer:      &singleConnection{dialer: safeDialer{dialer: cfg.Dialer, logger: cfg.Logger}},
 		token:       safeToken{source: cfg.Token, logger: cfg.Logger},
 		declaration: declaration,
+		limiter:     newDeclareLimiter(cfg.Clock),
 	}, nil
 }
 
@@ -320,6 +318,7 @@ func (r *Runner) waitUntil(ctx context.Context, deadline time.Time) {
 // control carries ack and error frames from the reader to the connection loop.
 type control struct {
 	frame Frame
+	at    time.Time // when the reader read the frame
 }
 
 // runWindow owns one Toss websocket from open to window close. It returns
@@ -342,9 +341,9 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 		r.counters.TokenUnavailable.Add(1)
 		return err
 	}
-	if token == r.rejectedToken {
+	if r.refused.contains(token) {
 		// A non-owner never asks for a new token; it waits until the owner
-		// publishes a different one.
+		// publishes one that Toss has not refused before.
 		return errTokenRejected
 	}
 
@@ -357,7 +356,7 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 			return r.windowEnded(ctx)
 		}
 		if errors.Is(err, ErrUnauthorized) {
-			r.rejectedToken = token
+			r.refused.add(token)
 			r.counters.TokenRejected.Add(1)
 			return errTokenRejected
 		}
@@ -366,7 +365,6 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 	// Break before make: this transport is closed before the supervisor can
 	// dial another one.
 	defer transport.Close()
-	r.rejectedToken = ""
 
 	controls := make(chan control, 8)
 	readerDone := make(chan error, 1)
@@ -413,6 +411,9 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 					if redeclares > maxRedeclares {
 						return errTooManyRedeclare
 					}
+					// Wait out the documented window from the moment the frame
+					// arrived, however late it arrived.
+					r.limiter.coolDown(message.at.Add(rateLimitCoolDown))
 					if err := r.declare(windowCtx, transport); err != nil {
 						if windowCtx.Err() != nil {
 							return r.windowEnded(ctx)
@@ -439,16 +440,13 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 	}
 }
 
-// declare sends the subscription array, spacing declarations at least a
-// second apart across reconnects.
+// declare sends the subscription array once the limiter admits it: at most
+// five declarations in any rolling second, across reconnects, and none
+// before a rate-limit cool-down ends.
 func (r *Runner) declare(ctx context.Context, transport Transport) error {
-	if !r.lastDeclare.IsZero() {
-		r.waitUntil(ctx, r.lastDeclare.Add(declareSpacing))
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+	if err := r.limiter.Wait(ctx); err != nil {
+		return err
 	}
-	r.lastDeclare = r.cfg.Clock.Now()
 	r.counters.Declarations.Add(1)
 	return r.write(ctx, transport, r.declaration)
 }
@@ -468,6 +466,7 @@ func (r *Runner) readLoop(ctx context.Context, transport Transport, controls cha
 		if err != nil {
 			return err
 		}
+		received := r.cfg.Clock.Now()
 		r.counters.Frames.Add(1)
 		frame := r.decoder.Decode(raw)
 		switch frame.Kind {
@@ -483,7 +482,7 @@ func (r *Runner) readLoop(ctx context.Context, transport Transport, controls cha
 			}
 		case FrameSubscriptions, FrameError:
 			select {
-			case controls <- control{frame: frame}:
+			case controls <- control{frame: frame, at: received}:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
