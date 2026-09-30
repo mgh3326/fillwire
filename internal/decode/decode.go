@@ -2,6 +2,7 @@
 package decode
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"log/slog"
@@ -88,15 +89,35 @@ type Record struct {
 	DupObservationCount uint64     `json:"-"`
 }
 
-// Decode returns a normalized ledger record when event is a valid KIS
-// execution. The false result means either a non-execution event or a
-// validation failure; only validation failures increment Dropped.
+// NonFill returns the count of execution notices classified as not a fill.
+func (d *Decoder) NonFill() uint64 {
+	snapshot := d.counters.Snapshot()
+	return snapshot.NonFillOrder + snapshot.NonFillReject + snapshot.NonFillCancel + snapshot.NonFillUnknown
+}
+
+// Decode returns a normalized ledger record when event is a KIS execution
+// notice that classifies as a fill and passes validation. The false result
+// means a non-execution event (not counted), a non-fill notice such as an
+// order accept (counted by NonFill), or a validation failure (counted by
+// Dropped).
 func (d *Decoder) Decode(event ws.Event) (Record, bool) {
 	if event.Execution == nil {
 		return Record{}, false
 	}
 
 	execution := event.Execution
+	// Classification must precede every other check: an accept notice carries
+	// the order quantity and price in the fill columns and would otherwise pass
+	// validation as a well-formed fill.
+	if kind := ClassifyNotice(event.TR, event.Fields); kind != NoticeFill {
+		d.skipNonFill(kind, event)
+		return Record{}, false
+	}
+	if !checkExecutionMatchesFrame(execution, event.Fields) {
+		d.drop("parsed execution disagrees with frame fields", execution)
+		return Record{}, false
+	}
+
 	orderNo := strings.TrimSpace(execution.OrderNo)
 	if orderNo == "" {
 		d.drop("empty broker order id", execution)
@@ -164,6 +185,27 @@ func (d *Decoder) Decode(event ws.Event) (Record, bool) {
 		DupSuspect:          dupSuspect,
 		DupObservationCount: observationCount,
 	}, true
+}
+
+func (d *Decoder) skipNonFill(kind NoticeKind, event ws.Event) {
+	d.counters.IncNonFill(kind)
+	if d.logger == nil {
+		return
+	}
+	// Only the order number and classification codes are logged; account and
+	// customer fields stay out of logs.
+	level := slog.LevelInfo
+	if kind == NoticeUnknown {
+		level = slog.LevelWarn
+	}
+	d.logger.Log(context.Background(), level, "skipping non-fill KIS execution notice", "kind", string(kind), "tr", event.TR, "order_no", event.Execution.OrderNo, "symbol", event.Execution.Symbol, "field_count", len(event.Fields), "cntg_yn", fieldAt(event.Fields, idxCntgYN), "rfus_yn", fieldAt(event.Fields, idxRfusYN), "rctf_cls", fieldAt(event.Fields, idxRctfCls), "acpt_yn", fieldAt(event.Fields, idxAcptYN))
+}
+
+func fieldAt(fields []string, index int) string {
+	if index < len(fields) {
+		return fields[index]
+	}
+	return ""
 }
 
 func (d *Decoder) drop(reason string, execution *ws.Execution) {

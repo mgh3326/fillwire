@@ -25,7 +25,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const kisExecutionFrame = "0|H0STCNI0|1|HTS_EXAMPLE^00000000^A123456789^0000000000^02^00^00^00^005930^3^71200^093015^0^2"
+const kisExecutionFrame = "0|H0STCNI0|1|HTS_EXAMPLE^00000000^A123456789^0000000000^02^0^00^0^005930^3^71200^093015^0^2^2^00000^5^^0^1^Y^^10^^EXAMPLE^71500"
 
 type fakeApproval struct {
 	approvalCalls atomic.Int32
@@ -199,7 +199,7 @@ func TestT1NormalPipeline(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		const expected = `{"fills":[{"broker":"kis","account_mode":"live","venue":"krx","instrument_type":"equity_kr","symbol":"005930","raw_symbol":"005930","side":"buy","broker_order_id":"A123456789","fill_seq":2023882045,"filled_qty":"3","filled_price":"71200","filled_notional":null,"fee_amount":null,"fee_currency":"KRW","filled_at":"2026-09-07T09:30:15+09:00","currency":"KRW","correlation_id":null,"raw_payload_json":{"tr":"H0STCNI0","fields":["HTS_EXAMPLE","00000000","A123456789","0000000000","02","00","00","00","005930","3","71200","093015","0","2"],"received_at":"2026-09-07T09:30:20+09:00"}}],"source":"fillwire","source_run_id":null}`
+		const expected = `{"fills":[{"broker":"kis","account_mode":"live","venue":"krx","instrument_type":"equity_kr","symbol":"005930","raw_symbol":"005930","side":"buy","broker_order_id":"A123456789","fill_seq":187985523,"filled_qty":"3","filled_price":"71200","filled_notional":null,"fee_amount":null,"fee_currency":"KRW","filled_at":"2026-09-07T09:30:15+09:00","currency":"KRW","correlation_id":null,"raw_payload_json":{"tr":"H0STCNI0","fields":["HTS_EXAMPLE","00000000","A123456789","0000000000","02","0","00","0","005930","3","71200","093015","0","2","2","00000","5","","0","1","Y","","10","","EXAMPLE","71500"],"received_at":"2026-09-07T09:30:20+09:00"}}],"source":"fillwire","source_run_id":null}`
 		assertJSONEqual(t, []byte(expected), body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"source":"fillwire","source_run_id":null,"received":1,"accepted":1,"rejected":0,"results":[{"status":"inserted","row_id":123,"reason":null}]}`))

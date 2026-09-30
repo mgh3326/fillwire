@@ -396,7 +396,7 @@ func validStaticConfig() runtimeConfig {
 }
 
 func shutdownFixtureEvent() ws.Event {
-	fields := []string{"HTS_EXAMPLE", "00000000", "A123456789", "0000000000", "02", "00", "00", "00", "005930", "3", "71200", "093015", "0", "2"}
+	fields := []string{"HTS_EXAMPLE", "00000000", "A123456789", "0000000000", "02", "0", "00", "0", "005930", "3", "71200", "093015", "0", "2", "2", "00000", "5", "", "0", "1", "Y", "", "10", "", "EXAMPLE", "71500"}
 	return ws.Event{
 		TR:         ws.TRExecutionLive,
 		Fields:     fields,

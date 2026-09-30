@@ -12,6 +12,11 @@ type Counters struct {
 	xackShortfall  atomic.Uint64
 	ingestFailures atomic.Uint64
 	drainDropped   atomic.Uint64
+	nonFillOrder   atomic.Uint64
+	nonFillReject  atomic.Uint64
+	nonFillCancel  atomic.Uint64
+	nonFillUnknown atomic.Uint64
+	sinkNonFill    atomic.Uint64
 }
 
 // CounterSnapshot is a consistent-enough point-in-time view for diagnostics.
@@ -23,6 +28,15 @@ type CounterSnapshot struct {
 	XAckShortfall  uint64
 	IngestFailures uint64
 	DrainDropped   uint64
+	// NonFillOrder..NonFillUnknown count execution-notice frames the decoder
+	// classified as not a fill and therefore never enqueued.
+	NonFillOrder   uint64
+	NonFillReject  uint64
+	NonFillCancel  uint64
+	NonFillUnknown uint64
+	// SinkNonFill counts stream entries whose stored frame is not a fill; the
+	// sink acknowledges them without posting them to the ledger ingest.
+	SinkNonFill uint64
 }
 
 // NewCounters allocates shared counters for the decoder, stream queue, and
@@ -42,6 +56,11 @@ func (c *Counters) Snapshot() CounterSnapshot {
 		XAckShortfall:  c.xackShortfall.Load(),
 		IngestFailures: c.ingestFailures.Load(),
 		DrainDropped:   c.drainDropped.Load(),
+		NonFillOrder:   c.nonFillOrder.Load(),
+		NonFillReject:  c.nonFillReject.Load(),
+		NonFillCancel:  c.nonFillCancel.Load(),
+		NonFillUnknown: c.nonFillUnknown.Load(),
+		SinkNonFill:    c.sinkNonFill.Load(),
 	}
 }
 
@@ -93,5 +112,31 @@ func (c *Counters) IncIngestFailure() {
 func (c *Counters) AddDrainDropped(n uint64) {
 	if c != nil && n > 0 {
 		c.drainDropped.Add(n)
+	}
+}
+
+// IncNonFill records one execution notice the decoder refused to treat as a
+// fill. Kinds other than order, rejected and canceled count as unknown.
+func (c *Counters) IncNonFill(kind NoticeKind) {
+	if c == nil {
+		return
+	}
+	switch kind {
+	case NoticeOrder:
+		c.nonFillOrder.Add(1)
+	case NoticeRejected:
+		c.nonFillReject.Add(1)
+	case NoticeCanceled:
+		c.nonFillCancel.Add(1)
+	default:
+		c.nonFillUnknown.Add(1)
+	}
+}
+
+// IncSinkNonFill records a stream entry skipped by the sink because its stored
+// frame does not classify as a fill.
+func (c *Counters) IncSinkNonFill() {
+	if c != nil {
+		c.sinkNonFill.Add(1)
 	}
 }

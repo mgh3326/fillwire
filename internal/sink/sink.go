@@ -318,33 +318,54 @@ func (r *Runner) DeliverOnce(ctx context.Context, messages []stream.Message) err
 	if len(messages) > 200 {
 		return errors.New("sink: batch exceeds 200 records")
 	}
-	fills := make([]decode.Record, len(messages))
-	for i, message := range messages {
+	// Re-classify every stored frame before posting. Entries written by an
+	// older binary that enqueued order accept notices must never reach the
+	// ledger as fills. They are acknowledged without posting: the stream entry
+	// itself stays in Redis as evidence, and re-reading it would only repeat
+	// the same deterministic skip.
+	nonFillIDs := make([]string, 0)
+	fillMessages := make([]stream.Message, 0, len(messages))
+	for _, message := range messages {
+		raw := message.Record.RawPayloadJSON
+		if kind := decode.ClassifyNotice(raw.TR, raw.Fields); kind != decode.NoticeFill {
+			nonFillIDs = append(nonFillIDs, message.ID)
+			r.counters.IncSinkNonFill()
+			r.logNonFillSkipped(message, kind)
+			continue
+		}
+		fillMessages = append(fillMessages, message)
+	}
+	if len(fillMessages) == 0 {
+		return r.queue.Ack(ctx, nonFillIDs...)
+	}
+
+	fills := make([]decode.Record, len(fillMessages))
+	for i, message := range fillMessages {
 		fills[i] = message.Record
 	}
 	response, err := r.client.Post(ctx, fills)
 	if err != nil {
 		return err
 	}
-	if len(response.Results) != len(messages) {
-		return fmt.Errorf("sink: result count %d does not match request count %d", len(response.Results), len(messages))
+	if len(response.Results) != len(fillMessages) {
+		return fmt.Errorf("sink: result count %d does not match request count %d", len(response.Results), len(fillMessages))
 	}
 
-	ackIDs := make([]string, 0, len(messages))
+	ackIDs := append(make([]string, 0, len(messages)), nonFillIDs...)
 	inserted, updated, unchanged, rejected := 0, 0, 0, 0
 	for index, result := range response.Results {
 		switch result.Status {
 		case "inserted":
 			inserted++
-			ackIDs = append(ackIDs, messages[index].ID)
+			ackIDs = append(ackIDs, fillMessages[index].ID)
 		case "updated":
 			updated++
-			ackIDs = append(ackIDs, messages[index].ID)
+			ackIDs = append(ackIDs, fillMessages[index].ID)
 		case "unchanged":
 			unchanged++
-			ackIDs = append(ackIDs, messages[index].ID)
-			if messages[index].DupSuspect {
-				r.logDuplicateAbsorbed(messages[index])
+			ackIDs = append(ackIDs, fillMessages[index].ID)
+			if fillMessages[index].DupSuspect {
+				r.logDuplicateAbsorbed(fillMessages[index])
 			}
 		case "rejected":
 			rejected++
@@ -356,7 +377,7 @@ func (r *Runner) DeliverOnce(ctx context.Context, messages []stream.Message) err
 	}
 	if r.logger != nil {
 		r.logger.Info("ingest response statuses observed",
-			"batch_size", len(messages),
+			"batch_size", len(fillMessages),
 			"inserted", inserted,
 			"updated", updated,
 			"unchanged", unchanged,
@@ -400,6 +421,13 @@ func (r *Runner) logFailure(err error) {
 		return
 	}
 	r.logger.Warn("ingest attempt failed; retaining pending records", "reason", safeErrorReason(err))
+}
+
+func (r *Runner) logNonFillSkipped(message stream.Message, kind decode.NoticeKind) {
+	if r.logger == nil {
+		return
+	}
+	r.logger.Warn("skipping stored KIS notice that is not a fill", "kind", string(kind), "order_no", message.Record.BrokerOrderID, "symbol", message.Record.Symbol)
 }
 
 func (r *Runner) logDuplicateAbsorbed(message stream.Message) {

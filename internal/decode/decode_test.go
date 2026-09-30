@@ -2,6 +2,7 @@ package decode_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,9 +18,9 @@ func TestT8ValidationDrop(t *testing.T) {
 		name   string
 		mutate func(*ws.Event)
 	}{
-		{name: "zero quantity", mutate: func(event *ws.Event) { event.Execution.Qty = "0" }},
-		{name: "zero price", mutate: func(event *ws.Event) { event.Execution.Price = "0" }},
-		{name: "empty order", mutate: func(event *ws.Event) { event.Execution.OrderNo = "   " }},
+		{name: "zero quantity", mutate: func(event *ws.Event) { event.Execution.Qty = "0"; event.Fields[9] = "0" }},
+		{name: "zero price", mutate: func(event *ws.Event) { event.Execution.Price = "0"; event.Fields[10] = "0" }},
+		{name: "empty order", mutate: func(event *ws.Event) { event.Execution.OrderNo = "   "; event.Fields[2] = "   " }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			mini := miniredis.RunT(t)
@@ -55,6 +56,7 @@ func TestT8ValidationDrop(t *testing.T) {
 func TestT9MidnightBoundary(t *testing.T) {
 	event := fixtureEvent()
 	event.Execution.FilledAt = "235959"
+	event.Fields[11] = "235959"
 	event.ReceivedAt = time.Date(2026, time.September, 8, 0, 0, 3, 0, time.FixedZone("KST", 9*60*60))
 	decoder := decode.New(decode.Config{AccountMode: "live", Venue: "krx", DupTrackMax: 10})
 	record, ok := decoder.Decode(event)
@@ -70,8 +72,7 @@ func TestT9MidnightBoundary(t *testing.T) {
 func TestT13FillSeqUsesAllFields(t *testing.T) {
 	first := fixtureEvent()
 	second := fixtureEvent()
-	second.Fields[13] = "3" // Same order/qty/price/second; another KIS wire field differs.
-	second.Execution.Filled = "3"
+	second.Fields[15] = "00001" // Same order/qty/price/second; another KIS wire field (BRNC_NO) differs.
 	decoder := decode.New(decode.Config{AccountMode: "live", Venue: "krx", DupTrackMax: 10})
 	firstRecord, ok := decoder.Decode(first)
 	if !ok {
@@ -172,14 +173,15 @@ func TestT17DuplicateTrackerIsBounded(t *testing.T) {
 
 func fixtureEvent() ws.Event {
 	fields := []string{
-		"HTS_EXAMPLE", "00000000", "A123456789", "0000000000", "02", "00", "00",
-		"00", "005930", "3", "71200", "093015", "0", "2",
+		"HTS_EXAMPLE", "00000000", "A123456789", "0000000000", "02", "0", "00",
+		"0", "005930", "3", "71200", "093015", "0", "2", "2", "00000", "5", "",
+		"0", "1", "Y", "", "10", "", "EXAMPLE", "71500",
 	}
 	return ws.Event{
 		TR:         ws.TRExecutionLive,
 		Key:        fields[0],
 		Fields:     fields,
-		Raw:        []byte("0|H0STCNI0|1|HTS_EXAMPLE^00000000^A123456789^0000000000^02^00^00^00^005930^3^71200^093015^0^2"),
+		Raw:        []byte("0|H0STCNI0|1|" + strings.Join(fields, "^")),
 		ReceivedAt: time.Date(2026, time.September, 7, 9, 30, 20, 0, time.FixedZone("KST", 9*60*60)),
 		Execution: &ws.Execution{
 			OrderNo:  "A123456789",
