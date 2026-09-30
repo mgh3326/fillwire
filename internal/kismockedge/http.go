@@ -98,6 +98,24 @@ func NewHandler(service *Service) http.Handler {
 		service.refreshMissingWitnessMetric(request.Context())
 		writeWitnessReceipt(writer, http.StatusOK, receipt)
 	})
+	mux.HandleFunc("GET /v1/price-band", func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		if len(query) != 2 {
+			writeShadowError(writer, http.StatusBadRequest, ErrorInvalidCommand)
+			return
+		}
+		band, code := service.PriceBand(request.Context(), query.Get("scope"), query.Get("stock_code"))
+		if code != "" {
+			status := http.StatusBadGateway
+			if code == ErrorInvalidCommand {
+				status = http.StatusBadRequest
+			}
+			writeShadowError(writer, status, code)
+			return
+		}
+		writer.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(writer).Encode(band)
+	})
 	mux.HandleFunc("POST /v1/commands/{command_id}/cancel", func(writer http.ResponseWriter, request *http.Request) {
 		receipt, err := service.Cancel(request.Context(), request.PathValue("command_id"))
 		if err != nil {

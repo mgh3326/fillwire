@@ -8,8 +8,9 @@ crypto. It is the separately approved evolution of the formerly reserved
 command name; it does not change Python ownership of `order_send_intents`,
 redirect Python traffic, or modify `auto_trader`.
 
-The receiver exposes `POST /v1/commands` and
-`POST /v1/commands/{command_id}/cancel`, and binds to `127.0.0.1:8080` by
+The receiver exposes `POST /v1/commands`,
+`POST /v1/commands/{command_id}/cancel`, and the read-only
+`GET /v1/price-band`, and binds to `127.0.0.1:8080` by
 default. `BROKER_EDGE_LISTEN_ADDR` may select another loopback address (for
 example `127.0.0.1:0` in tests), but cannot expose the unauthenticated receiver
 on a non-loopback interface. Authentication and authorization remain a later,
@@ -90,6 +91,23 @@ period. Query failure, ambiguous matches, and an unexpired grace period remain
 `UNKNOWN` without a resolution record. Legacy receipt rows that predate stored
 command facts are resolved absent only when the successful day query contains
 zero orders.
+
+## Read-only price band
+
+`GET /v1/price-band` serves one domestic mock symbol's daily price band. The
+query must be exactly `scope=kis_mock&stock_code=<6 digits>`; anything else is
+`400/invalid_command`. The edge answers `PriceBandV1` — `schema_version`,
+`stock_code`, `last_price`, `upper_limit`, `lower_limit`, `base_price`, each a
+decimal digit string — mapped from the KIS inquire-price output fields
+`stck_prpr`, `stck_mxpr`, `stck_llam`, and `stck_sdpr`.
+
+The inquiry is `GET /uapi/domestic-stock/v1/quotations/inquire-price` with
+`tr_id=FHKST01010100` on the same pinned VTS authority as the order paths,
+using the same strict read-only cached token. It issues no token, writes
+nothing durable, records no pending marker, and cannot prepare an order.
+Configuration, token, transport, and parse failures are `502` with the
+reader's closed error code, so a caller can always fail closed. The canary
+uses it to derive its KR limit price at run time.
 
 ## Mock-only placement gates
 

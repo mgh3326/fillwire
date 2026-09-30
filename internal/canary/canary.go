@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
+	"github.com/mgh3326/broker-edge/internal/kismockedge"
 	_ "time/tzdata" // The production image is distroless and has no zoneinfo files.
 )
 
@@ -32,6 +34,7 @@ const (
 	OutcomePlaceNotAccepted   = "place_not_accepted"
 	OutcomeCancelNotCancelled = "cancel_not_cancelled"
 	OutcomeEdgeUnreachable    = "edge_unreachable"
+	OutcomePriceUnavailable   = "price_unavailable"
 	OutcomeNoSession          = "no_session"
 	commandIDPrefix           = "broker-edge-canary:"
 	defaultEdgeURL            = "http://127.0.0.1:8080"
@@ -40,10 +43,11 @@ const (
 )
 
 // Config is intentionally limited to mock command details and local output.
+// There is deliberately no price knob: the KR limit price is derived at run
+// time from the edge's daily-band inquiry so it is always inside the band.
 type Config struct {
 	EdgeURL     string
 	KRSymbol    string
-	KRPrice     string
 	TextfileDir string
 }
 
@@ -85,7 +89,6 @@ func ConfigFromEnv(lookup func(string) string) Config {
 	config := Config{
 		EdgeURL:     strings.TrimSpace(lookup("CANARY_EDGE_URL")),
 		KRSymbol:    strings.TrimSpace(lookup("CANARY_KR_SYMBOL")),
-		KRPrice:     strings.TrimSpace(lookup("CANARY_KR_PRICE")),
 		TextfileDir: strings.TrimSpace(lookup("CANARY_TEXTFILE_DIR")),
 	}
 	if config.EdgeURL == "" {
@@ -93,9 +96,6 @@ func ConfigFromEnv(lookup func(string) string) Config {
 	}
 	if config.KRSymbol == "" {
 		config.KRSymbol = "005930"
-	}
-	if config.KRPrice == "" {
-		config.KRPrice = "1000"
 	}
 	if config.TextfileDir == "" {
 		config.TextfileDir = defaultTextfileDirectory
@@ -178,9 +178,17 @@ func execute(ctx context.Context, config Config, now func() time.Time, client *h
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 	commandID := commandID(runAt)
-	stock, price := config.KRSymbol, config.KRPrice
+	stock := config.KRSymbol
+	var price string
 	if scope == ScopeUS {
 		stock, price = "AAPL", "1"
+	} else {
+		derived, ok := inquireKRPrice(ctx, client, base, stock)
+		if !ok {
+			result.Outcome = OutcomePriceUnavailable
+			return result
+		}
+		price = derived.String()
 	}
 	command := executioncontracts.ExecutionCommandV1{
 		SchemaVersion: executioncontracts.ExecutionCommandV1SchemaVersion, CommandID: commandID,
@@ -227,6 +235,83 @@ func execute(ctx context.Context, config Config, now func() time.Time, client *h
 	}
 	result.Outcome = OutcomeOK
 	return result
+}
+
+// inquireKRPrice reads the symbol's daily band through the edge's read-only
+// endpoint and derives the limit price inside it. Every failure fails closed:
+// the caller places no order when this returns false.
+func inquireKRPrice(ctx context.Context, client *http.Client, base, symbol string) (*big.Int, bool) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		base+"/v1/price-band?scope="+ScopeKR+"&stock_code="+url.QueryEscape(symbol), nil)
+	if err != nil {
+		return nil, false
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, false
+	}
+	var band executioncontracts.PriceBandV1
+	decodeErr := json.NewDecoder(response.Body).Decode(&band)
+	response.Body.Close()
+	if decodeErr != nil || response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices ||
+		band.SchemaVersion != executioncontracts.PriceBandV1SchemaVersion || band.StockCode != symbol {
+		return nil, false
+	}
+	return deriveKRPrice(band)
+}
+
+// deriveKRPrice picks the order price inside the daily band. The exchange's
+// own lower limit is used verbatim when the inquiry provides it; otherwise
+// the band floor is recomputed as base x 0.70 rounded up to the KRX tick.
+func deriveKRPrice(band executioncontracts.PriceBandV1) (*big.Int, bool) {
+	if lower, ok := positiveInteger(band.LowerLimit); ok {
+		return roundUpToTickKR(lower), true
+	}
+	if base, ok := positiveInteger(band.BasePrice); ok {
+		return bandFloorKR(base), true
+	}
+	return nil, false
+}
+
+// roundUpToTickKR returns the smallest KRX tick multiple at or above price.
+// A real lower limit is already tick-aligned, so this normally returns the
+// limit unchanged; it exists so a malformed band can never produce a price
+// the edge's own tick check would reject.
+func roundUpToTickKR(price *big.Int) *big.Int {
+	tick := kismockedge.GetTickSizeKR(price)
+	quotient, remainder := new(big.Int).QuoRem(price, tick, new(big.Int))
+	if remainder.Sign() != 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	return quotient.Mul(quotient, tick)
+}
+
+// bandFloorKR computes base x 0.70 rounded up to the KRX tick, entirely in
+// integer arithmetic: scaled = base x 7 keeps tenths exact, and the smallest
+// tick multiple at or above scaled/10 is the band floor.
+func bandFloorKR(base *big.Int) *big.Int {
+	scaled := new(big.Int).Mul(base, big.NewInt(7))
+	ceiling := new(big.Int).Quo(scaled, big.NewInt(10))
+	if new(big.Int).Rem(scaled, big.NewInt(10)).Sign() != 0 {
+		ceiling.Add(ceiling, big.NewInt(1))
+	}
+	tick := kismockedge.GetTickSizeKR(ceiling)
+	divisor := new(big.Int).Mul(tick, big.NewInt(10))
+	multiples := new(big.Int).Quo(scaled, divisor)
+	if new(big.Int).Rem(scaled, divisor).Sign() != 0 {
+		multiples.Add(multiples, big.NewInt(1))
+	}
+	return multiples.Mul(multiples, tick)
+}
+
+func positiveInteger(value string) (*big.Int, bool) {
+	for _, digit := range value {
+		if digit < '0' || digit > '9' {
+			return nil, false
+		}
+	}
+	parsed, ok := new(big.Int).SetString(value, 10)
+	return parsed, ok && parsed.Sign() > 0
 }
 
 func loopbackURL(value string) (string, error) {

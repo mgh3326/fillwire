@@ -12,8 +12,27 @@ It chooses `kis_mock` on weekdays from 09:05 through 15:15 KST and
 The New York location accounts for DST. Outside those windows it exits zero
 with `scope=no_session,outcome=no_session`, without placing anything.
 
-Domestic defaults are `CANARY_KR_SYMBOL=005930` and `CANARY_KR_PRICE=1000`;
-US defaults are `AAPL` at `1`. `CANARY_EDGE_URL` defaults to
+For `kis_mock` the canary first asks the edge for the symbol's daily price
+band: `GET /v1/price-band?scope=kis_mock&stock_code=<symbol>` is a read-only
+inquiry backed by the KIS mock inquire-price read (`FHKST01010100`). The
+order price is then derived inside the band: the exchange lower limit
+(`stck_llam`, returned as `lower_limit`) verbatim — rounded up to the KRX
+tick if the value were ever misaligned — or, when the lower limit is absent,
+the band base (`stck_sdpr`, `base_price`) multiplied by 0.70 and rounded UP
+to the KRX tick. The result is exactly the band floor (or less than one tick
+above it), so the buy sits at the bottom of the daily band: far from the
+market and unable to fill in a normal market, while still being a price the
+exchange accepts. The order type stays `limit`; nothing about the inquiry
+changes the single place-then-cancel budget.
+
+The inquiry fails closed. An unreachable edge, a non-2xx or malformed
+response, a mismatched schema or stock code, or a band with neither a usable
+lower limit nor a base price yields `outcome=price_unavailable` and no order
+is placed. There is deliberately no price knob: `CANARY_KR_PRICE` was removed
+because a fixed price can drift outside the daily band. The US path is
+unchanged and still sends the constant `AAPL` at `1` without an inquiry.
+
+`CANARY_KR_SYMBOL` defaults to `005930`. `CANARY_EDGE_URL` defaults to
 `http://127.0.0.1:8080` and is restricted to loopback. The command ID is
 prefixed `broker-edge-canary:` and is also sent as the correlation ID. Each
 run writes its result as one JSON object to stdout. Set `CANARY_TEXTFILE_DIR` (default
@@ -29,9 +48,13 @@ When the edge rejects a place or cancel, the object additionally carries
 broker's JSON value is a string; any other JSON type is replaced by
 `"<non-string omitted>"`. `http_status` is the HTTP status integer from the
 response, never a body field. All `rejection` text is masked at capture so
-account numbers, access tokens, and application keys can never appear;
-`msg1` is capped at 512 runes. The fields are absent on `ok`, `no_session`,
-and `edge_unreachable`
+account numbers, access tokens, and application keys can never appear.
+`rt_cd` and `msg1` additionally mask generic account-shaped digit runs and
+long credential-shaped runs; `msg_cd` is KIS vocabulary rather than a
+secret, so only the configured secrets themselves are redacted there and an
+ordinary numeric code stays readable. `msg1` is capped at 512 runes. The
+fields are absent on `ok`, `no_session`, `edge_unreachable`, and
+`price_unavailable`
 outcomes and whenever the edge response could not be decoded. `rejection`
 values are response-only evidence: the edge never persists them.
 

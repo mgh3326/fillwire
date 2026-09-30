@@ -31,7 +31,11 @@ type Service struct {
 	// not enable live placement: kis_live is witness-only in this release.
 	KISLiveShadowEnabled bool
 	Brokers              map[string]Broker
-	Now                  func() time.Time
+	// Quoters is the read-only price-inquiry surface keyed by account scope.
+	// It is deliberately separate from Brokers: a quoter can never build a
+	// mutation request.
+	Quoters map[string]Quoter
+	Now     func() time.Time
 	// Metrics is optional for direct library callers. NewHandler installs one
 	// when needed, and the daemon constructor installs one up front.
 	Metrics *Metrics
@@ -77,6 +81,18 @@ func NewEnvironmentService(store *Store, lookup func(string) string, transport h
 				Transport: transport,
 				LoadConfig: func() (AlpacaPaperCryptoConfig, string) {
 					return AlpacaPaperCryptoConfigFromEnv(lookup)
+				},
+			},
+		},
+		Quoters: map[string]Quoter{
+			executioncontracts.AccountScopeKISMock: KISMockQuoter{
+				Transport: transport,
+				LoadConfig: func() (kismockread.Config, string) {
+					config, err := kismockread.ConfigFromEnv(lookup)
+					if err != nil {
+						return kismockread.Config{}, string(err.Code)
+					}
+					return config, ""
 				},
 			},
 		},

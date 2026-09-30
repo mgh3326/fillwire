@@ -69,13 +69,23 @@ func newSecretMasker(config kismockread.Config, token string) *secretMasker {
 // Masking runs on the full value before bounding so a cut cannot shorten a
 // secret into a still-valid prefix.
 func (masker *secretMasker) maskText(value string, maxRunes int) string {
-	for _, needle := range masker.exact {
-		value = strings.ReplaceAll(value, needle, redactedValue)
-	}
+	value = masker.maskNeedles(value)
 	value = accountNumberShape.ReplaceAllString(value, redactedValue)
 	value = credentialShape.ReplaceAllString(value, redactedValue)
 	if runes := []rune(value); len(runes) > maxRunes {
 		value = string(runes[:maxRunes])
+	}
+	return value
+}
+
+// maskNeedles removes only the configured exact secrets (application key,
+// application secret, access token, and the account number in every
+// spelling). It intentionally applies no generic pattern: a KIS code like
+// msg_cd is an opaque broker vocabulary, so digit-run or long-run shapes
+// would erase diagnostic values that are not secrets.
+func (masker *secretMasker) maskNeedles(value string) string {
+	for _, needle := range masker.exact {
+		value = strings.ReplaceAll(value, needle, redactedValue)
 	}
 	return value
 }
@@ -99,6 +109,30 @@ func (masker *secretMasker) maskedField(raw json.RawMessage, maxRunes int) strin
 	return masker.maskText(text, maxRunes)
 }
 
+// maskedCodeField passes a broker code field through only the exact-needle
+// masker. Message codes are KIS vocabulary, not secrets, so the generic
+// digit-run and credential shapes would hide them; a configured secret that
+// happens to appear as a code is still redacted, and non-string values are
+// still dropped.
+func (masker *secretMasker) maskedCodeField(raw json.RawMessage, maxRunes int) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	if trimmed[0] != '"' {
+		return nonStringFieldMarker
+	}
+	var text string
+	if json.Unmarshal(trimmed, &text) != nil {
+		return nonStringFieldMarker
+	}
+	value := masker.maskNeedles(text)
+	if runes := []rune(value); len(runes) > maxRunes {
+		value = string(runes[:maxRunes])
+	}
+	return value
+}
+
 // maskedRejection converts a broker HTTP response into masked diagnostics. It
 // returns nil only when the broker never produced an HTTP response.
 func maskedRejection(status int, body map[string]json.RawMessage, masker *secretMasker) *executioncontracts.BrokerRejectionV1 {
@@ -107,7 +141,7 @@ func maskedRejection(status int, body map[string]json.RawMessage, masker *secret
 	}
 	return &executioncontracts.BrokerRejectionV1{
 		RtCd:       masker.maskedField(body["rt_cd"], maxRejectionCodeLength),
-		MsgCd:      masker.maskedField(body["msg_cd"], maxRejectionCodeLength),
+		MsgCd:      masker.maskedCodeField(body["msg_cd"], maxRejectionCodeLength),
 		Msg1:       masker.maskedField(body["msg1"], maxRejectionMsgLength),
 		HTTPStatus: status,
 	}

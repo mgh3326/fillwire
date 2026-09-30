@@ -182,3 +182,35 @@ func TestRejectionReachesReceiptButNotStore(t *testing.T) {
 		t.Fatalf("rejection must never persist: %#v", stored.Rejection)
 	}
 }
+
+// msg_cd is KIS vocabulary, not a secret: an eight-digit code that merely
+// looks like an account number must stay readable. Only configured secrets
+// are still redacted inside msg_cd.
+func TestMaskedRejectionMsgCdMasksOnlyNeedles(t *testing.T) {
+	config := testBrokerConfig()
+	masker := newSecretMasker(config, "cached-token-for-test")
+	body := map[string]json.RawMessage{
+		"msg_cd": json.RawMessage(`"87654321"`),
+		"msg1":   json.RawMessage(`"order refused 12345678"`),
+	}
+	rejection := maskedRejection(http.StatusOK, body, masker)
+	if rejection.MsgCd != "87654321" {
+		t.Fatalf("non-secret msg_cd was masked: %q", rejection.MsgCd)
+	}
+	if !strings.Contains(rejection.Msg1, redactedValue) {
+		t.Fatalf("msg1 kept an account digit run: %q", rejection.Msg1)
+	}
+
+	for _, code := range []string{`"12345678"`, `"12345678-01"`, `"1234567801"`} {
+		rejection = maskedRejection(http.StatusOK, map[string]json.RawMessage{"msg_cd": json.RawMessage(code)}, masker)
+		if strings.Contains(rejection.MsgCd, "12345678") {
+			t.Fatalf("account spelling %s survived in msg_cd %q", code, rejection.MsgCd)
+		}
+	}
+
+	long := strings.Repeat("x", maxRejectionCodeLength+10)
+	rejection = maskedRejection(http.StatusOK, map[string]json.RawMessage{"msg_cd": json.RawMessage(`"` + long + `"`)}, masker)
+	if got := len([]rune(rejection.MsgCd)); got != maxRejectionCodeLength {
+		t.Fatalf("msg_cd runes = %d, want %d", got, maxRejectionCodeLength)
+	}
+}

@@ -111,6 +111,22 @@ type BrokerRejectionV1 struct {
 	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
+// PriceBandV1SchemaVersion identifies the read-only daily price-band wire
+// shape served by the edge's price-band endpoint.
+const PriceBandV1SchemaVersion = "price-band/v1"
+
+// PriceBandV1 is the edge's read-only answer for one domestic mock symbol's
+// daily price band. Every price is a decimal digit string; the shape carries
+// no account, order, token, or credential material.
+type PriceBandV1 struct {
+	SchemaVersion string `json:"schema_version"`
+	StockCode     string `json:"stock_code"`
+	LastPrice     string `json:"last_price,omitempty"`
+	UpperLimit    string `json:"upper_limit,omitempty"`
+	LowerLimit    string `json:"lower_limit,omitempty"`
+	BasePrice     string `json:"base_price,omitempty"`
+}
+
 // TokenLeaseView exposes validity metadata only. It intentionally never carries
 // a token value.
 type TokenLeaseView struct {
