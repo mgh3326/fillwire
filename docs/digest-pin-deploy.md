@@ -164,10 +164,14 @@ starting the other — never restart both and hope.
 
 Switch from `at-kis-ws` to fillwire:
 
+`at-kis-ws` is a Docker container with a restart policy of `unless-stopped`,
+not a systemd unit, so `systemctl` does not control it. `docker stop` marks it
+stopped, which keeps the restart policy from bringing it back.
+
 ```sh
-sudo systemctl stop at-kis-ws.service
-systemctl is-active at-kis-ws.service
-# expected: inactive (or failed) — do not continue while it is active
+sudo docker stop <at-kis-ws container>
+sudo docker ps --format '{{.Names}}'
+# expected: no at-kis-ws line — do not continue while the container is running
 sudo systemctl start fillwire.service
 sudo journalctl -u fillwire.service -n 50 --no-pager
 # expected: "KIS websocket initial subscription active", no exit-42 line
@@ -179,7 +183,7 @@ Switch back from fillwire to `at-kis-ws`:
 sudo systemctl stop fillwire.service
 systemctl is-active fillwire.service
 # expected: inactive (or failed)
-sudo systemctl start at-kis-ws.service
+sudo docker start <at-kis-ws container>
 ```
 
 If fillwire is already down with exit 42, do not `systemctl restart` it — the
