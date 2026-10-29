@@ -177,7 +177,8 @@ with. So fillwire:
   defines in `app/services/fill_watch_context/toss_token_boundary.py`.
 - treats a token within 120 s of `expires_at` as absent, which is
   auto_trader's own buffer. With no usable token the reader does not dial; it
-  re-reads the key at intervals that back off to at most 15 s.
+  re-reads the key at intervals that back off to a 15 s base, plus up to 20%
+  jitter, so a capped poll waits at most 18 s.
 - after a handshake 401, does not redial with any token whose fingerprint it
   still holds. It keeps a bounded set of refused-token fingerprints: SHA-256
   hashes, never the token, the latest 32. It dials again only when the cache
@@ -205,8 +206,9 @@ they block enabling the reader, not the code:
      closed: it does not dial, and it issues nothing. On every attempt it logs
      the warning `quote reader window run failed; retrying` with reason
      `quote: no usable cached Toss access token`, and it re-reads the key at
-     intervals that back off to 15 s. The `token_unavailable` counter grows
-     in the window-close and shutdown summaries.
+     intervals that back off to a 15 s base, plus up to 20% jitter (at most
+     18 s). The `token_unavailable` counter grows in the window-close and
+     shutdown summaries.
    - **Resuming.** The reader resumes as soon as the owner's next on-demand
      refresh publishes a usable token.
    - **Open connection.** A connection that is already open is not affected,
@@ -223,7 +225,8 @@ they block enabling the reader, not the code:
 - It never feeds fillwire's exit decision. A socket failure, a Toss error
   frame, a missing token, a Redis failure, or a reconnect storm is logged and
   retried with backoff. Backoff starts at 1 s and doubles with jitter to
-  5 min. While waiting for a token, the interval is capped at 15 s. Exit
+  5 min. While waiting for a token, the base interval is capped at 15 s and jitter
+  (up to 20%) is added on top, so one wait is at most 18 s. Exit
   codes are unchanged.
 - A panic in the lane, or in its dialer, transport, or token reader, is
   contained. It stops only the lane or becomes a retryable error.
