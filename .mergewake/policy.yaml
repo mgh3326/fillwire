@@ -1,0 +1,15 @@
+version: 1
+# Shadow only: mergewake reviews and classifies, never merges.
+enabled: false
+required_checks:
+  - verify
+  - secrets
+watch_checks:
+  - verify
+blocking:
+  - paths: ['deploy/**', 'Dockerfile', '.dockerignore', 'fillwire.toml']
+    reason: Deploy and runtime config reach the production fill collector directly.
+  - paths: ['internal/**']
+    reason: The daemon decodes broker fills and posts them to the execution ledger.
+  - paths: ['.github/workflows/**', '.mergewake/**']
+    reason: Verification and policy changes can bypass recovery controls.
