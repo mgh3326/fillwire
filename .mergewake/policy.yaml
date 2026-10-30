@@ -1,0 +1,15 @@
+version: 1
+# Shadow only: mergewake classifies and reviews but never merges (ROB-1426).
+enabled: false
+required_checks:
+  - verify
+  - secrets
+blocking:
+  - paths: ['internal/sink/**', 'internal/decode/**']
+    reason: Sink and decoder changes write or classify fills in the execution ledger before a revert.
+  - paths: ['fillwire.toml', 'cmd/**']
+    reason: Runtime configuration and entrypoint changes alter which streams and sinks run in production.
+  - paths: ['deploy/**', 'Dockerfile', '.dockerignore']
+    reason: Deploy, image and host-unit changes reach production directly.
+  - paths: ['.github/workflows/**', '.mergewake/**', 'go.mod', 'go.sum']
+    reason: Verification, dependency and policy changes can bypass recovery controls.
