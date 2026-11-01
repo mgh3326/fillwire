@@ -1,6 +1,7 @@
 package exec_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/mgh3326/fillwire/internal/exec"
@@ -132,5 +133,30 @@ func TestKillSwitchStopsSends(t *testing.T) {
 
 	if !(*exec.KillSwitch)(nil).Engaged() {
 		t.Fatal("a nil kill switch must count as engaged")
+	}
+}
+
+// TestFilledTargetCancelsWorkingOrder: the ledger shows the target filled
+// while an order still rests at the broker. The executor cancels it before
+// it finishes, so nothing is left working unwatched.
+func TestFilledTargetCancelsWorkingOrder(t *testing.T) {
+	r := newRig(t, fixtureIntent(t), enabled())
+	r.top = exec.Top{Bid: 70_000, Ask: 70_400}
+	r.step(0)
+	first := r.g.Sends[0].Key
+	r.g.Fill(4, at(1)) // fills on the submit's key, not delivered yet
+	r.step(5)          // amend sized 10; the broker keeps 6 open
+	// The ledger then reports the whole target on the old key.
+	r.e.OnFill(exec.Fill{FillID: "ledger-1", Key: first, Qty: 10, Price: 70_000, AtNS: at(6)})
+	r.step(6)
+	equal(t, r.actions(), []string{"submit@70000x10", "amend@70100x10", "cancel"})
+	if _, _, live := r.g.Live(); live {
+		t.Fatal("an order is still working at the broker")
+	}
+	if st := r.e.State(); st.Done != exec.DoneFilled || st.Order != nil {
+		t.Fatalf("done %q order %+v", st.Done, st.Order)
+	}
+	if _, err := exec.Apply(r.e.State(), exec.Record{Kind: exec.RecFinish, Reason: exec.DoneFilled}); !errors.Is(err, exec.ErrTransition) {
+		t.Fatal("a second finish applied")
 	}
 }

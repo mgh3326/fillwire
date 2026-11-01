@@ -66,7 +66,7 @@ func TestFaultPartialFills(t *testing.T) {
 	if st := r.e.State(); st.Filled != 10 || st.Done != exec.DoneFilled || r.g.Filled() != 10 {
 		t.Fatalf("filled %d done %q", st.Filled, st.Done)
 	}
-	equal(t, r.actions(), []string{"submit@70000x10", "amend@70100x9", "amend@70200x7", "amend@70300x4"})
+	equal(t, r.actions(), []string{"submit@70000x10", "amend@70100x9", "amend@70200x7", "amend@70300x4", "cancel"})
 	r.safe()
 }
 

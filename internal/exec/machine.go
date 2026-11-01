@@ -295,10 +295,10 @@ func Apply(s State, r Record) (State, error) {
 		if s.Done != "" || s.InFlight != nil || r.Reason == "" {
 			return bad("finish while done or unresolved")
 		}
-		if s.Order != nil && r.Reason != DoneFilled {
+		if s.Order != nil {
 			return bad("finish %q with a working order", r.Reason)
 		}
-		n.Done, n.Order = r.Reason, nil
+		n.Done = r.Reason
 	default:
 		return bad("unknown kind")
 	}
@@ -336,15 +336,12 @@ func decide(s State, in inputs) decision {
 	finish := func(reason string) decision {
 		return decision{rec: &Record{Kind: RecFinish, AtNS: in.now, Reason: reason}}
 	}
-	if s.Filled >= s.Target {
-		if s.InFlight != nil {
-			return decision{query: true}
-		}
-		return finish(DoneFilled)
-	}
 	// Never resend while an outcome is unknown: reconcile first.
 	if s.InFlight != nil {
 		return decision{query: true}
+	}
+	if s.Filled >= s.Target && s.Order == nil {
+		return finish(DoneFilled)
 	}
 	if !in.cfg.SendEnabled {
 		return decision{}
@@ -358,6 +355,10 @@ func decide(s State, in inputs) decision {
 	}
 	closing := s.Halt
 	switch {
+	case s.Filled >= s.Target:
+		// The ledger shows the target filled, but an order may still rest
+		// at the broker: cancel it before finishing.
+		closing = DoneFilled
 	case in.killed:
 		closing = DoneKilled
 	case in.now >= s.Intent.ExpiresAt.UnixNano():

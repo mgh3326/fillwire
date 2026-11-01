@@ -95,7 +95,7 @@ func TestTransitions(t *testing.T) {
 			r.fill(4, 11)
 			r.step(15)
 		},
-		wantSends:  []string{"submit@70000x10", "amend@70100x6", "amend@70200x4"},
+		wantSends:  []string{"submit@70000x10", "amend@70100x6", "amend@70200x4", "cancel"},
 		wantDone:   exec.DoneFilled,
 		wantFilled: 10,
 	}, {
