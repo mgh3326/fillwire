@@ -82,34 +82,29 @@ func writeLine(w io.Writer, l Line) error {
 // line, a newline is appended first so the next session starts on its own
 // line; replay counts the torn line and skips it.
 func OpenEvidence(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o640)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o640)
 	if err != nil {
 		return nil, err
 	}
-	torn, err := endsTorn(path)
-	if err == nil && torn {
-		_, err = f.Write([]byte{'\n'})
-	}
-	if err != nil {
+	if err := terminateTornLine(f); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("book: open evidence: %w", err)
 	}
 	return f, nil
 }
 
-func endsTorn(path string) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
+func terminateTornLine(f *os.File) error {
 	info, err := f.Stat()
 	if err != nil || info.Size() == 0 {
-		return false, err
+		return err
 	}
 	last := make([]byte, 1)
 	if _, err := f.ReadAt(last, info.Size()-1); err != nil {
-		return false, err
+		return err
 	}
-	return last[0] != '\n', nil
+	if last[0] == '\n' {
+		return nil
+	}
+	_, err = f.Write([]byte{'\n'})
+	return err
 }

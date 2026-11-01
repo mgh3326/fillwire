@@ -159,13 +159,14 @@ func (rp *replayer) line(raw []byte) error {
 		rp.state.Summary.Sessions++
 		// A new session starts from a fresh tracker, as the recorder did, so
 		// trade continuity is not checked across sessions.
-		rp.resync()
 		rp.tracker = newTracker()
+		rp.unsyncBooks()
 		base.Session, base.Type = rp.session, EventSession
 		return rp.send(base)
 	case KindReconnect:
 		rp.state.Summary.Reconnects++
-		rp.resync()
+		rp.tracker.reconnect()
+		rp.unsyncBooks()
 		base.Type = EventReconnect
 		return rp.send(base)
 	case KindStale:
@@ -178,10 +179,9 @@ func (rp *replayer) line(raw []byte) error {
 	return fmt.Errorf("%w: kind %q (session %d seq %d)", ErrFormat, l.Kind, rp.session, l.Seq)
 }
 
-// resync marks every book unsynced and emits nothing: the next snapshot of
-// each symbol carries Synced=true again.
-func (rp *replayer) resync() {
-	rp.tracker.reconnect()
+// unsyncBooks marks every book unsynced and emits nothing: the next snapshot
+// of each symbol carries Synced=true again.
+func (rp *replayer) unsyncBooks() {
 	for symbol, b := range rp.state.Books {
 		b.Synced = false
 		rp.state.Books[symbol] = b

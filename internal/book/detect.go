@@ -111,10 +111,8 @@ func (t *tracker) trade(r TradeRecord) Verdict {
 		t.trades[r.Symbol] = &tradeCursor{acml: r.AcmlVol, text: r.text}
 		return v
 	}
-	if r.text == c.text {
-		v.Class = ClassDuplicate
-		return v
-	}
+	// The first trade after a reconnect consumes the resync, even when it is a
+	// byte-identical resend of the last one.
 	if c.resync {
 		v.Resync = true
 		c.resync = false
@@ -122,6 +120,10 @@ func (t *tracker) trade(r TradeRecord) Verdict {
 			c.acml, c.text = r.AcmlVol, r.text
 			return v
 		}
+	}
+	if r.text == c.text {
+		v.Class = ClassDuplicate
+		return v
 	}
 	switch previous := r.AcmlVol - r.Qty; {
 	case r.AcmlVol == c.acml:

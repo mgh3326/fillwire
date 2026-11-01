@@ -327,3 +327,27 @@ func TestOpenEvidenceAppendsOnly(t *testing.T) {
 		t.Fatalf("mode = %v", info.Mode().Perm())
 	}
 }
+
+// A byte-identical resend of the last trade right after a reconnect is a
+// duplicate, and it consumes the resync: the next trade is a plain one.
+func TestRecorderResyncConsumedByResend(t *testing.T) {
+	rec, out := newTestRecorder(t)
+	last := tradeFrame("005930", "090000", 71000, 100, 100)
+	feed(t, rec, last)
+	if err := rec.Reconnect(at(500), 1); err != nil {
+		t.Fatal(err)
+	}
+	for i, raw := range [][]byte{last, tradeFrame("005930", "090001", 71100, 10, 110)} {
+		if err := rec.Frame(raw, at(600+i*100)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []Verdict{
+		{Symbol: "005930", Class: ClassOK},
+		{Symbol: "005930", Class: ClassDuplicate, Resync: true},
+		{Symbol: "005930", Class: ClassOK},
+	}
+	if got := verdicts(t, out.Bytes()); !reflect.DeepEqual(got, want) {
+		t.Fatalf("verdicts = %+v, want %+v", got, want)
+	}
+}
