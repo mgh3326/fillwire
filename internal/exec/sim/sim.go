@@ -85,7 +85,15 @@ func runOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path st
 	started := false
 	var mid float64
 	var top exec.Top
+	deadline := in.ExpiresAt.UnixNano()
 	fill := func(qty, atNS int64) error {
+		// The executor cancels at the first tick at or after the deadline
+		// (decide: now >= expires_at). That tick runs after this event's
+		// fills, so without this check an event at or past the deadline
+		// could fill an order that already counts as cancelled.
+		if atNS >= deadline {
+			return nil
+		}
 		f, ok := g.Fill(qty, atNS)
 		if !ok {
 			return nil

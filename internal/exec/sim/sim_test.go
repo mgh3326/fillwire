@@ -205,3 +205,40 @@ func TestOtherSymbolEventsAdvanceTheClock(t *testing.T) {
 		t.Fatalf("got %+v, want submit then a deadline cancel", r)
 	}
 }
+
+// TestNoFillAtOrAfterTheDeadline: after one book at t0, the next event is a
+// trade through the buy's price. At 34 s (before the 35 s deadline) it fills;
+// at or after 35 s the order must already count as cancelled, under both
+// rules.
+func TestNoFillAtOrAfterTheDeadline(t *testing.T) {
+	_, intents := load(t)
+	cfg := exec.DefaultConfig()
+	cfg.SendEnabled = true
+	for _, c := range []struct {
+		sec        float64
+		wantFilled int64
+		wantDone   string
+	}{{34, 10, exec.DoneFilled}, {35, 0, exec.DoneDeadline}, {36, 0, exec.DoneDeadline}} {
+		var buf bytes.Buffer
+		rec, err := book.NewRecorder(&buf, 2*time.Second, t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		at := t0.Add(time.Duration(c.sec * float64(time.Second)))
+		if err := rec.Frame(bookRaw(t0, 70_000, 70_200), t0); err != nil {
+			t.Fatal(err)
+		}
+		if err := rec.Frame(tradeRaw(at, 69_900, 10, 10), at); err != nil {
+			t.Fatal(err)
+		}
+		for _, rule := range sim.Rules {
+			res, err := sim.Run(buf.Bytes(), intents[:1], cfg, rule)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r := res[0]; r.Filled != c.wantFilled || r.Done != c.wantDone {
+				t.Errorf("trade at %vs, %s: filled %d done %q, want %d %q", c.sec, rule, r.Filled, r.Done, c.wantFilled, c.wantDone)
+			}
+		}
+	}
+}
