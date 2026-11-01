@@ -100,7 +100,10 @@ func runOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path st
 			started = true
 		}
 		switch {
-		case ev.Type == book.EventReconnect || ev.Type == book.EventSession:
+		case ev.Type == book.EventReconnect || ev.Type == book.EventSession,
+			ev.Type == book.EventStale && ev.TR == book.TRBook && ev.Symbol == in.Symbol:
+			// A reconnect, a new session or a silent book stream: nothing is
+			// priced from this book until the next snapshot.
 			top.Synced = false
 			e.OnBook(top)
 		case ev.Type == book.EventBook && ev.Symbol == in.Symbol:
@@ -110,7 +113,7 @@ func runOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path st
 			if mid == 0 && top.Synced && top.Bid > 0 && top.Ask > 0 {
 				mid = float64(top.Bid+top.Ask) / 2
 			}
-			if _, price, live := g.Live(); live && rule == Touch && reaches(in.Side, opposite(in.Side, top), price) {
+			if _, price, live := g.Live(); live && rule == Touch && top.Synced && reaches(in.Side, opposite(in.Side, top), price) {
 				if err := fill(in.TargetQty(), ev.AtNS); err != nil {
 					return err
 				}
@@ -129,9 +132,8 @@ func runOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path st
 					}
 				}
 			}
-		default:
-			return nil
 		}
+		// Every event advances the executor's clock, whatever its symbol.
 		return e.Tick(ev.AtNS)
 	})
 	if err != nil {

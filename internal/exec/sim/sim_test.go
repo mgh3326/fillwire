@@ -174,3 +174,34 @@ func TestReplayFillRules(t *testing.T) {
 		t.Fatal("unknown rule accepted")
 	}
 }
+
+// TestOtherSymbolEventsAdvanceTheClock: after one 005930 book, only another
+// symbol's books arrive. Their times must still reach the executor, which
+// cancels at the deadline (35 s) without a fresh 005930 book.
+func TestOtherSymbolEventsAdvanceTheClock(t *testing.T) {
+	_, intents := load(t)
+	var buf bytes.Buffer
+	rec, err := book.NewRecorder(&buf, 2*time.Second, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Frame(bookRaw(t0, 70_000, 70_200), t0); err != nil {
+		t.Fatal(err)
+	}
+	for s := 1; s <= 40; s++ {
+		at := t0.Add(time.Duration(s) * time.Second)
+		other := bytes.Replace(bookRaw(at, 180_000, 180_500), []byte("005930"), []byte("000660"), 1)
+		if err := rec.Frame(other, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := exec.DefaultConfig()
+	cfg.SendEnabled = true
+	res, err := sim.Run(buf.Bytes(), intents[:1], cfg, sim.Touch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := res[0]; r.Done != exec.DoneDeadline || r.Sends != 2 || r.Filled != 0 {
+		t.Fatalf("got %+v, want submit then a deadline cancel", r)
+	}
+}
