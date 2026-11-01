@@ -467,6 +467,9 @@ the data:
   even if identical; a trade is checked against the pre-reconnect volume, so
   trades lost during the outage appear as a gap. If `ACML_VOL` restarted (a
   new trading day), the tape restarts from it.
+- **new exchange day**: a frame received on a later KST date than the one
+  before it resyncs every book and restarts every symbol's tape baseline, even
+  when the socket never reconnected.
 
 Execution notices (`H0STCNI0`/`H0STCNI9`), subscribe acknowledgements and
 PINGPONG frames are never recorded.
@@ -494,18 +497,22 @@ state, err := book.Replay(f, func(e book.Event) error {
 ```
 
 `bookrec replay -in FILE [-out FILE]` writes the same events as JSON lines,
-then the final book of each symbol, and prints the summary to stderr.
+then the final book of each symbol, and prints the summary to stderr. It
+refuses an `-out` that names the `-in` file.
 
 Rules for a consumer:
 
-- Act only on a book with `Synced: true`. After a `reconnect` or a new
-  `session`, a symbol's book is unsynced until its next `book` event.
+- Act only on a book with `Synced: true`. After a `reconnect`, a new
+  `session` or a new exchange day, a symbol's book is unsynced until its next
+  `book` event.
 - Treat a `gap` as missing tape: volume-based fill models must not assume
   those trades happened at a known price.
 - Treat `stale` as no information since `since_ns`, not as an unchanged
   market.
 - `summary.torn_lines` counts the torn last line of a crashed recorder;
-  replay skips it. A non-zero `verdict_mismatches` means the file was
+  replay skips it. An invalid line anywhere else (one not followed directly
+  by a new `session` line) fails the replay with `book.ErrCorrupt` rather than
+  silently dropping frames. A non-zero `verdict_mismatches` means the file was
   written by different detection code; replay applies its own verdicts.
 - Event times are receive times (`at_ns`, Unix ns); `hour` is the exchange
   time (HHMMSS, KST, one-second resolution).

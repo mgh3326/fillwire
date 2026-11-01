@@ -68,7 +68,7 @@ func (r *Recorder) Frame(raw []byte, at time.Time) error {
 		r.write(line)
 		return r.err
 	}
-	line.Verdicts = r.tracker.frame(frame)
+	line.Verdicts, _ = r.tracker.frame(frame, line.AtNS)
 	for _, v := range line.Verdicts {
 		r.arrive(streamKey{frame.TR, v.Symbol}, line.AtNS)
 	}

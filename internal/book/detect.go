@@ -1,5 +1,7 @@
 package book
 
+import "time"
+
 // Class is the verdict on one book or trade record.
 type Class string
 
@@ -34,6 +36,11 @@ func (c Class) Applied() bool { return c == ClassOK || c == ClassGap }
 // against the pre-reconnect cumulative volume, so trades lost during the
 // outage show up as a gap; if ACML_VOL went backwards (a new trading day) the
 // tape restarts from it.
+//
+// A frame received on a later KST calendar date than the previous one starts
+// a new exchange day even without a reconnect: every book is unsynced and the
+// first trade per symbol becomes that day's baseline (Resync, never a gap or
+// regression).
 type Verdict struct {
 	Symbol     string `json:"symbol"`
 	Class      Class  `json:"class"`
@@ -48,9 +55,10 @@ type bookCursor struct {
 }
 
 type tradeCursor struct {
-	acml   int64
-	text   string
-	resync bool
+	acml    int64
+	text    string
+	resync  bool
+	restart bool // new exchange day: the next trade is the baseline
 }
 
 // tracker holds the continuity state shared by the recorder (which writes
@@ -58,6 +66,14 @@ type tradeCursor struct {
 type tracker struct {
 	books  map[string]*bookCursor
 	trades map[string]*tradeCursor
+	day    int64 // KST calendar day of the latest frame, days since epoch
+}
+
+// kstOffset is KRX's fixed UTC offset; Korea has no daylight saving.
+const kstOffset = 9 * time.Hour
+
+func exchangeDay(atNS int64) int64 {
+	return (atNS + int64(kstOffset)) / int64(24*time.Hour)
 }
 
 func newTracker() *tracker {
@@ -73,15 +89,33 @@ func (t *tracker) reconnect() {
 	}
 }
 
-func (t *tracker) frame(f Frame) []Verdict {
-	verdicts := make([]Verdict, 0, len(f.Books)+len(f.Trades))
+// frame classifies every record of f, received at atNS. newDay reports that
+// f is the first frame of a later exchange day; the caller unsyncs its books.
+func (t *tracker) frame(f Frame, atNS int64) (verdicts []Verdict, newDay bool) {
+	if day := exchangeDay(atNS); day > t.day {
+		newDay = t.day != 0
+		t.day = day
+		if newDay {
+			t.startDay()
+		}
+	}
+	verdicts = make([]Verdict, 0, len(f.Books)+len(f.Trades))
 	for _, r := range f.Books {
 		verdicts = append(verdicts, t.book(r))
 	}
 	for _, r := range f.Trades {
 		verdicts = append(verdicts, t.trade(r))
 	}
-	return verdicts
+	return verdicts, newDay
+}
+
+func (t *tracker) startDay() {
+	for _, c := range t.books {
+		c.synced = false
+	}
+	for _, c := range t.trades {
+		c.restart = true
+	}
 }
 
 func (t *tracker) book(r BookRecord) Verdict {
@@ -109,6 +143,11 @@ func (t *tracker) trade(r TradeRecord) Verdict {
 	c, seen := t.trades[r.Symbol]
 	if !seen {
 		t.trades[r.Symbol] = &tradeCursor{acml: r.AcmlVol, text: r.text}
+		return v
+	}
+	if c.restart {
+		*c = tradeCursor{acml: r.AcmlVol, text: r.text}
+		v.Resync = true
 		return v
 	}
 	// The first trade after a reconnect consumes the resync, even when it is a

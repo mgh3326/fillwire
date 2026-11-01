@@ -76,8 +76,9 @@ type Summary struct {
 	Stale      int   `json:"stale"`
 	Reconnects int   `json:"reconnects"`
 	BadFrames  int   `json:"bad_frames"`
-	// TornLines counts lines that are not valid JSON: the torn tail of a
-	// crashed recorder. They are skipped.
+	// TornLines counts torn lines left by a crashed recorder: an invalid
+	// line that ends the file or is followed directly by a new session line.
+	// They are skipped; any other invalid line fails the replay (ErrCorrupt).
 	TornLines int `json:"torn_lines"`
 	// VerdictMismatches counts frames whose recorded verdicts differ from the
 	// ones replay recomputed. Replay always applies its own verdicts; a
@@ -102,8 +103,13 @@ func (s State) SortedBooks() []BookState {
 	return books
 }
 
-// ErrFormat marks an evidence file this replay cannot read.
-var ErrFormat = errors.New("book: unsupported evidence")
+var (
+	// ErrFormat marks an evidence file this replay cannot read.
+	ErrFormat = errors.New("book: unsupported evidence")
+	// ErrCorrupt marks an invalid line in the middle of a session, where a
+	// crash cannot have torn it. Skipping it could silently drop frames.
+	ErrCorrupt = errors.New("book: corrupt evidence")
+)
 
 // Replay reads an evidence file and rebuilds book state and the trade tape.
 // It recomputes every verdict from the raw frames with the same detection
@@ -117,10 +123,10 @@ func Replay(r io.Reader, emit func(Event) error) (State, error) {
 		emit:    emit,
 	}
 	reader := bufio.NewReaderSize(r, 64*1024)
-	for {
+	for lineNo := 1; ; lineNo++ {
 		chunk, readErr := reader.ReadBytes('\n')
 		if len(bytes.TrimSpace(chunk)) > 0 {
-			if err := rp.line(chunk); err != nil {
+			if err := rp.line(chunk, lineNo); err != nil {
 				return rp.state, err
 			}
 		}
@@ -137,15 +143,24 @@ type replayer struct {
 	tracker *tracker
 	state   State
 	session int
+	torn    int // line number of an invalid line not yet followed by a session line
 	emit    func(Event) error
 }
 
-func (rp *replayer) line(raw []byte) error {
+func (rp *replayer) line(raw []byte, lineNo int) error {
 	var l Line
 	if err := json.Unmarshal(raw, &l); err != nil {
+		if rp.torn != 0 {
+			return fmt.Errorf("%w: invalid lines %d and %d", ErrCorrupt, rp.torn, lineNo)
+		}
+		rp.torn = lineNo
 		rp.state.Summary.TornLines++
 		return nil
 	}
+	if rp.torn != 0 && l.Kind != KindSession {
+		return fmt.Errorf("%w: invalid line %d is followed by a %s line, not a new session", ErrCorrupt, rp.torn, l.Kind)
+	}
+	rp.torn = 0
 	if l.V != FormatVersion {
 		return fmt.Errorf("%w: version %d (session %d seq %d)", ErrFormat, l.V, rp.session, l.Seq)
 	}
@@ -196,7 +211,10 @@ func (rp *replayer) frame(l Line, base Event) error {
 		sum.BadFrames++
 		return nil
 	}
-	verdicts := rp.tracker.frame(frame)
+	verdicts, newDay := rp.tracker.frame(frame, l.AtNS)
+	if newDay {
+		rp.unsyncBooks()
+	}
 	if !reflect.DeepEqual(verdicts, l.Verdicts) {
 		sum.VerdictMismatches++
 	}

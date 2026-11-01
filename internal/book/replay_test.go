@@ -101,3 +101,34 @@ func TestReplayStopsOnEmitError(t *testing.T) {
 		t.Fatalf("err = %v after %d calls", err, calls)
 	}
 }
+
+// Only a crash can tear a line, and a crash ends the session: the torn line
+// is the last one, or the next line opens a new session. Anything else is
+// corruption that would silently drop frames, so replay fails.
+func TestReplayRejectsMidFileCorruption(t *testing.T) {
+	evidence := recordScenario(t)
+	nl := bytes.IndexByte(evidence, '\n') + 1
+	second := bytes.IndexByte(evidence[nl:], '\n') + nl + 1
+	torn := []byte(`{"v":1,"seq":99,"ki` + "\n")
+	session := []byte(`{"v":1,"seq":1,"kind":"session","at_ns":1}` + "\n")
+
+	cases := map[string]struct {
+		evidence []byte
+		want     error
+	}{
+		"torn tail":           {append(append([]byte{}, evidence...), torn[:len(torn)-1]...), nil},
+		"torn before session": {append(append(append([]byte{}, evidence...), torn...), session...), nil},
+		"mid-session":         {append(append(append([]byte{}, evidence[:second]...), torn...), evidence[second:]...), ErrCorrupt},
+		"torn before frame":   {append(append(append([]byte{}, evidence[:nl]...), torn...), evidence[nl:]...), ErrCorrupt},
+		"two invalid at end":  {append(append(append([]byte{}, evidence...), torn...), torn...), ErrCorrupt},
+	}
+	for name, c := range cases {
+		state, err := Replay(bytes.NewReader(c.evidence), nil)
+		if !errors.Is(err, c.want) {
+			t.Errorf("%s: err = %v, want %v", name, err, c.want)
+		}
+		if c.want == nil && state.Summary.TornLines != 1 {
+			t.Errorf("%s: torn lines = %d, want 1", name, state.Summary.TornLines)
+		}
+	}
+}

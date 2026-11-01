@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestRecorder(t *testing.T) (*Recorder, *bytes.Buffer) {
@@ -349,5 +350,46 @@ func TestRecorderResyncConsumedByResend(t *testing.T) {
 	}
 	if got := verdicts(t, out.Bytes()); !reflect.DeepEqual(got, want) {
 		t.Fatalf("verdicts = %+v, want %+v", got, want)
+	}
+}
+
+// A session that stays connected across midnight KST starts the new exchange
+// day fresh: the morning book is a resync, not a regression behind 15:30, and
+// the morning trade is a baseline, not a regression behind yesterday's volume.
+func TestRecorderNewExchangeDayWithoutReconnect(t *testing.T) {
+	rec, out := newTestRecorder(t)
+	closing := t0.Add(6*time.Hour + 30*time.Minute) // 15:30 KST
+	morning := t0.Add(24 * time.Hour)               // 09:00 KST next day
+	steps := []struct {
+		raw []byte
+		at  time.Time
+	}{
+		{bookFrame("005930", "153000", 71100, 71000, 10), closing},
+		{tradeFrame("005930", "153000", 71000, 500, 900000), closing},
+		{bookFrame("005930", "090000", 72100, 72000, 10), morning},
+		{tradeFrame("005930", "090000", 72000, 10, 10), morning},
+		{tradeFrame("005930", "090000", 72000, 5, 15), morning.Add(time.Second)},
+	}
+	for _, s := range steps {
+		if err := rec.Frame(s.raw, s.at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []Verdict{
+		{Symbol: "005930", Class: ClassOK},
+		{Symbol: "005930", Class: ClassOK},
+		{Symbol: "005930", Class: ClassOK, Resync: true},
+		{Symbol: "005930", Class: ClassOK, Resync: true},
+		{Symbol: "005930", Class: ClassOK},
+	}
+	if got := verdicts(t, out.Bytes()); !reflect.DeepEqual(got, want) {
+		t.Fatalf("verdicts = %+v, want %+v", got, want)
+	}
+	state, err := Replay(bytes.NewReader(out.Bytes()), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := state.Books["005930"]; b.Hour != "090000" || !b.Synced || state.Summary.Regressed != 0 || len(state.Tape) != 3 {
+		t.Fatalf("book = %+v, summary = %+v", b, state.Summary)
 	}
 }

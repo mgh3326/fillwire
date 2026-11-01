@@ -15,13 +15,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/book"
@@ -69,8 +69,8 @@ func record(args []string, stdin io.Reader, stderr io.Writer, now func() time.Ti
 	if *out == "" {
 		return errors.New("record: -out is required")
 	}
-	if *stale <= 0 {
-		return errors.New("record: -stale must be positive")
+	if *stale < time.Millisecond {
+		return errors.New("record: -stale must be at least 1ms")
 	}
 	file, err := book.OpenEvidence(*out)
 	if err != nil {
@@ -81,45 +81,56 @@ func record(args []string, stdin io.Reader, stderr io.Writer, now func() time.Ti
 	if err != nil {
 		return err
 	}
+	tick := time.NewTicker(*stale / 4)
+	defer tick.Stop()
+	if err := recordFrom(rec, stdin, tick.C, now); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	return file.Close()
+}
 
-	stop := make(chan struct{})
-	var ticker sync.WaitGroup
-	ticker.Add(1)
+// recordFrom feeds stdin lines and ticks to rec from one goroutine, so a
+// write failure from either ends the recording at once, even while stdin is
+// idle.
+func recordFrom(rec *book.Recorder, stdin io.Reader, tick <-chan time.Time, now func() time.Time) error {
+	lines := make(chan []byte)
+	readErr := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		defer ticker.Done()
-		tick := time.NewTicker(*stale / 4)
-		defer tick.Stop()
-		for {
+		scanner := bufio.NewScanner(stdin)
+		scanner.Buffer(make([]byte, 64*1024), 1<<20)
+		for scanner.Scan() {
 			select {
-			case <-stop:
+			case lines <- bytes.Clone(scanner.Bytes()):
+			case <-done:
 				return
-			case <-tick.C:
-				if rec.Tick(now()) != nil {
-					return
-				}
 			}
 		}
+		readErr <- scanner.Err()
+		close(lines)
 	}()
-
-	scanner := bufio.NewScanner(stdin)
-	scanner.Buffer(make([]byte, 64*1024), 1<<20)
-	for scanner.Scan() {
-		if len(scanner.Bytes()) == 0 {
-			continue
+	for {
+		select {
+		case line, open := <-lines:
+			if !open {
+				return <-readErr
+			}
+			if len(line) == 0 {
+				continue
+			}
+			if err := rec.Frame(line, now()); err != nil {
+				return err
+			}
+		case <-tick:
+			if err := rec.Tick(now()); err != nil {
+				return err
+			}
 		}
-		if err := rec.Frame(scanner.Bytes(), now()); err != nil {
-			break
-		}
 	}
-	close(stop)
-	ticker.Wait()
-	if err := rec.Err(); err != nil {
-		return err
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return file.Sync()
 }
 
 func replay(args []string, stdout, stderr io.Writer) error {
@@ -138,15 +149,44 @@ func replay(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	defer src.Close()
-	out := stdout
-	if *outPath != "" {
-		file, err := os.Create(*outPath)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		out = file
+	if *outPath == "" {
+		return writeReplay(src, stdout, stderr)
 	}
+	if err := refuseSameFile(src, *outPath); err != nil {
+		return err
+	}
+	file, err := os.Create(*outPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := writeReplay(src, file, stderr); err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+// refuseSameFile stops -out from truncating the evidence being replayed,
+// whatever path (or link) names it.
+func refuseSameFile(src *os.File, outPath string) error {
+	in, err := src.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.Stat(outPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if os.SameFile(in, out) {
+		return errors.New("replay: -out names the -in evidence file")
+	}
+	return nil
+}
+
+func writeReplay(src io.Reader, out, stderr io.Writer) error {
 	buffered := bufio.NewWriter(out)
 	enc := json.NewEncoder(buffered)
 	state, err := book.Replay(src, func(e book.Event) error { return enc.Encode(e) })

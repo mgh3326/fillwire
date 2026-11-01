@@ -107,6 +107,11 @@ func ParseFrame(raw []byte) (Frame, error) {
 	}
 	parts := strings.SplitN(text, "|", 4)
 	if len(parts) < 4 || (parts[0] != "0" && parts[0] != "1") || parts[1] == "" {
+		// A damaged header that still names a recorded transaction is a
+		// malformed frame, kept as evidence, not noise to ignore.
+		if len(parts) > 1 && (parts[1] == TRBook || parts[1] == TRTrade) {
+			return Frame{TR: parts[1]}, fmt.Errorf("%w: header %q", ErrMalformed, text)
+		}
 		return Frame{}, ErrNotRealtime
 	}
 	tr := parts[1]
@@ -192,6 +197,9 @@ func parseTrade(f []string) (TradeRecord, error) {
 	if p.err == nil && (r.Qty <= 0 || r.AcmlVol < r.Qty) {
 		return TradeRecord{}, fmt.Errorf("volume %d with cumulative %d", r.Qty, r.AcmlVol)
 	}
+	if p.err == nil && r.Price <= 0 {
+		return TradeRecord{}, fmt.Errorf("price %d", r.Price)
+	}
 	return r, p.err
 }
 
@@ -206,6 +214,11 @@ func validateHeader(symbol, hour string) error {
 		if c < '0' || c > '9' {
 			return fmt.Errorf("hour %q", hour)
 		}
+	}
+	// An out-of-range time would become the book's ordering baseline and
+	// make every later snapshot look like a regression.
+	if hour[0:2] > "23" || hour[2:4] > "59" || hour[4:6] > "59" {
+		return fmt.Errorf("hour %q out of range", hour)
 	}
 	return nil
 }

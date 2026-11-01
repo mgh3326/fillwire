@@ -54,7 +54,13 @@ func TestParseFrameRejects(t *testing.T) {
 		want error
 	}{
 		"ack":            {`{"header":{"tr_id":"H0STASP0"},"body":{"rt_cd":"0"}}`, ErrNotRealtime},
-		"too few parts":  {"0|H0STASP0|001", ErrNotRealtime},
+		"not kis":        {"hello", ErrNotRealtime},
+		"too few parts":  {"0|H0STASP0|001", ErrMalformed},
+		"bad flag":       {"2|H0STCNT0|001|x", ErrMalformed},
+		"hour range":     {string(tradeFrame("005930", "259999", 1, 1, 1)), ErrMalformed},
+		"minute range":   {string(bookFrame("005930", "096000", 2, 1, 1)), ErrMalformed},
+		"zero price":     {string(tradeFrame("005930", "090000", 0, 1, 1)), ErrMalformed},
+		"negative price": {string(tradeFrame("005930", "090000", -5, 1, 1)), ErrMalformed},
 		"execution":      {"0|H0STCNI0|001|a^b", ErrUnsupportedTR},
 		"encrypted":      {"1|H0STCNT0|001|xyz", ErrEncrypted},
 		"zero count":     {"0|H0STCNT0|000|a", ErrMalformed},
