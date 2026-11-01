@@ -160,3 +160,38 @@ func TestFilledTargetCancelsWorkingOrder(t *testing.T) {
 		t.Fatal("a second finish applied")
 	}
 }
+
+// TestOversizedLedgerFillStopsSending: ledger evidence beyond the target, in
+// one oversized fill or cumulatively, is recorded whole (never clamped or
+// refused, which would undercount and keep sending), reported as
+// ErrOverfill, and stops every send except the cancel of the working order.
+func TestOversizedLedgerFillStopsSending(t *testing.T) {
+	for name, fills := range map[string][]int64{"one oversized fill": {15}, "cumulative fills": {6, 6}} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t, fixtureIntent(t), enabled())
+			r.top = exec.Top{Bid: 70_000, Ask: 70_400}
+			r.step(0)
+			key := r.g.Sends[0].Key
+			var last error
+			for i, q := range fills {
+				last = r.e.OnFill(exec.Fill{FillID: "ledger-" + itoa(int64(i)), Key: key, Qty: q, Price: 70_000, AtNS: at(1)})
+			}
+			if !errors.Is(last, exec.ErrOverfill) {
+				t.Fatalf("err %v, want ErrOverfill", last)
+			}
+			if st := r.e.State(); st.Filled != 12 && st.Filled != 15 || st.Overfill() != st.Filled-10 {
+				t.Fatalf("filled %d overfill %d", st.Filled, st.Overfill())
+			}
+			for _, s := range []float64{1, 5, 10, 15, 20} {
+				r.step(s)
+			}
+			equal(t, r.actions(), []string{"submit@70000x10", "cancel"})
+			if st := r.e.State(); st.Done != exec.DoneFilled || st.Order != nil {
+				t.Fatalf("done %q order %+v", st.Done, st.Order)
+			}
+			if _, _, live := r.g.Live(); live {
+				t.Fatal("an order is still working at the broker")
+			}
+		})
+	}
+}
