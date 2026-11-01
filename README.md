@@ -417,6 +417,113 @@ Set `enabled = false`, or delete the `[quotes]` table, and restart fillwire.
 The mount can stay or go. Existing `quotes:toss` entries remain until trimmed
 by `MAXLEN` or deleted by the desk (`DEL quotes:toss`).
 
+## Book recorder and replay (`bookrec`)
+
+`internal/book` records KIS domestic order-book (`H0STASP0`) and trade
+(`H0STCNT0`) websocket frames into append-only evidence files, and replays
+those files deterministically into book state and a trade tape. `cmd/bookrec`
+is its command-line front end. Neither has a network client, and neither is
+wired into the `fillwire` binary.
+
+### Recording
+
+`book.Recorder` takes frames from whatever reads the socket:
+
+```go
+f, _ := book.OpenEvidence("005930-20261102.evidence.jsonl") // append-only
+rec, _ := book.NewRecorder(f, book.DefaultStaleAfter, time.Now())
+rec.Frame(event.Raw, event.ReceivedAt) // each go-kis ws.Event
+rec.Reconnect(info.At, info.Attempt)   // from ws.Config.OnReconnect
+rec.Tick(time.Now())                   // every 500 ms
+```
+
+`bookrec record -out FILE < frames` does the same for raw frames piped one
+per line on stdin, stamping each with its read time. Nothing feeds a live
+KIS socket to it yet: KIS admits one websocket session per app key, and
+fillwire already holds that session for `fills:kis`. A live source needs
+either a second app key or the book and trade subscriptions inside the
+fillwire process.
+
+Each evidence line is one JSON object written with a single `write`:
+
+| `kind` | Meaning |
+|---|---|
+| `session` | A recording run started; `stale_after_ms` is its threshold. |
+| `frame` | One received frame, verbatim in `raw` (or base64 `raw_bytes` if not UTF-8), with `at_ns` and one verdict per record. A frame that does not parse keeps its `error` and changes nothing. |
+| `reconnect` | The socket reconnected. Every book is unsynced until its next snapshot. |
+| `stale` | A stream (`tr`, `symbol`) was silent for longer than the threshold (2 s by default) since `since_ns`. Flagged once per silence, by `Tick` or by the frame that ends the silence. |
+
+KIS book and trade frames carry no sequence number, so the verdicts come from
+the data:
+
+- **trade gap**: `ACML_VOL - CNTG_VOL` is larger than the previous
+  `ACML_VOL`; `missing_vol` is the difference. The trade is applied and
+  becomes the new baseline.
+- **duplicate**: a record identical to the last applied one, or a trade whose
+  `ACML_VOL` was already applied. Skipped.
+- **regress**: a trade whose `ACML_VOL` went backwards, or a book with an
+  earlier exchange time. Skipped.
+- **resync**: the first record per symbol after a reconnect. A book is applied
+  even if identical; a trade is checked against the pre-reconnect volume, so
+  trades lost during the outage appear as a gap. If `ACML_VOL` restarted (a
+  new trading day), the tape restarts from it.
+- **new exchange day**: a frame received on a later KST date than the one
+  before it resyncs every book and restarts every symbol's tape baseline, even
+  when the socket never reconnected.
+
+Execution notices (`H0STCNI0`/`H0STCNI9`), subscribe acknowledgements and
+PINGPONG frames are never recorded.
+
+### Consuming the replay
+
+An executor or backtest reads evidence through `book.Replay`. It recomputes
+every verdict from the raw frames with the recorder's own detection code, so
+the output depends only on the file's bytes: replaying the same file twice
+yields byte-identical events.
+
+```go
+f, _ := os.Open("005930-20261102.evidence.jsonl")
+state, err := book.Replay(f, func(e book.Event) error {
+	switch e.Type {
+	case book.EventBook:  // e.Book: full ten-level snapshot, e.Book.Synced
+	case book.EventTrade: // e.Trade: one applied trade, in tape order
+	case book.EventGap:   // e.MissingVol shares were traded but never received
+	case book.EventStale, book.EventReconnect, book.EventSession:
+	}
+	return nil // a non-nil error stops the replay and is returned
+})
+// state.Books: final book per symbol; state.Tape: every applied trade;
+// state.Summary: counts of gaps, duplicates, stale streams, torn lines.
+```
+
+`bookrec replay -in FILE [-out FILE]` writes the same events as JSON lines,
+then the final book of each symbol, and prints the summary to stderr. It
+refuses an `-out` that names the `-in` file.
+
+Rules for a consumer:
+
+- Act only on a book with `Synced: true`. After a `reconnect`, a new
+  `session` or a new exchange day, a symbol's book is unsynced until its next
+  `book` event.
+- Treat a `gap` as missing tape: volume-based fill models must not assume
+  those trades happened at a known price.
+- Treat `stale` as no information since `since_ns`, not as an unchanged
+  market.
+- `summary.torn_lines` counts the torn last line of a crashed recorder;
+  replay skips it. An invalid line anywhere else (one not followed directly
+  by a new `session` line) fails the replay with `book.ErrCorrupt` rather than
+  silently dropping frames. A non-zero `verdict_mismatches` means the file was
+  written by different detection code; replay applies its own verdicts.
+- Event times are receive times (`at_ns`, Unix ns); `hour` is the exchange
+  time (HHMMSS, KST, one-second resolution).
+
+### Build guarantee
+
+`cmd/bookrec/noorder_test.go` builds the binary and fails if it links any
+non-standard package outside an allowlist (`internal/book` only), links
+`net`, `net/http` or `crypto/tls`, has a symbol shaped like an order client,
+or contains a KIS order path (`/trading/order…`) or order transaction ID.
+
 ## Idempotency key
 
 `fill_seq` is derived from the KIS execution record alone: `sha256` over all decrypted
