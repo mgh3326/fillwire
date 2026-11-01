@@ -1,10 +1,12 @@
 version: 1
-# Shadow only: mergewake classifies and reviews but never merges (ROB-1426).
-enabled: false
+# Operator 2026-11-02: auto-merge (land) on; blocking paths still get two review passes.
+enabled: true
 required_checks:
   - verify
   - secrets
 blocking:
+  - paths: ['internal/exec/**']
+    reason: The order execution state machine decides what is sent to a broker once it is wired to E1.
   - paths: ['internal/sink/**', 'internal/decode/**']
     reason: Sink and decoder changes write or classify fills in the execution ledger before a revert.
   - paths: ['fillwire.toml', 'cmd/**']
@@ -13,3 +15,7 @@ blocking:
     reason: Deploy, image and host-unit changes reach production directly.
   - paths: ['.github/workflows/**', '.mergewake/**', 'go.mod', 'go.sum']
     reason: Verification, dependency and policy changes can bypass recovery controls.
+review_gate:
+  land: graded
+fast_lane:
+  max_changed_lines: 50
