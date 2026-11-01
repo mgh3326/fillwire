@@ -1,0 +1,4 @@
+{"intent_id":"3f2b6c1e-8a4d-4e5f-9a7b-1c2d3e4f5a6b","symbol":"005930","side":"buy","rule":"through","target":10,"filled":9,"avg_price":70244.44,"arrival_mid":70100,"slippage_bps":20.61,"sends":5,"done":"cap","violations":0}
+{"intent_id":"3f2b6c1e-8a4d-4e5f-9a7b-1c2d3e4f5a6b","symbol":"005930","side":"buy","rule":"touch","target":10,"filled":10,"avg_price":70000,"arrival_mid":70100,"slippage_bps":-14.27,"sends":2,"done":"filled","violations":0}
+{"intent_id":"9c1d2e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f","symbol":"005930","side":"sell","rule":"through","target":10,"filled":4,"avg_price":69900,"arrival_mid":70100,"slippage_bps":28.53,"sends":5,"done":"cap","violations":0}
+{"intent_id":"9c1d2e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f","symbol":"005930","side":"sell","rule":"touch","target":10,"filled":10,"avg_price":70100,"arrival_mid":70100,"slippage_bps":0,"sends":3,"done":"filled","violations":0}
