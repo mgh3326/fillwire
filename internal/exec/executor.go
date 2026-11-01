@@ -58,6 +58,11 @@ type Executor struct {
 	err   error
 }
 
+// ErrOverfill is returned by OnFill when ledger fills exceed the target.
+// The fill is recorded; the executor sends nothing more but a cancel of its
+// working order. The caller should alert an operator.
+var ErrOverfill = errors.New("exec: ledger fills exceed the target")
+
 // ErrHalted is returned once a journal write failed; the executor then does
 // nothing more, because its disk state may lag what it did.
 var ErrHalted = errors.New("exec: halted after a journal failure")
@@ -91,7 +96,13 @@ func (e *Executor) OnFill(f Fill) error {
 	if _, ours := e.state.sentKey(f.Key); !ours {
 		return nil
 	}
-	return e.commit(Record{Kind: RecFill, AtNS: f.AtNS, Fill: &f})
+	if err := e.commit(Record{Kind: RecFill, AtNS: f.AtNS, Fill: &f}); err != nil {
+		return err
+	}
+	if over := e.state.Overfill(); over > 0 {
+		return fmt.Errorf("%w: filled %d, target %d (fill %s recorded)", ErrOverfill, e.state.Filled, e.state.Target, f.FillID)
+	}
+	return nil
 }
 
 // maxStepsPerTick bounds one Tick; each step is a journaled record or a query.

@@ -136,6 +136,11 @@ func (s State) Started() bool { return s.Intent.IntentID != "" }
 // fills and broker-reported fills.
 func (s State) Remaining() int64 { return s.Target - max(s.Filled, s.BrokerFilled) }
 
+// Overfill is how far ledger fills exceed the target (0 if they do not).
+// Nothing the executor sends can cause it (no send exceeds Remaining); a
+// non-zero value is broker or ledger evidence for an operator to examine.
+func (s State) Overfill() int64 { return max(s.Filled-s.Target, 0) }
+
 // Digest is the SHA-256 of the state's JSON form; equal states have equal
 // digests.
 func (s State) Digest() string {
@@ -288,6 +293,11 @@ func Apply(s State, r Record) (State, error) {
 		if _, ok := s.sentKey(f.Key); !ok {
 			return bad("fill for key %q this intent never sent", f.Key)
 		}
+		// A fill is evidence and is recorded whole, even past the target or
+		// larger than the order it hit. Clamping or refusing it would make
+		// the executor undercount and keep sending. Past the target,
+		// Remaining is below 1, so decide sends nothing but a cancel of the
+		// working order, then finishes; Overfill reports the excess.
 		n.Fills[f.FillID] = *f
 		n.Filled += f.Qty
 		n.FillNotional += f.Qty * f.Price
