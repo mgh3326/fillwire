@@ -1,0 +1,53 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish assets for the selected tag
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Resolve release tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag=v0.0.0
+          if [ "$REF_TYPE" = tag ]; then tag=$REF_NAME; fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Cross-build and verify release assets
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath \
+              -ldflags="-s -w -X main.version=$RELEASE_TAG -X main.commit=$GITHUB_SHA" \
+              -o "dist/fillwire-${target%/*}-${target#*/}" ./cmd/fillwire
+          done
+          cd dist
+          sha256sum fillwire-* > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Publish release assets
+        if: github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" dist/fillwire-* dist/SHA256SUMS --verify-tag --generate-notes
