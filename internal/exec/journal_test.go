@@ -107,3 +107,46 @@ func TestJournalRefusesCorruption(t *testing.T) {
 		}
 	}
 }
+
+func TestReplayRefusesTrailingDataOnLine(t *testing.T) {
+	r := richRun(t)
+	data, _ := os.ReadFile(r.path)
+	if _, err := exec.ReplayJournal(bytes.NewReader(data)); err != nil {
+		t.Fatalf("untouched journal: %v", err)
+	}
+	lines := bytes.SplitAfter(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
+	for name, idx := range map[string]int{"first line": 0, "last line": len(lines) - 1} {
+		cp := make([][]byte, len(lines))
+		copy(cp, lines)
+		cp[idx] = append(bytes.TrimSuffix(cp[idx], []byte("\n")), '{', '}')
+		if idx != len(lines)-1 {
+			cp[idx] = append(cp[idx], '\n')
+		}
+		bad := append(bytes.Join(cp, nil), '\n')
+		if _, err := exec.ReplayJournal(bytes.NewReader(bad)); !errors.Is(err, exec.ErrCorrupt) {
+			t.Errorf("%s replay: err %v, want ErrCorrupt", name, err)
+		}
+		path := filepath.Join(t.TempDir(), "j.log")
+		if err := os.WriteFile(path, bad, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := exec.OpenJournal(path); !errors.Is(err, exec.ErrCorrupt) {
+			t.Errorf("%s open: err %v, want ErrCorrupt", name, err)
+		}
+	}
+}
+
+// TestJournalRefusesSecondOpen: a second handle on a journal that is open
+// would append at its own offset and overwrite the first one's records.
+func TestJournalRefusesSecondOpen(t *testing.T) {
+	r := newRig(t, fixtureIntent(t), enabled())
+	if j, _, err := exec.OpenJournal(r.path); !errors.Is(err, exec.ErrJournalLocked) {
+		if j != nil {
+			j.Close()
+		}
+		t.Fatalf("second open: err %v, want ErrJournalLocked", err)
+	}
+	if st := r.restart(); !st.Started() {
+		t.Fatal("reopen after close lost the start record")
+	}
+}
