@@ -74,14 +74,40 @@ Do not schedule the run until every item holds:
 2. **E1 open items** (contract, "Open items for E2 and E3"):
    - The KR mock coordination route is installed, so a submit is not `uncertain` by construction.
    - The follow-up capability for mock amend and cancel is minted, so amend and cancel are not `uncertain` with zero broker calls.
-3. **fillwire live feeds:** a live book source for the intent's symbol (the bookrec stream, not a recorded file), and ledger fills mapped back to idempotency keys through the `broker_order_id`s in the journal. Then remove `execmock`'s send-mode refusal in the same PR, which is a blocking path.
+3. **fillwire live feeds — still blocked:** E2 now cancels and finishes
+   `stale_book` when the last book is older than 30 s while an order is working.
+   This includes a restart with no book: silence is measured from the last
+   journaled order move. New submits and amends still require a book within
+   `StaleAfter` (2 s by default).
+
+   `Executor.OnLedgerFill` binds a scoped ledger fill through the accepted
+   submit/amend outcomes' `broker_order_id`s in the local journal, including
+   superseded orders. It normalizes leading zeros and includes the KST trading
+   day of the send and fill, because broker numbers repeat across days. A
+   missing, unknown or ambiguous broker identity, a conflicting key, or changed
+   evidence under an existing fill ID returns `ErrAttribution` and stops further
+   executor actions. A repeated identical fill is counted once.
+
+   The live adapters remain required. `bookrec` currently writes files and has
+   no Redis producer or stream schema. The merged E1 intent query provides an
+   aggregate `filled_qty`, not individual execution-ledger fill rows. Neither
+   that aggregate nor `fills:kis` (which precedes ledger commit) is ledger fill
+   evidence. Define the book stream producer/schema and the effective ledger
+   row read contract, including account, symbol, side, trading day, stable fill
+   ID, price, quantity and timestamp, before wiring these adapters and removing
+   `execmock`'s send-mode refusal. Do not schedule a run with this build.
 4. **Intent:** one intent stored through `SqlAlchemyGatewayStore.store_intent`, with `account = "kis_mock"`. Use the smallest size: 1 share, `max_notional_krw` below 100,000, and expiry within 30 minutes.
 
 ## Run steps (operator present)
 
 1. Check that the KIS mock runner control reads `ACTIVE` and that the gateway env gate is exactly `true` on the auto_trader host.
-2. Run `execmock -dry-run` against the live book for 1 minute. Check every printed body against the intent's bounds.
-3. Set `send_enabled = true` and `account = "kis_mock"`, and start the run, with the journal on local disk.
+2. Once precondition 3 is complete, run `execmock -dry-run` against the live
+   book for 1 minute. Check every printed body against the intent's bounds.
+   The current `-in` command above verifies recorded evidence only; it cannot
+   verify a live feed.
+3. Once the live adapters and explicit send flag exist, set `send_enabled =
+   true` and `account = "kis_mock"`, and start the run with that flag and the
+   journal on local disk. This build still refuses send mode.
 4. Watch the run until the intent finishes or a stop condition fires.
 
 ## What to watch
@@ -104,7 +130,7 @@ Stop, then set `GLOBAL_FREEZE` or stop the process, on any of these:
 | Any `refused` outcome that is not `submissions_killed` or `authorization_expired` | E2 sent something E1 forbids, so the mirror or the binding is wrong |
 | A second working order for the intent appears at the broker | Breaks the one-lineage rule |
 | A fill without a ledger row, or a ledger row for an unknown order id | Fill attribution is broken |
-| `ErrOverfill`, `ErrHalted`, or a journal write error | The executor stopped itself |
+| `ErrOverfill`, `ErrAttribution`, `ErrHalted`, or a journal write error | The executor stopped itself |
 | The book goes stale for more than 30 s while an order is working | Pricing has no input. Cancel and stop |
 
 After a stop, cancel the working order through E1. A cancel is allowed under `GLOBAL_FREEZE`. Then attach the journal and the E1 rows to the ticket.

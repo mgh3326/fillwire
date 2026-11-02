@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/mgh3326/fillwire/internal/exec"
 )
 
 const evidence = "../../internal/exec/sim/testdata/sim.evidence.jsonl"
@@ -100,5 +102,47 @@ func TestConfigThatWouldSendSendsNothing(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("%d requests sent", hits.Load())
+	}
+}
+
+func TestRecordedDryRunBodiesStayWithinIntentBounds(t *testing.T) {
+	data, err := os.ReadFile("testdata/intent.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := exec.ParseIntent(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs := execmock("-config", "testdata/dry-run.toml", "-intent", "testdata/intent.json", "-in", evidence, "-dry-run")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errs)
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var envelope struct {
+			DryRun bool       `json:"dry_run"`
+			Body   exec.Child `json:"body"`
+		}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if !envelope.DryRun {
+			continue
+		}
+		count++
+		c := envelope.Body
+		if c.IntentID != in.IntentID {
+			t.Fatalf("wrong intent: %+v", c)
+		}
+		if c.Action == exec.ActCancel {
+			continue
+		}
+		if c.Qty < 1 || c.Qty > in.TargetQty() || c.Price < 1 || c.Price > in.Cap() || c.Qty*c.Price > in.MaxNotionalKRW {
+			t.Fatalf("outside intent bounds: %+v", c)
+		}
+	}
+	if count == 0 {
+		t.Fatal("no bodies checked")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 )
 
 // Child actions, as in E1's child request contract.
@@ -28,11 +29,12 @@ const (
 
 // Finish reasons.
 const (
-	DoneFilled   = "filled"
-	DoneCap      = "cap"
-	DoneDeadline = "deadline"
-	DoneKilled   = "killed"
-	DoneRefused  = "refused"
+	DoneFilled    = "filled"
+	DoneCap       = "cap"
+	DoneDeadline  = "deadline"
+	DoneKilled    = "killed"
+	DoneRefused   = "refused"
+	DoneStaleBook = "stale_book"
 	// DoneE1Caps: no order is working and E1's cumulative caps leave no room
 	// for a new one (exposure.go).
 	DoneE1Caps = "e1_caps"
@@ -377,6 +379,8 @@ func decide(s State, in inputs) decision {
 		closing = DoneKilled
 	case in.now >= s.Intent.ExpiresAt.UnixNano():
 		closing = DoneDeadline
+	case s.Order != nil && bookSilentSince(s, in) < in.now-int64(30*time.Second):
+		closing = DoneStaleBook
 	}
 	if closing != "" {
 		if s.Order != nil {
@@ -437,6 +441,15 @@ func decide(s State, in inputs) decision {
 		return finish(DoneE1Caps)
 	}
 	return send(Child{Action: ActSubmit, Qty: q, Price: p}, "open")
+}
+
+// A restart has no book. Count silence from the last order move until a
+// snapshot arrives; a future timestamp cannot postpone the stop.
+func bookSilentSince(s State, in inputs) int64 {
+	if in.top != nil && in.top.AtNS > 0 && in.top.AtNS <= in.now {
+		return in.top.AtNS
+	}
+	return s.LastMoveNS
 }
 
 // fitNewOrder sizes a new order lineage at price p to the room E1's caps
