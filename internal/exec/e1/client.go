@@ -175,6 +175,15 @@ func New(cfg Config, in exec.Intent, opt Options) (*Client, error) {
 	if c.header == "" {
 		c.header = DefaultTokenHeader
 	}
+	// A header Go cannot write fails each request as a transport error,
+	// which the executor holds as uncertain for good: refuse it here.
+	if !headerName(c.header) {
+		return nil, fmt.Errorf("%w: token header %q is not a valid header name", ErrConfig, c.header)
+	}
+	switch http.CanonicalHeaderKey(c.header) {
+	case ConfirmHeader, "Content-Type", "Content-Length", "Host", "Transfer-Encoding":
+		return nil, fmt.Errorf("%w: token header %q collides with a header the client sets", ErrConfig, c.header)
+	}
 	if mode == Off {
 		return c, nil
 	}
@@ -197,6 +206,9 @@ func New(cfg Config, in exec.Intent, opt Options) (*Client, error) {
 	if c.token == "" {
 		return nil, fmt.Errorf("%w: empty token", ErrConfig)
 	}
+	if !headerValue(c.token) {
+		return nil, fmt.Errorf("%w: token is not a valid header value", ErrConfig) // the token itself is never printed
+	}
 	hc := http.Client{Timeout: cfg.Timeout}
 	if opt.HTTP != nil {
 		hc = *opt.HTTP
@@ -216,21 +228,61 @@ func New(cfg Config, in exec.Intent, opt Options) (*Client, error) {
 // plain http to any other host would hand it to whatever is on the path. A
 // URL with credentials in it is refused too: the token header is the only
 // credential.
+//
+// The errors never echo the URL as given: it may hold credentials. A URL
+// that parses is shown with its userinfo redacted; one that does not is not
+// shown.
 func checkURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Opaque != "" {
-		return "", fmt.Errorf("%w: url %q", ErrConfig, raw)
+	if err != nil {
+		return "", fmt.Errorf("%w: url does not parse", ErrConfig)
+	}
+	shown := u.Redacted()
+	switch {
+	case u.User != nil:
+		return "", fmt.Errorf("%w: url %q: credentials in a url are refused; the token header is the only credential", ErrConfig, shown)
+	case u.Host == "" || u.Hostname() == "" || u.Opaque != "":
+		return "", fmt.Errorf("%w: url %q", ErrConfig, shown)
 	}
 	switch u.Scheme {
 	case "https":
 	case "http":
 		if !loopback(u.Hostname()) {
-			return "", fmt.Errorf("%w: url %q: http only to a loopback host; use https", ErrConfig, raw)
+			return "", fmt.Errorf("%w: url %q: http only to a loopback host; use https", ErrConfig, shown)
 		}
 	default:
-		return "", fmt.Errorf("%w: url %q", ErrConfig, raw)
+		return "", fmt.Errorf("%w: url %q", ErrConfig, shown)
 	}
 	return u.String(), nil
+}
+
+// headerName reports whether s is an HTTP field name: one or more token
+// characters (RFC 9110, section 5.6.2).
+func headerName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		switch {
+		case 'a' <= b && b <= 'z', 'A' <= b && b <= 'Z', '0' <= b && b <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", b) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// headerValue reports whether s can be sent as a field value: visible ASCII
+// and spaces, with no leading or trailing space.
+func headerValue(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if b := s[i]; b < 0x20 || b > 0x7e {
+			return false
+		}
+	}
+	return strings.TrimSpace(s) == s
 }
 
 func loopback(host string) bool {

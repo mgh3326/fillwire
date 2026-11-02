@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -398,6 +399,58 @@ func TestTokenTravelsOnlyOverTLSOrLoopback(t *testing.T) {
 	} {
 		if _, err := e1.New(sendConfig(u), in, e1.Options{Token: tokenSource(t, true)}); err != nil {
 			t.Errorf("%s: %v", u, err)
+		}
+	}
+}
+
+// TestBadHeaderConfigFailsInNew: a token header or token that Go cannot
+// write would fail every request as a transport error, which the executor
+// holds as uncertain with no way to reconcile. New refuses it instead.
+func TestBadHeaderConfigFailsInNew(t *testing.T) {
+	in := fixtureIntent(t)
+	srv := newServer(t, nil)
+	for _, h := range []string{"X Token", "X-Token:", "X-Token\n", "X-Tökén", "(X)", "x-execution-intent-confirm", "content-type", "Host"} {
+		for _, cfg := range []e1.Config{
+			{Account: e1.MockAccount, SendEnabled: true, URL: srv.URL, TokenHeader: h},
+			{Account: e1.MockAccount, DryRun: true, URL: srv.URL, TokenHeader: h},
+			{Account: e1.MockAccount, URL: srv.URL, TokenHeader: h},
+		} {
+			if _, err := e1.New(cfg, in, e1.Options{Token: tokenSource(t, false), Log: io.Discard}); !errors.Is(err, e1.ErrConfig) {
+				t.Errorf("header %q (send %v, dry run %v): %v", h, cfg.SendEnabled, cfg.DryRun, err)
+			}
+		}
+	}
+	for _, tok := range []string{"tok-secret\nb", "tok-secret\r\nX-Evil: 1", "tok-secret\x00", " tok-secret", "tok-secret ", "tok-secrét"} {
+		_, err := e1.New(sendConfig(srv.URL), in, e1.Options{Token: func() (string, error) { return tok, nil }})
+		if !errors.Is(err, e1.ErrConfig) || strings.Contains(err.Error(), "tok-secret") {
+			t.Errorf("token %q: %v", tok, err)
+		}
+	}
+	c, err := e1.New(e1.Config{Account: e1.MockAccount, SendEnabled: true, URL: srv.URL, TokenHeader: "X-Gateway_Token.v2"}, in, e1.Options{Token: tokenSource(t, true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Send(submit(in)); err != nil {
+		t.Fatalf("valid header: %v", err)
+	}
+	if srv.count() != 1 {
+		t.Fatalf("hits %d", srv.count())
+	}
+}
+
+// TestURLErrorsHideCredentials: a refused URL is never echoed with its
+// userinfo, since callers log these errors.
+func TestURLErrorsHideCredentials(t *testing.T) {
+	in := fixtureIntent(t)
+	for _, u := range []string{
+		"https://user:s3cret-pw@gateway.example/child",
+		"http://user:s3cret-pw@127.0.0.1/child",
+		"http://user:s3cret-pw@[::1/child",
+		"ftp://user:s3cret-pw@gateway.example/child",
+	} {
+		_, err := e1.New(sendConfig(u), in, e1.Options{Token: tokenSource(t, false)})
+		if !errors.Is(err, e1.ErrConfig) || strings.Contains(err.Error(), "s3cret-pw") {
+			t.Errorf("%q: %v", u, err)
 		}
 	}
 }
