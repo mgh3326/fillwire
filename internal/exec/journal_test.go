@@ -150,3 +150,47 @@ func TestJournalRefusesSecondOpen(t *testing.T) {
 		t.Fatal("reopen after close lost the start record")
 	}
 }
+
+// acceptGW accepts every child and reports no working order.
+type acceptGW struct{ sends []exec.Child }
+
+func (g *acceptGW) Send(c exec.Child) (exec.Outcome, error) {
+	g.sends = append(g.sends, c)
+	return exec.Outcome{Key: c.Key, Status: exec.StatusAccepted}, nil
+}
+
+func (g *acceptGW) Query(string) (exec.View, error) { return exec.View{}, nil }
+
+// TestLegacySellAboveNotionalReplays: a journal written before sells were
+// held to max_notional_krw (testdata: a sell of 10 opened at the 70,400 ask,
+// 704,000 KRW against a 700,000 cap) still opens, and the next step amends
+// the order back within max_notional_krw instead of stepping from the ask.
+func TestLegacySellAboveNotionalReplays(t *testing.T) {
+	data, err := os.ReadFile("testdata/legacy_sell_above_notional.journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "exec.journal")
+	if err := os.WriteFile(path, data, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	j, st, err := exec.OpenJournal(path)
+	if err != nil {
+		t.Fatalf("legacy journal: %v", err)
+	}
+	t.Cleanup(func() { j.Close() })
+	if st.Order == nil || st.Order.Price != 70_400 || st.Intent.MaxNotionalKRW != 700_000 {
+		t.Fatalf("replayed order %+v max notional %d", st.Order, st.Intent.MaxNotionalKRW)
+	}
+	g := &acceptGW{}
+	e := exec.New(enabled(), j, st, g, &exec.KillSwitch{})
+	e.OnBook(exec.Top{Bid: 69_800, Ask: 70_400, AtNS: at(5), Synced: true})
+	if err := e.Tick(at(5)); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range g.sends {
+		got = append(got, describe(c))
+	}
+	equal(t, got, []string{"amend@70000x10"})
+}

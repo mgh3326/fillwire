@@ -228,20 +228,6 @@ func TestSellOpenHeldToMaxNotional(t *testing.T) {
 	r.step(5)
 	equal(t, r.actions(), []string{"submit@70000x10", "amend@69900x10"})
 	r.safe()
-
-	st, err := exec.Apply(exec.State{}, exec.Record{Kind: exec.RecStart, Intent: &in})
-	if err != nil {
-		t.Fatal(err)
-	}
-	submit := func(price int64) exec.Record {
-		return exec.Record{Kind: exec.RecSend, Child: &exec.Child{Action: exec.ActSubmit, IntentID: in.IntentID, Key: in.IntentID + ":1", Qty: 10, Price: price}}
-	}
-	if _, err := exec.Apply(st, submit(70_100)); !errors.Is(err, exec.ErrTransition) {
-		t.Fatalf("submit past max_notional_krw: err %v, want ErrTransition", err)
-	}
-	if _, err := exec.Apply(st, submit(70_000)); err != nil {
-		t.Fatalf("submit at max_notional_krw: %v", err)
-	}
 }
 
 // TestFutureBookBlocksSends: a book stamped ahead of the clock is no

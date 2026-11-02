@@ -224,9 +224,6 @@ func Apply(s State, r Record) (State, error) {
 			if c.Qty < 1 || c.Qty > s.Remaining() || c.Price < 1 || s.Intent.worse(c.Price, s.Cap) {
 				return bad("%s qty %d price %d outside remaining %d cap %d", c.Action, c.Qty, c.Price, s.Remaining(), s.Cap)
 			}
-			if c.Price > s.Intent.MaxNotionalKRW/c.Qty {
-				return bad("%s notional %d x %d beyond max_notional_krw %d", c.Action, c.Qty, c.Price, s.Intent.MaxNotionalKRW)
-			}
 			if (c.Action == ActSubmit) != (s.Order == nil) {
 				return bad("%s with order %v", c.Action, s.Order)
 			}
@@ -406,15 +403,17 @@ func decide(s State, in inputs) decision {
 			p = s.Cap
 		}
 		// A sell may open above Cap, where the whole remaining quantity
-		// could exceed max_notional_krw. Amends only move toward Cap, so
-		// bounding the opening price bounds the order.
+		// could exceed max_notional_krw: hold the price to notionalCeil.
 		p = min(p, s.Intent.notionalCeil(rem))
 		return send(Child{Action: ActSubmit, Qty: rem, Price: p}, "open")
 	}
 	if in.now-s.LastMoveNS < in.cfg.StepEvery.Nanoseconds() {
 		return decision{}
 	}
-	// stepToward stops at the cap, which the cancel above handles.
-	p := stepToward(s.Intent.Side, s.Order.Price, s.Cap)
+	// stepToward stops at the cap, which the cancel above handles. The
+	// notional bound is applied here too, not in Apply: a sell journaled
+	// above it before the bound existed must still replay, and its next
+	// step brings it back within max_notional_krw.
+	p := min(stepToward(s.Intent.Side, s.Order.Price, s.Cap), s.Intent.notionalCeil(rem))
 	return send(Child{Action: ActAmend, Qty: rem, Price: p}, "step")
 }
