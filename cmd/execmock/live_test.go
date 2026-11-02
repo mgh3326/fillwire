@@ -444,7 +444,11 @@ func TestCommandLiveDryRunUsesRedisWithoutTokens(t *testing.T) {
 	if code != 0 || hits.Load() != 0 || bookReads.Load() == 0 || strings.Count(out, `"dry_run":true`) != 2 {
 		t.Fatalf("code %d HTTP hits %d book reads %d error %s output %s", code, hits.Load(), bookReads.Load(), errs, out)
 	}
-	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d output lines, want exactly 2 (submit and cancel):\n%s", len(lines), out)
+	}
+	for i, line := range lines {
 		var envelope struct {
 			Body exec.Child `json:"body"`
 		}
