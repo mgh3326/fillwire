@@ -29,7 +29,9 @@ var ErrEventsClosed = errors.New("reader: KIS event stream closed unexpectedly")
 
 // Config selects a matched KIS endpoint/TR pair and a websocket transport.
 type Config struct {
-	Endpoint    string // live or mock
+	BookSymbols []string       // optional read-only subscriptions on this same session
+	OnBook      func(ws.Event) // must not block the fills reader
+	Endpoint    string         // live or mock
 	HTSID       string
 	Approval    ws.ApprovalKeyProvider
 	Dialer      ws.Dialer
@@ -179,6 +181,11 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		}
 		return err
 	}
+	for _, symbol := range r.cfg.BookSymbols {
+		if err := conn.Subscribe(ctx, "H0STASP0", symbol); err != nil && r.cfg.Logger != nil {
+			r.cfg.Logger.Warn("KIS book subscription unavailable; mock REST fallback remains active")
+		}
+	}
 	if r.cfg.Logger != nil {
 		r.cfg.Logger.Info("KIS websocket initial subscription active")
 	}
@@ -208,6 +215,12 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 					return nil
 				}
 				return reconnect.stoppedError()
+			}
+			if event.TR == "H0STASP0" {
+				if r.cfg.OnBook != nil {
+					r.cfg.OnBook(event)
+				}
+				continue
 			}
 			select {
 			case out <- event:

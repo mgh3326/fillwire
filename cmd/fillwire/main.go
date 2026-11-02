@@ -135,6 +135,16 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		})
 	}
 
+	bookEvent, stopBooks, err := startBooks(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer stopBooks()
+	var bookSymbols []string
+	if cfg.Books.Enabled {
+		bookSymbols = []string{cfg.Books.Symbol}
+	}
+
 	counters := decode.NewCounters()
 	decoder := decode.New(decode.Config{
 		AccountMode: cfg.KIS.AccountMode,
@@ -197,6 +207,8 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	go func() {
 		defer close(events)
 		readerDone <- reader.New(reader.Config{
+			BookSymbols: bookSymbols,
+			OnBook:      bookEvent,
 			Endpoint:    cfg.KIS.Endpoint,
 			HTSID:       cfg.KIS.HTSID,
 			Approval:    approval,

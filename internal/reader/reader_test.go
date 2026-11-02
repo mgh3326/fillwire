@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -768,4 +769,59 @@ func waitPending(t *testing.T, client *redis.Client, key, group string, want int
 	}
 	pending, err := client.XPending(context.Background(), key, group).Result()
 	t.Fatalf("pending = %+v, %v; want %d", pending, err, want)
+}
+
+func TestBookSubscriptionSharesExecutionSession(t *testing.T) {
+	data, err := os.ReadFile("../exec/sim/testdata/sim.evidence.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Raw string `json:"raw"`
+	}
+	if err := json.Unmarshal([]byte(strings.Split(string(data), "\n")[1]), &frame); err != nil {
+		t.Fatal(err)
+	}
+	transport := newFakeTransport(func(tr *fakeTransport, raw []byte) {
+		successfulSubscribe(tr, raw)
+		if bytes.Contains(raw, []byte("H0STASP0")) {
+			tr.push(frame.Raw)
+			tr.push(kisExecutionFrame)
+		}
+	})
+	cfg := readerConfig(transport, &fakeApproval{})
+	cfg.BookSymbols = []string{"005930"}
+	books := make(chan ws.Event, 1)
+	cfg.OnBook = func(ev ws.Event) { books <- ev }
+	var dials atomic.Int32
+	cfg.Dialer = ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { dials.Add(1); return transport, nil })
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	out := make(chan ws.Event, 2)
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, out) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case ev := <-books:
+		if ev.TR != "H0STASP0" {
+			t.Fatal("wrong book event")
+		}
+	case <-ctx.Done():
+		t.Fatal("book not routed")
+	}
+	select {
+	case ev := <-out:
+		if ev.TR != ws.TRExecutionLive {
+			t.Fatalf("book leaked to fills: %+v", ev)
+		}
+	case <-ctx.Done():
+		t.Fatal("fills not delivered")
+	}
+	if dials.Load() != 1 || transport.writes.Load() != 2 {
+		t.Fatalf("dials %d subscriptions %d", dials.Load(), transport.writes.Load())
+	}
 }

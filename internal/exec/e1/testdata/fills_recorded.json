@@ -1,0 +1,19 @@
+{
+  "intent_id": "3f2b6c1e-8a4d-4e5f-9a7b-1c2d3e4f5a6b",
+  "orders": [
+    {
+      "broker_order_id": "000123",
+      "cumulative_qty": 2,
+      "fills": [
+        {
+          "fill_id": "42",
+          "side": "buy",
+          "qty": 2,
+          "price": "70000.00000000",
+          "filled_at": "2026-11-02T00:00:01+00:00",
+          "committed_at": "2026-11-02T00:00:02+00:00"
+        }
+      ]
+    }
+  ]
+}

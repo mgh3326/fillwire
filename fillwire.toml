@@ -61,3 +61,9 @@ token_key = "toss:oauth:0000000000000000:access_token" # the cached token key; r
 stream_key = "quotes:toss" # must start with quotes:
 max_len = 100000 # XADD MAXLEN ~ N
 buffer = 1024 # at most 65536
+
+# Optional book snapshots on the existing KIS websocket; mock REST fallback.
+[books]
+enabled = false
+symbol = "005930"
+access_token_env = "KIS_MOCK_ACCESS_TOKEN"

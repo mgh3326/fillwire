@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 )
 
 // Child actions, as in E1's child request contract.
@@ -28,11 +29,12 @@ const (
 
 // Finish reasons.
 const (
-	DoneFilled   = "filled"
-	DoneCap      = "cap"
-	DoneDeadline = "deadline"
-	DoneKilled   = "killed"
-	DoneRefused  = "refused"
+	DoneFilled    = "filled"
+	DoneCap       = "cap"
+	DoneDeadline  = "deadline"
+	DoneKilled    = "killed"
+	DoneRefused   = "refused"
+	DoneStaleBook = "stale_book"
 	// DoneE1Caps: no order is working and E1's cumulative caps leave no room
 	// for a new one (exposure.go).
 	DoneE1Caps = "e1_caps"
@@ -98,14 +100,15 @@ const (
 // and it reads nothing but the state and the record, so replaying a journal
 // rebuilds the state exactly.
 type Record struct {
-	Kind    string   `json:"kind"`
-	AtNS    int64    `json:"at_ns"`
-	Intent  *Intent  `json:"intent,omitempty"`
-	Child   *Child   `json:"child,omitempty"`
-	Reason  string   `json:"reason,omitempty"`
-	Outcome *Outcome `json:"outcome,omitempty"`
-	View    *View    `json:"view,omitempty"`
-	Fill    *Fill    `json:"fill,omitempty"`
+	Kind        string   `json:"kind"`
+	DeferFinish bool     `json:"defer_finish,omitempty"`
+	AtNS        int64    `json:"at_ns"`
+	Intent      *Intent  `json:"intent,omitempty"`
+	Child       *Child   `json:"child,omitempty"`
+	Reason      string   `json:"reason,omitempty"`
+	Outcome     *Outcome `json:"outcome,omitempty"`
+	View        *View    `json:"view,omitempty"`
+	Fill        *Fill    `json:"fill,omitempty"`
 }
 
 // State is everything the executor knows about one intent.
@@ -249,7 +252,11 @@ func Apply(s State, r Record) (State, error) {
 		switch {
 		case o.Status == StatusAccepted && c.Action == ActCancel:
 			n.Order = nil
-			n.Done = s.InFlightReason
+			if r.DeferFinish {
+				n.Halt = s.InFlightReason
+			} else {
+				n.Done = s.InFlightReason
+			}
 		case o.Status == StatusAccepted && c.Action == ActSubmit:
 			n.Order = &Order{Key: c.Key, Price: c.Price, Qty: c.Qty}
 		case o.Status == StatusAccepted:
@@ -283,7 +290,11 @@ func Apply(s State, r Record) (State, error) {
 		}
 		n.BrokerFilled = max(s.BrokerFilled, v.FilledQty)
 		if s.InFlight != nil && s.InFlight.Action == ActCancel && n.Order == nil {
-			n.Done = s.InFlightReason
+			if r.DeferFinish {
+				n.Halt = s.InFlightReason
+			} else {
+				n.Done = s.InFlightReason
+			}
 		}
 		n.InFlight, n.InFlightStatus, n.InFlightReason = nil, "", ""
 	case RecFill:
@@ -377,6 +388,8 @@ func decide(s State, in inputs) decision {
 		closing = DoneKilled
 	case in.now >= s.Intent.ExpiresAt.UnixNano():
 		closing = DoneDeadline
+	case s.Order != nil && bookSilentSince(s, in) < in.now-int64(30*time.Second):
+		closing = DoneStaleBook
 	}
 	if closing != "" {
 		if s.Order != nil {
@@ -437,6 +450,15 @@ func decide(s State, in inputs) decision {
 		return finish(DoneE1Caps)
 	}
 	return send(Child{Action: ActSubmit, Qty: q, Price: p}, "open")
+}
+
+// A restart has no book. Count silence from the last order move until a
+// synced snapshot arrives; a future timestamp cannot postpone the stop.
+func bookSilentSince(s State, in inputs) int64 {
+	if in.top != nil && in.top.Synced && in.top.AtNS > 0 && in.top.AtNS <= in.now {
+		return in.top.AtNS
+	}
+	return s.LastMoveNS
 }
 
 // fitNewOrder sizes a new order lineage at price p to the room E1's caps

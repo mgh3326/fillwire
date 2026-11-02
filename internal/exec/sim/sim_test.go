@@ -177,7 +177,7 @@ func TestReplayFillRules(t *testing.T) {
 
 // TestOtherSymbolEventsAdvanceTheClock: after one 005930 book, only another
 // symbol's books arrive. Their times must still reach the executor, which
-// cancels at the deadline (35 s) without a fresh 005930 book.
+// cancels after 30 s of book silence, before the deadline (35 s).
 func TestOtherSymbolEventsAdvanceTheClock(t *testing.T) {
 	_, intents := load(t)
 	var buf bytes.Buffer
@@ -201,8 +201,8 @@ func TestOtherSymbolEventsAdvanceTheClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := res[0]; r.Done != exec.DoneDeadline || r.Sends != 2 || r.Filled != 0 {
-		t.Fatalf("got %+v, want submit then a deadline cancel", r)
+	if r := res[0]; r.Done != exec.DoneStaleBook || r.Sends != 2 || r.Filled != 0 {
+		t.Fatalf("got %+v, want submit then a stale-book cancel", r)
 	}
 }
 
