@@ -19,3 +19,7 @@ review_gate:
   land: graded
 fast_lane:
   max_changed_lines: 50
+
+deploy_approval:
+  - paths: ['internal/reader/**', 'internal/sink/**', 'internal/stream/**', 'deploy/**']
+    reason: Feed authorization, durable ledger writes or service enablement changes

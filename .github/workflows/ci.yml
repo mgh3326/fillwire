@@ -79,3 +79,10 @@ jobs:
           test -n "$DIGEST"
           echo "Pushed image: $IMAGE@$DIGEST"
           printf '%s\n' '### GHCR image' "- image: \`$IMAGE\`" "- digest: \`$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+  auto-tag-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/test-auto-tag.py
+      - run: python3 scripts/test-repair-release.py
