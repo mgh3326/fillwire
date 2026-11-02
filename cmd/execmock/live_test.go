@@ -12,11 +12,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	redisserver "github.com/alicebob/miniredis/v2/server"
 	"github.com/mgh3326/fillwire/internal/bookfeed"
 	"github.com/mgh3326/fillwire/internal/exec"
 	"github.com/mgh3326/fillwire/internal/exec/e1"
@@ -378,8 +380,6 @@ func TestLiveBookSilenceCancelsAndStops(t *testing.T) {
 
 func TestCommandLiveDryRunUsesRedisWithoutTokens(t *testing.T) {
 	m := miniredis.RunT(t)
-	r := redis.NewClient(&redis.Options{Addr: m.Addr()})
-	defer r.Close()
 	file, err := os.Open("../../internal/bookfeed/testdata/stream.jsonl")
 	if err != nil {
 		t.Fatal(err)
@@ -391,15 +391,45 @@ func TestCommandLiveDryRunUsesRedisWithoutTokens(t *testing.T) {
 	if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
-	row.Values["ts_exchange"] = now.Format(time.RFC3339Nano)
-	row.Values["ts_received"] = now.Format(time.RFC3339Nano)
-	if err := r.XAdd(context.Background(), &redis.XAddArgs{Stream: "book:kis:005930", Values: row.Values}).Err(); err != nil {
+	template, err := bookfeed.Decode(row.Values)
+	if err != nil {
 		t.Fatal(err)
 	}
+	var bookReads atomic.Int64
+	// Deliver the recorded book with current timestamps when the command reads
+	// it, so journal startup time cannot make the fixture stale.
+	m.Server().SetPreHook(func(peer *redisserver.Peer, command string, args ...string) bool {
+		if command != "XREVRANGE" || len(args) == 0 || args[0] != "book:kis:"+template.Symbol {
+			return false
+		}
+		bookReads.Add(1)
+		snapshot := template
+		snapshot.Exchange = time.Now()
+		snapshot.Received = snapshot.Exchange
+		var values []string
+		for key, value := range snapshot.Values() {
+			values = append(values, key, value.(string))
+		}
+		if _, err := m.XAdd(args[0], "*", values); err != nil {
+			peer.WriteError("fixture snapshot unavailable")
+			return true
+		}
+		return false
+	})
 	t.Setenv("EXECMOCK_TEST_REDIS_URL", "redis://"+m.Addr())
+	t.Setenv("UNSET_GATEWAY_TOKEN", "")
 	in := liveIntent(t)
-	in.ExpiresAt = now.Add(time.Minute)
+	if in.Symbol != template.Symbol {
+		t.Fatal("intent and book fixture symbols differ")
+	}
+	// End through the price cap, not a 10ms wall-clock window that can expire
+	// before the journal fsync completes. Keep safety limits past the test deadline.
+	runFor := time.Hour
+	if deadline, ok := t.Deadline(); ok {
+		runFor = time.Until(deadline) + time.Minute
+	}
+	in.ExpiresAt = time.Now().Add(runFor)
+	in.LimitPriceKRW = template.Bids[0].Price
 	data, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -410,9 +440,20 @@ func TestCommandLiveDryRunUsesRedisWithoutTokens(t *testing.T) {
 	}
 	server, hits := e1Server(t)
 	cfg := writeConfig(t, "[e1]\naccount = \"kis_mock\"\nurl = "+strconvQuote(server.URL+"/execution-intents/children")+"\ntoken_env = \"UNSET_GATEWAY_TOKEN\"\n[redis]\nurl_env = \"EXECMOCK_TEST_REDIS_URL\"\n")
-	code, out, errs := execmock("-config", cfg, "-intent", intentPath, "-live-book", "-dry-run", "-duration", "10ms")
-	if code != 0 || hits.Load() != 0 || strings.Count(out, `"dry_run":true`) != 2 {
-		t.Fatalf("code %d hits %d error %s output %s", code, hits.Load(), errs, out)
+	code, out, errs := execmock("-config", cfg, "-intent", intentPath, "-live-book", "-dry-run", "-duration", runFor.String(), "-step", "1ns")
+	if code != 0 || hits.Load() != 0 || bookReads.Load() == 0 || strings.Count(out, `"dry_run":true`) != 2 {
+		t.Fatalf("code %d HTTP hits %d book reads %d error %s output %s", code, hits.Load(), bookReads.Load(), errs, out)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var envelope struct {
+			Body exec.Child `json:"body"`
+		}
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{exec.ActSubmit, exec.ActCancel}[i]; envelope.Body.Action != want {
+			t.Fatalf("body %d action=%q, want %q", i, envelope.Body.Action, want)
+		}
 	}
 }
 
