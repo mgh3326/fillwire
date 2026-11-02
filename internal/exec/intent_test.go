@@ -1,6 +1,7 @@
 package exec_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -97,5 +98,18 @@ func TestTickGrid(t *testing.T) {
 		if f, cl := exec.FloorTick(c.p), exec.CeilTick(c.p); f != c.floor || cl != c.ceil {
 			t.Errorf("%d: floor %d ceil %d, want %d %d", c.p, f, cl, c.floor, c.ceil)
 		}
+	}
+}
+
+func TestParseIntentRefusesTrailingData(t *testing.T) {
+	base, _ := os.ReadFile("testdata/e1_intent.json")
+	base = bytes.TrimRight(base, " \t\r\n")
+	for _, tail := range []string{"}", "]", "{}", "x", " {}"} {
+		if _, err := exec.ParseIntent(append(slices.Clone(base), tail...)); !errors.Is(err, exec.ErrIntent) {
+			t.Errorf("tail %q: err %v, want ErrIntent", tail, err)
+		}
+	}
+	if _, err := exec.ParseIntent(append(slices.Clone(base), "\n  \n"...)); err != nil {
+		t.Errorf("trailing whitespace: %v", err)
 	}
 }

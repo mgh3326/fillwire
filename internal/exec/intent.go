@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"time"
 )
@@ -82,7 +83,7 @@ func ParseIntent(data []byte) (Intent, error) {
 	if err := dec.Decode(&in); err != nil {
 		return Intent{}, fmt.Errorf("%w: %v", ErrIntent, err)
 	}
-	if dec.More() {
+	if _, err := dec.Token(); err != io.EOF {
 		return Intent{}, fmt.Errorf("%w: trailing data", ErrIntent)
 	}
 	return in, in.Validate()
@@ -146,6 +147,15 @@ func (in Intent) Validate() error {
 	return nil
 }
 
+// clone copies the one pointer field so no State aliases a caller's value.
+func (in Intent) clone() Intent {
+	if in.ModelVersion != nil {
+		v := *in.ModelVersion
+		in.ModelVersion = &v
+	}
+	return in
+}
+
 // Cap is the worst price the executor may ever send: limit_price_krw moved
 // onto the tick grid in the side's favour. E1 would accept up to
 // max_slippage_bps beyond the limit; the executor never uses that room.
@@ -158,7 +168,9 @@ func (in Intent) Cap() int64 {
 
 // TargetQty is the quantity the executor works: max_quantity, cut so the
 // whole quantity at Cap stays within max_notional_krw and the inventory
-// range. Because no send is priced beyond Cap, no send can exceed either.
+// range. No buy is priced above Cap, so no buy can exceed either; a sell may
+// be priced above Cap, so its price is also held to the notional room E1
+// leaves (State.fitNewOrder).
 func (in Intent) TargetQty() int64 {
 	q := in.MaxQuantity
 	if c := in.Cap(); c > 0 {

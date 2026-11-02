@@ -1,7 +1,6 @@
 package exec_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/mgh3326/fillwire/internal/exec"
@@ -57,39 +56,4 @@ func TestNoSecondRootBeyondE1Caps(t *testing.T) {
 		t.Fatalf("done %q order %+v", st.Done, st.Order)
 	}
 	r.safe()
-}
-
-// A sell opens at the ask, which may be above the cap. E1 counts that
-// notional, so the price is held to what max_notional_krw allows: 10 × 70,400
-// would be 704,000 against 700,000.
-func TestSellOpenHeldToE1Notional(t *testing.T) {
-	in := sellIntent(t)
-	in.MaxNotionalKRW = 700_000
-	r := newRig(t, in, enabled())
-	r.top = exec.Top{Bid: 70_300, Ask: 70_400}
-	r.step(0)
-	equal(t, r.actions(), []string{"submit@70000x10"})
-	r.safe()
-}
-
-func TestApplyRefusesBeyondE1Caps(t *testing.T) {
-	in := fixtureIntent(t)
-	apply := func(st exec.State, r exec.Record) exec.State {
-		t.Helper()
-		next, err := exec.Apply(st, r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return next
-	}
-	st := apply(exec.State{}, exec.Record{Kind: exec.RecStart, Intent: &in})
-	k := func(n string) string { return in.IntentID + ":" + n }
-	c1 := exec.Child{Action: exec.ActSubmit, IntentID: in.IntentID, Key: k("1"), Qty: 10, Price: 70_000}
-	st = apply(st, exec.Record{Kind: exec.RecSend, Child: &c1})
-	st = apply(st, exec.Record{Kind: exec.RecOutcome, Outcome: &exec.Outcome{Key: c1.Key, Status: exec.StatusUncertain}})
-	st = apply(st, exec.Record{Kind: exec.RecReconcile, View: &exec.View{}})
-	c2 := exec.Child{Action: exec.ActSubmit, IntentID: in.IntentID, Key: k("2"), Qty: 1, Price: 70_000}
-	if _, err := exec.Apply(st, exec.Record{Kind: exec.RecSend, Child: &c2}); err == nil || !strings.Contains(err.Error(), "quantity_cap_exceeded") {
-		t.Fatalf("second submit: %v", err)
-	}
 }

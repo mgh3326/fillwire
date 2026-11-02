@@ -166,6 +166,7 @@ func (s State) sentKey(key string) (Child, bool) {
 
 func (s State) clone() State {
 	c := s
+	c.Intent = s.Intent.clone()
 	c.Fills = maps.Clone(s.Fills)
 	c.Sent = slices.Clone(s.Sent)
 	if s.Order != nil {
@@ -202,7 +203,7 @@ func Apply(s State, r Record) (State, error) {
 		if err := r.Intent.Validate(); err != nil {
 			return bad("%v", err)
 		}
-		n = State{Intent: *r.Intent, Cap: r.Intent.Cap(), Target: r.Intent.TargetQty(), Fills: map[string]Fill{}}
+		n = State{Intent: r.Intent.clone(), Cap: r.Intent.Cap(), Target: r.Intent.TargetQty(), Fills: map[string]Fill{}}
 	case RecSend:
 		c := r.Child
 		switch {
@@ -228,9 +229,6 @@ func Apply(s State, r Record) (State, error) {
 			}
 			if (c.Action == ActSubmit) != (s.Order == nil) {
 				return bad("%s with order %v", c.Action, s.Order)
-			}
-			if why := s.e1CapsRefusal(*c); why != "" {
-				return bad("%s qty %d price %d: E1 would refuse: %s", c.Action, c.Qty, c.Price, why)
 			}
 			n.LastMoveNS = r.AtNS
 		case ActCancel:
@@ -390,48 +388,61 @@ func decide(s State, in inputs) decision {
 	if rem < 1 {
 		return decision{} // the broker reports fills the ledger has not shown yet
 	}
+	var step Child
+	if s.Order != nil {
+		if in.now-s.LastMoveNS < in.cfg.StepEvery.Nanoseconds() {
+			return decision{}
+		}
+		// The order rested a full step. An amend never grows it and never
+		// leaves E1's room (exposure.go). The cancels below need no fresh
+		// book, like every cancel.
+		q := rem
+		if s.Order.Qty > 0 {
+			q = min(q, s.Order.Qty)
+		}
+		qRoom, nRoom := s.e1Room(s.rootOf(s.Order.Key))
+		q = min(q, qRoom)
+		cp := s.Cap
+		if s.Intent.Side == Buy && q > 0 {
+			cp = min(cp, FloorTick(nRoom/q))
+		}
+		if q < 1 || !s.Intent.worse(cp, s.Order.Price) {
+			return send(Child{Action: ActCancel}, DoneCap)
+		}
+		step = Child{Action: ActAmend, TargetKey: s.Order.Key, Qty: q, Price: stepToward(s.Intent.Side, s.Order.Price, cp)}
+		// A lineage already past E1's caps cannot be amended at all: E1
+		// counts its high-water mark. Only a journal written before the
+		// executor mirrored E1 holds one (a sell opened above
+		// max_notional_krw); it still replays, and its order is cancelled.
+		if s.E1CapsRefusal(step) != "" {
+			return send(Child{Action: ActCancel}, DoneE1Caps)
+		}
+	}
 	t := in.top
-	if t == nil || !t.Synced || in.now-t.AtNS > in.cfg.StaleAfter.Nanoseconds() || t.Bid < 1 || t.Ask < 1 {
-		return decision{} // stale book: no new send
+	if t == nil || !t.Synced || t.AtNS > in.now || in.now-t.AtNS > in.cfg.StaleAfter.Nanoseconds() || t.Bid < 1 || t.Ask < 1 {
+		return decision{} // stale or future-stamped book: no new send
 	}
-	if s.Order == nil {
-		p := t.Bid
-		if s.Intent.Side == Sell {
-			p = t.Ask
-		}
-		if s.Intent.worse(p, s.Cap) {
-			p = s.Cap
-		}
-		q, p := s.fitNewOrder(rem, p)
-		if q < 1 {
-			return finish(DoneE1Caps)
-		}
-		return send(Child{Action: ActSubmit, Qty: q, Price: p}, "open")
+	if s.Order != nil {
+		return send(Child{Action: ActAmend, Qty: step.Qty, Price: step.Price}, "step")
 	}
-	if in.now-s.LastMoveNS < in.cfg.StepEvery.Nanoseconds() {
-		return decision{}
+	p := t.Bid
+	if s.Intent.Side == Sell {
+		p = t.Ask
 	}
-	// An amend never grows the order and never leaves E1's room.
-	q := rem
-	if s.Order.Qty > 0 {
-		q = min(q, s.Order.Qty)
+	if s.Intent.worse(p, s.Cap) {
+		p = s.Cap
 	}
-	qRoom, nRoom := s.e1Room(s.rootOf(s.Order.Key))
-	q = min(q, qRoom)
-	cp := s.Cap
-	if s.Intent.Side == Buy && q > 0 {
-		cp = min(cp, FloorTick(nRoom/q))
+	q, p := s.fitNewOrder(rem, p)
+	if q < 1 {
+		return finish(DoneE1Caps)
 	}
-	if q < 1 || !s.Intent.worse(cp, s.Order.Price) {
-		return send(Child{Action: ActCancel}, DoneCap)
-	}
-	p := stepToward(s.Intent.Side, s.Order.Price, cp)
-	return send(Child{Action: ActAmend, Qty: q, Price: p}, "step")
+	return send(Child{Action: ActSubmit, Qty: q, Price: p}, "open")
 }
 
 // fitNewOrder sizes a new order lineage at price p to the room E1's caps
-// leave (exposure.go). A buy keeps its price and loses quantity. A sell first
-// gives up price, down to the cap, then quantity. q < 1 means nothing fits.
+// leave (exposure.go). A buy keeps its price and loses quantity. A sell may
+// open above Cap, so it first gives up price, down to Cap, to stay within
+// max_notional_krw, then quantity. q < 1 means nothing fits.
 func (s State) fitNewOrder(rem, p int64) (q, price int64) {
 	qRoom, nRoom := s.e1Room("") // a new lineage has no high-water mark yet
 	q = min(rem, qRoom)

@@ -15,8 +15,9 @@ package exec
 // The sums over lineages must stay within max_quantity and max_notional_krw,
 // and the position projected from the summed quantity must stay inside the
 // inventory range. The executor mirrors this so it never sends a child that
-// E1 would refuse for caps: decide sizes a send to the room left, and Apply
-// refuses a send that does not fit.
+// E1 would refuse for caps: decide sizes a send to the room left, and the
+// executor refuses to journal a send that does not fit (Executor.commit).
+// Apply does not check it, so a journal written before the mirror replays.
 //
 // E1 skips refused children; the executor counts every child it sent. The
 // two agree on every child the executor can still send: a refused submit or
@@ -84,9 +85,9 @@ func (s State) e1Room(root string) (qty, notional int64) {
 	return max(limit-others.qty, 0), max(in.MaxNotionalKRW-others.notional, 0)
 }
 
-// e1CapsRefusal is the reason E1 would refuse submit or amend c for caps, in
+// E1CapsRefusal is the reason E1 would refuse submit or amend c for caps, in
 // E1's order of checks, or "" if c fits.
-func (s State) e1CapsRefusal(c Child) string {
+func (s State) E1CapsRefusal(c Child) string {
 	exp := s.e1Exposure()
 	root := c.Key
 	if c.Action == ActAmend {

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 
@@ -205,9 +204,11 @@ func hasCase(name string, n int, at func(int) string) bool {
 	return false
 }
 
-// TestContractCapsMatchE1 applies the children E1 decided through exec.Apply
-// and checks that the executor allows exactly the children E1 allowed, and
-// refuses the rest for the same cap.
+// TestContractCapsMatchE1 checks each child E1 decided against the
+// executor's mirror of E1's caps (State.E1CapsRefusal, which the executor
+// checks before it journals a send): the mirror allows exactly the children
+// E1 allowed, and refuses the rest for the same cap. Each allowed child is
+// then applied, so the next one is checked against the same history.
 func TestContractCapsMatchE1(t *testing.T) {
 	n := 0
 	for _, s := range recorded(t) {
@@ -232,13 +233,17 @@ func TestContractCapsMatchE1(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				next, err := exec.Apply(st, exec.Record{Kind: exec.RecSend, Child: &c})
+				why := st.E1CapsRefusal(c)
 				if o.Status == exec.StatusRefused {
-					if err == nil || !strings.Contains(err.Error(), *o.Reason) {
-						t.Fatalf("step %d: E1 refused %s; Apply: %v", i+1, *o.Reason, err)
+					if why != *o.Reason {
+						t.Fatalf("step %d: E1 refused %s; mirror: %q", i+1, *o.Reason, why)
 					}
 					continue
 				}
+				if why != "" {
+					t.Fatalf("step %d: E1 %s; mirror refused: %s", i+1, o.Status, why)
+				}
+				next, err := exec.Apply(st, exec.Record{Kind: exec.RecSend, Child: &c})
 				if err != nil {
 					t.Fatalf("step %d: E1 %s; Apply refused: %v", i+1, o.Status, err)
 				}

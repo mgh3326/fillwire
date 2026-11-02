@@ -10,7 +10,8 @@ import (
 // Config holds the executor's knobs. The zero value sends nothing.
 type Config struct {
 	// SendEnabled must be set explicitly; when false the executor sends no
-	// child request of any kind.
+	// child request of any kind, cancels included. It still reconciles and
+	// records fills, and finishes only as filled with no order working.
 	SendEnabled bool
 	// StepEvery is how long an order rests at one price before it moves one
 	// tick toward the cap.
@@ -36,7 +37,8 @@ type Gateway interface {
 
 // KillSwitch is the global kill: while engaged the executor sends no submit
 // or amend, and cancels its working order (E1 keeps cancels allowed while
-// submissions are blocked).
+// submissions are blocked). With SendEnabled false the executor sends no
+// cancel either: a working order is left to E1's own kill.
 type KillSwitch struct{ engaged atomic.Bool }
 
 // Engage turns the kill on; Release turns it off.
@@ -130,7 +132,9 @@ func (e *Executor) Tick(nowNS int64) error {
 				return err
 			}
 			if d.rec.Kind == RecSend {
-				e.send(*d.rec.Child, nowNS)
+				if err := e.send(*d.rec.Child, nowNS); err != nil {
+					return err
+				}
 			}
 		default:
 			return nil
@@ -140,8 +144,9 @@ func (e *Executor) Tick(nowNS int64) error {
 }
 
 // send calls the gateway for a child already journaled as in flight and
-// journals the answer. A transport error is journaled as uncertain.
-func (e *Executor) send(c Child, nowNS int64) {
+// journals the answer; a journal failure is returned (and halts). A transport
+// error is journaled as uncertain.
+func (e *Executor) send(c Child, nowNS int64) error {
 	out, err := e.gw.Send(c)
 	if err != nil {
 		out = Outcome{Key: c.Key, Status: StatusUncertain, Reason: "transport: " + err.Error()}
@@ -149,13 +154,22 @@ func (e *Executor) send(c Child, nowNS int64) {
 	if out.Key != c.Key {
 		out = Outcome{Key: c.Key, Status: StatusUncertain, Reason: fmt.Sprintf("answer for key %q", out.Key)}
 	}
-	_ = e.commit(Record{Kind: RecOutcome, AtNS: nowNS, Outcome: &out}) // a failure halts via e.err
+	return e.commit(Record{Kind: RecOutcome, AtNS: nowNS, Outcome: &out})
 }
 
 // commit applies r, journals it, and only then makes it the current state.
+// It refuses a submit or amend that E1 would refuse for caps: decide sizes
+// every send to E1's room, so this is the backstop. The check lives here, not
+// in Apply, because commit sees only new records, and a journal written
+// before the executor mirrored E1 must still replay.
 func (e *Executor) commit(r Record) error {
 	if e.err != nil {
 		return e.err
+	}
+	if c := r.Child; r.Kind == RecSend && c != nil && (c.Action == ActSubmit || c.Action == ActAmend) {
+		if why := e.state.E1CapsRefusal(*c); why != "" {
+			return fmt.Errorf("exec: %s qty %d price %d not sent: E1 would refuse: %s", c.Action, c.Qty, c.Price, why)
+		}
 	}
 	next, err := Apply(e.state, r)
 	if err != nil {
