@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -97,7 +98,8 @@ type Config struct {
 	// DryRun writes requests instead of sending them. It wins over
 	// SendEnabled.
 	DryRun bool
-	// URL is the gateway's child request endpoint (http or https).
+	// URL is the gateway's child request endpoint: https, or http to a
+	// loopback host only, since each request carries the gateway token.
 	URL string
 	// TokenHeader names the header the token travels in; empty means
 	// DefaultTokenHeader.
@@ -209,12 +211,34 @@ func New(cfg Config, in exec.Intent, opt Options) (*Client, error) {
 	return c, nil
 }
 
+// checkURL accepts an https URL, or an http URL whose host is loopback
+// (localhost, 127.0.0.0/8, ::1). Every request carries the gateway token, so
+// plain http to any other host would hand it to whatever is on the path. A
+// URL with credentials in it is refused too: the token header is the only
+// credential.
 func checkURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Opaque != "" {
+		return "", fmt.Errorf("%w: url %q", ErrConfig, raw)
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !loopback(u.Hostname()) {
+			return "", fmt.Errorf("%w: url %q: http only to a loopback host; use https", ErrConfig, raw)
+		}
+	default:
 		return "", fmt.Errorf("%w: url %q", ErrConfig, raw)
 	}
 	return u.String(), nil
+}
+
+func loopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Mode reports the client's mode.

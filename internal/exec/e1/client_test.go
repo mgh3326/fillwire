@@ -365,6 +365,43 @@ func TestSendModeNeedsURLAndToken(t *testing.T) {
 	}
 }
 
+// TestTokenTravelsOnlyOverTLSOrLoopback: every request carries the gateway
+// token, so New refuses plain http to any host but loopback, and a URL with
+// credentials in it, before it reads the token.
+func TestTokenTravelsOnlyOverTLSOrLoopback(t *testing.T) {
+	in := fixtureIntent(t)
+	for _, u := range []string{
+		"http://gateway.example/child",
+		"http://10.0.0.5:8000/child",
+		"http://192.168.0.10/child",
+		"http://localhost.example/child",
+		"http://127.0.0.1.example/child",
+		"http://[::ffff:10.0.0.5]/child",
+		"http://0.0.0.0:8000/child",
+		"https://user:pass@gateway.example/child",
+		"http://user@127.0.0.1/child",
+		"https:///child",
+		"https:gateway.example/child",
+	} {
+		for _, cfg := range []e1.Config{sendConfig(u), {Account: e1.MockAccount, DryRun: true, URL: u}} {
+			if _, err := e1.New(cfg, in, e1.Options{Token: tokenSource(t, false), Log: io.Discard}); !errors.Is(err, e1.ErrConfig) {
+				t.Errorf("%s (dry run %v): %v", u, cfg.DryRun, err)
+			}
+		}
+	}
+	for _, u := range []string{
+		"https://gateway.example/child",
+		"http://127.0.0.1:8000/child",
+		"http://127.0.0.2/child",
+		"http://localhost:8000/child",
+		"http://[::1]:8000/child",
+	} {
+		if _, err := e1.New(sendConfig(u), in, e1.Options{Token: tokenSource(t, true)}); err != nil {
+			t.Errorf("%s: %v", u, err)
+		}
+	}
+}
+
 func TestRedirectIsNotFollowed(t *testing.T) {
 	in := fixtureIntent(t)
 	elsewhere := newServer(t, nil)

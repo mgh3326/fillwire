@@ -39,6 +39,7 @@ X-Execution-Intent-Confirm: <idempotency_key of this body>
 {"action":"submit","intent_id":"<uuid>","idempotency_key":"<uuid>:1","quantity":10,"limit_price_krw":70000}
 ```
 
+- **URL:** `https`, or `http` to a loopback host only (`localhost`, `127.0.0.0/8` or `::1`), because every request carries the token. A URL with credentials in it is refused. The client never follows a redirect.
 - **Body:** exactly one E1 child request: submit, amend or cancel, with E1's field names and no other field. Keys are `<intent_id>:<n>`, which matches E1's key pattern.
 - **Auth:** a shared token in the header that `token_header` names. The default is `X-Execution-Intent-Gateway-Token`. The client reads the token only in send mode, and `execmock` never reads one in this build.
 - **Per-action confirm:** the route passes `confirm=True` to `IntentGateway.handle` only when `X-Execution-Intent-Confirm` equals the body's `idempotency_key`. A missing or different value means `confirm=False`, and E1 answers `confirm_required`.
@@ -63,7 +64,7 @@ E1 has no reconcile query, so `Query` always fails. An unknown outcome holds the
 
 E2 mirrors E1's cumulative rule, `decisions.py` `_exposure_by_order` and `_caps_refusal`, in `internal/exec/exposure.go`. Each order lineage counts at its high-water quantity and notional. Every child sent counts, and a cancel frees nothing.
 
-E2 sizes a new order to the room left. If none is left, the intent finishes `e1_caps`. In practice, a second order after an unknown first one finishes the intent, because E1 refuses it anyway.
+E2 sizes a new order to the room left. If none is left, the intent finishes `e1_caps`. In practice, a second order after an unknown first one finishes the intent, because E1 refuses it anyway. An amend E1 would refuse cancels the order and finishes `e1_caps`. The executor checks every submit and amend against the mirror before it journals the send. Replay does not check, so a journal written before the mirror still opens.
 
 ## Preconditions for the mock run
 
