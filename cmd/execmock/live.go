@@ -118,6 +118,14 @@ type liveInputs struct {
 }
 
 func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry bool, until time.Time, in liveInputs) error {
+	interrupt := func() error {
+		kill.Engage()
+		if err := e.Tick(in.Now().UnixNano()); err != nil {
+			return err
+		}
+		return errors.New("execmock: interrupted; verify terminal broker/ledger evidence before restarting")
+	}
+
 	step := func() error {
 		pollCtx, cancelPoll := context.WithTimeout(ctx, 5*time.Second)
 		defer cancelPoll()
@@ -146,6 +154,9 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 			return e.Tick(now.UnixNano())
 		}
 		if err := step(); err != nil {
+			if ctx.Err() != nil {
+				return interrupt()
+			}
 			return err
 		}
 		if e.State().Done != "" {
@@ -153,11 +164,7 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 		}
 		select {
 		case <-ctx.Done():
-			kill.Engage()
-			if err := e.Tick(in.Now().UnixNano()); err != nil {
-				return err
-			}
-			return errors.New("execmock: interrupted; verify terminal broker/ledger evidence before restarting")
+			return interrupt()
 		case _, ok := <-in.Ticks:
 			if !ok {
 				return errors.New("execmock: clock stopped")

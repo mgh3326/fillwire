@@ -413,3 +413,59 @@ func TestCommandLiveDryRunUsesRedisWithoutTokens(t *testing.T) {
 		t.Fatalf("code %d hits %d error %s output %s", code, hits.Load(), errs, out)
 	}
 }
+
+func TestInterruptDuringReadCancelsWorkingOrder(t *testing.T) {
+	for _, stage := range []string{"ledger", "broker", "book"} {
+		for _, interrupted := range []bool{true, false} {
+			name := stage + map[bool]string{true: "/interrupt", false: "/ordinary_error"}[interrupted]
+			t.Run(name, func(t *testing.T) {
+				in := liveIntent(t)
+				start := in.ExpiresAt.Add(-35 * time.Second)
+				gateway := exectest.New(in)
+				e, kill := liveExecutor(t, in, numericGateway{gateway}, true)
+				e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: start.UnixNano(), Synced: true})
+				if err := e.Tick(start.UnixNano()); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				readError := errors.New("read interrupted") // HTTP readers may hide context.Canceled.
+				failRead := func() error {
+					if interrupted {
+						cancel()
+					}
+					return readError
+				}
+				inputs := liveInputs{
+					Now: func() time.Time { return start.Add(time.Second) },
+					Ledger: func(context.Context) (e1.FillsSnapshot, error) {
+						if stage == "ledger" {
+							return e1.FillsSnapshot{}, failRead()
+						}
+						return e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{{BrokerOrderID: "123", Fills: []e1.LedgerFill{}}}}, nil
+					},
+					Broker: func(context.Context, exec.BrokerOrder) (brokerView, error) {
+						if stage == "broker" {
+							return brokerView{}, failRead()
+						}
+						return brokerView{}, nil
+					},
+					Book: func(context.Context) (bookfeed.Snapshot, bool, error) { return bookfeed.Snapshot{}, false, failRead() },
+				}
+				err := driveLive(ctx, e, kill, false, time.Time{}, inputs)
+				if !interrupted {
+					if !errors.Is(err, readError) || kill.Engaged() || len(gateway.Sends) != 1 {
+						t.Fatalf("ordinary read error changed shutdown behavior: kill=%v sends=%+v err=%v", kill.Engaged(), gateway.Sends, err)
+					}
+					return
+				}
+				if !kill.Engaged() || len(gateway.Sends) != 2 || gateway.Sends[1].Action != exec.ActCancel {
+					t.Fatalf("interrupt during %s: kill=%v sends=%+v; want kill and submit followed by cancel", stage, kill.Engaged(), gateway.Sends)
+				}
+				if err == nil || !strings.Contains(err.Error(), "interrupted;") || e.State().Done != "" {
+					t.Fatalf("interrupt claimed clean completion: state=%+v err=%v", e.State(), err)
+				}
+			})
+		}
+	}
+}
