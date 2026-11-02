@@ -65,7 +65,7 @@ func Run(evidence []byte, intents []exec.Intent, cfg exec.Config, rule Rule) ([]
 	defer os.RemoveAll(dir)
 	out := make([]Result, 0, len(intents))
 	for i, in := range intents {
-		r, err := runOne(evidence, in, cfg, rule, filepath.Join(dir, fmt.Sprintf("%d.journal", i)))
+		r, err := RunOne(evidence, in, cfg, rule, filepath.Join(dir, fmt.Sprintf("%d.journal", i)), nil)
 		if err != nil {
 			return nil, fmt.Errorf("sim: intent %s: %w", in.IntentID, err)
 		}
@@ -74,14 +74,27 @@ func Run(evidence []byte, intents []exec.Intent, cfg exec.Config, rule Rule) ([]
 	return out, nil
 }
 
-func runOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path string) (Result, error) {
+// RunOne replays evidence for one intent with its journal at path. The fake
+// gateway answers every child request and decides fills; wrap, if not nil,
+// returns the gateway the executor sends through, which must reach the fake
+// (e1's dry-run client does, through its simulated answer).
+func RunOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path string, wrap func(*exectest.Gateway) (exec.Gateway, error)) (Result, error) {
+	if rule != Through && rule != Touch {
+		return Result{}, fmt.Errorf("sim: unknown rule %q", rule)
+	}
 	j, st, err := exec.OpenJournal(path)
 	if err != nil {
 		return Result{}, err
 	}
 	defer j.Close()
 	g := exectest.New(in)
-	e := exec.New(cfg, j, st, g, &exec.KillSwitch{})
+	var gw exec.Gateway = g
+	if wrap != nil {
+		if gw, err = wrap(g); err != nil {
+			return Result{}, err
+		}
+	}
+	e := exec.New(cfg, j, st, gw, &exec.KillSwitch{})
 	started := false
 	var mid float64
 	var top exec.Top

@@ -120,8 +120,10 @@ func TestFaultProcessKillAndRestart(t *testing.T) {
 		wantAfter []string
 		wantPrice int64
 	}{
+		// E1 counts the journaled submit against the caps even though it
+		// never reached the broker, so no second submit fits (exposure.go).
 		{"kill before the submit reaches the broker", func(r *rig) { r.g.KillBefore = true }, 0,
-			[]string{"submit@70000x10", "submit@70000x10"}, 70_000},
+			[]string{"submit@70000x10"}, 0},
 		{"kill after the submit reached the broker", func(r *rig) { r.g.KillAfter = true }, 0,
 			[]string{"submit@70000x10"}, 70_000},
 		{"kill before the amend reaches the broker", func(r *rig) { r.step(0); r.g.KillBefore = true }, 5,
@@ -143,8 +145,14 @@ func TestFaultProcessKillAndRestart(t *testing.T) {
 			}
 			r.book(c.killAt+0.5, 70_000, 70_400)
 			r.e.Tick(at(c.killAt + 0.5))
-			if st := r.e.State(); st.InFlight != nil || st.Order == nil || st.Order.Price != c.wantPrice {
-				t.Fatalf("after restart: in flight %+v order %+v", st.InFlight, st.Order)
+			st = r.e.State()
+			switch {
+			case st.InFlight != nil:
+				t.Fatalf("after restart: in flight %+v", st.InFlight)
+			case c.wantPrice == 0 && (st.Order != nil || st.Done != exec.DoneE1Caps):
+				t.Fatalf("after restart: order %+v done %q, want no order and %q", st.Order, st.Done, exec.DoneE1Caps)
+			case c.wantPrice != 0 && (st.Order == nil || st.Order.Price != c.wantPrice):
+				t.Fatalf("after restart: order %+v", st.Order)
 			}
 			equal(t, r.actions(), c.wantAfter)
 			r.safe()

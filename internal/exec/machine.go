@@ -33,6 +33,9 @@ const (
 	DoneDeadline = "deadline"
 	DoneKilled   = "killed"
 	DoneRefused  = "refused"
+	// DoneE1Caps: no order is working and E1's cumulative caps leave no room
+	// for a new one (exposure.go).
+	DoneE1Caps = "e1_caps"
 )
 
 // Child is one child request. Targets are named by idempotency key, never by
@@ -226,6 +229,9 @@ func Apply(s State, r Record) (State, error) {
 			if (c.Action == ActSubmit) != (s.Order == nil) {
 				return bad("%s with order %v", c.Action, s.Order)
 			}
+			if why := s.e1CapsRefusal(*c); why != "" {
+				return bad("%s qty %d price %d: E1 would refuse: %s", c.Action, c.Qty, c.Price, why)
+			}
 			n.LastMoveNS = r.AtNS
 		case ActCancel:
 		default:
@@ -396,14 +402,52 @@ func decide(s State, in inputs) decision {
 		if s.Intent.worse(p, s.Cap) {
 			p = s.Cap
 		}
-		return send(Child{Action: ActSubmit, Qty: rem, Price: p}, "open")
+		q, p := s.fitNewOrder(rem, p)
+		if q < 1 {
+			return finish(DoneE1Caps)
+		}
+		return send(Child{Action: ActSubmit, Qty: q, Price: p}, "open")
 	}
 	if in.now-s.LastMoveNS < in.cfg.StepEvery.Nanoseconds() {
 		return decision{}
 	}
-	if s.Order.Price == s.Cap {
+	// An amend never grows the order and never leaves E1's room.
+	q := rem
+	if s.Order.Qty > 0 {
+		q = min(q, s.Order.Qty)
+	}
+	qRoom, nRoom := s.e1Room(s.rootOf(s.Order.Key))
+	q = min(q, qRoom)
+	cp := s.Cap
+	if s.Intent.Side == Buy && q > 0 {
+		cp = min(cp, FloorTick(nRoom/q))
+	}
+	if q < 1 || !s.Intent.worse(cp, s.Order.Price) {
 		return send(Child{Action: ActCancel}, DoneCap)
 	}
-	p := stepToward(s.Intent.Side, s.Order.Price, s.Cap)
-	return send(Child{Action: ActAmend, Qty: rem, Price: p}, "step")
+	p := stepToward(s.Intent.Side, s.Order.Price, cp)
+	return send(Child{Action: ActAmend, Qty: q, Price: p}, "step")
+}
+
+// fitNewOrder sizes a new order lineage at price p to the room E1's caps
+// leave (exposure.go). A buy keeps its price and loses quantity. A sell first
+// gives up price, down to the cap, then quantity. q < 1 means nothing fits.
+func (s State) fitNewOrder(rem, p int64) (q, price int64) {
+	qRoom, nRoom := s.e1Room("") // a new lineage has no high-water mark yet
+	q = min(rem, qRoom)
+	if q < 1 {
+		return 0, p
+	}
+	if s.Intent.Side == Buy {
+		return min(q, nRoom/p), p
+	}
+	if q*s.Cap > nRoom {
+		q = nRoom / s.Cap
+	}
+	if q < 1 {
+		return 0, p
+	}
+	// nRoom/q >= Cap and Cap is a grid price, so the floor stays at or above
+	// Cap.
+	return q, min(p, FloorTick(nRoom/q))
 }
