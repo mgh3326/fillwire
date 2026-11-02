@@ -23,8 +23,11 @@ from the named environment variable on each REST read; the producer never issues
 an OAuth token. The operator owns token freshness and process restarts when its
 environment token changes. Do not put credential values in TOML.
 
-With no valid websocket book during the preceding 4 seconds, mock mode attempts
-a REST quotation read every 2 seconds:
+With no successfully published websocket book received during the preceding
+4 seconds, mock mode attempts a REST quotation read every 2 seconds. This
+availability check uses receive time; an old exchange clock remains visible to
+executor freshness checks and does not itself trigger REST fallback:
+
 `GET /uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn`, transaction
 `FHKST01010200`, market `J`, symbol `FID_INPUT_ISCD`. The
 [KIS quotation example](https://github.com/koreainvestment/open-trading-api/blob/main/examples_llm/domestic_stock/inquire_asking_price_exp_ccn/inquire_asking_price_exp_ccn.py)

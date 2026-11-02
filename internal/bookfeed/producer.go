@@ -96,7 +96,7 @@ func Run(ctx context.Context, r redis.Cmdable, rest RESTReader, symbol string, m
 					warn(fmt.Errorf("bookfeed: publish failed"))
 					continue
 				}
-				lastWS = s.At()
+				lastWS = s.Received
 			}
 		case now := <-timer.C:
 			if !mock || rest == nil || now.Sub(lastWS) <= 4*time.Second {

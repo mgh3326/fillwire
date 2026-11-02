@@ -149,3 +149,66 @@ func TestWebsocketSnapshotKeepsFiveLevelsAndExchangeClock(t *testing.T) {
 		t.Fatalf("snapshot %+v", s)
 	}
 }
+
+func TestRecentWebsocketArrivalSuppressesFallbackWithStaleExchangeClock(t *testing.T) {
+	data, err := os.ReadFile("../exec/sim/testdata/sim.evidence.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Raw string `json:"raw"`
+	}
+	if err := json.Unmarshal([]byte(strings.Split(string(data), "\n")[1]), &frame); err != nil {
+		t.Fatal(err)
+	}
+	received := time.Now()
+	parts := strings.SplitN(frame.Raw, "|", 4)
+	fields := strings.Split(parts[3], "^")
+	fields[1] = received.Add(-time.Minute).In(KST).Format("150405")
+	parts[3] = strings.Join(fields, "^")
+	event := ws.Event{Raw: []byte(strings.Join(parts, "|")), ReceivedAt: received}
+	m := miniredis.RunT(t)
+	r := redis.NewClient(&redis.Options{Addr: m.Addr()})
+	defer r.Close()
+	var calls atomic.Int64
+	rest := asking(t, &calls)
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan ws.Event, 1)
+	events <- event
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, r, rest, "005930", true, events, func(err error) { t.Error(err) }) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	// Observe a successfully published websocket book before testing the first
+	// fallback tick. The exchange clock stays old; arrival is recent.
+	deadline := time.After(time.Second)
+	for {
+		snapshot, ok, err := Latest(ctx, r, "005930")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			if snapshot.Source != "ws" || received.Sub(snapshot.At()) < 30*time.Second {
+				t.Fatalf("expected a stale exchange clock on a fresh ws arrival: %+v", snapshot)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("websocket snapshot not published")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	<-time.After(2200 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatalf("REST fallback calls=%d, want 0 after a recent websocket arrival", calls.Load())
+	}
+	snapshot, ok, err := Latest(ctx, r, "005930")
+	if err != nil || !ok || snapshot.Source != "ws" || !snapshot.At().Before(received.Add(-30*time.Second)) {
+		t.Fatalf("exchange staleness was hidden: %+v %v", snapshot, err)
+	}
+}
