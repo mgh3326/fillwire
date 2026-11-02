@@ -158,9 +158,18 @@ func (e *Executor) send(c Child, nowNS int64) error {
 }
 
 // commit applies r, journals it, and only then makes it the current state.
+// It refuses a submit or amend that E1 would refuse for caps: decide sizes
+// every send to E1's room, so this is the backstop. The check lives here, not
+// in Apply, because commit sees only new records, and a journal written
+// before the executor mirrored E1 must still replay.
 func (e *Executor) commit(r Record) error {
 	if e.err != nil {
 		return e.err
+	}
+	if c := r.Child; r.Kind == RecSend && c != nil && (c.Action == ActSubmit || c.Action == ActAmend) {
+		if why := e.state.E1CapsRefusal(*c); why != "" {
+			return fmt.Errorf("exec: %s qty %d price %d not sent: E1 would refuse: %s", c.Action, c.Qty, c.Price, why)
+		}
 	}
 	next, err := Apply(e.state, r)
 	if err != nil {

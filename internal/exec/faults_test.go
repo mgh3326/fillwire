@@ -122,8 +122,10 @@ func TestFaultProcessKillAndRestart(t *testing.T) {
 		wantAfter []string
 		wantPrice int64
 	}{
+		// E1 counts the journaled submit against the caps even though it
+		// never reached the broker, so no second submit fits (exposure.go).
 		{"kill before the submit reaches the broker", func(r *rig) { r.g.KillBefore = true }, 0,
-			[]string{"submit@70000x10", "submit@70000x10"}, 70_000},
+			[]string{"submit@70000x10"}, 0},
 		{"kill after the submit reached the broker", func(r *rig) { r.g.KillAfter = true }, 0,
 			[]string{"submit@70000x10"}, 70_000},
 		{"kill before the amend reaches the broker", func(r *rig) { r.step(0); r.g.KillBefore = true }, 5,
@@ -145,8 +147,14 @@ func TestFaultProcessKillAndRestart(t *testing.T) {
 			}
 			r.book(c.killAt+0.5, 70_000, 70_400)
 			r.e.Tick(at(c.killAt + 0.5))
-			if st := r.e.State(); st.InFlight != nil || st.Order == nil || st.Order.Price != c.wantPrice {
-				t.Fatalf("after restart: in flight %+v order %+v", st.InFlight, st.Order)
+			st = r.e.State()
+			switch {
+			case st.InFlight != nil:
+				t.Fatalf("after restart: in flight %+v", st.InFlight)
+			case c.wantPrice == 0 && (st.Order != nil || st.Done != exec.DoneE1Caps):
+				t.Fatalf("after restart: order %+v done %q, want no order and %q", st.Order, st.Done, exec.DoneE1Caps)
+			case c.wantPrice != 0 && (st.Order == nil || st.Order.Price != c.wantPrice):
+				t.Fatalf("after restart: order %+v", st.Order)
 			}
 			equal(t, r.actions(), c.wantAfter)
 			r.safe()
@@ -154,17 +162,26 @@ func TestFaultProcessKillAndRestart(t *testing.T) {
 	}
 }
 
-// outcomeFailGW answers every send as uncertain and every query as "no order";
-// it fails the first query and closes the journal inside the failAt-th send.
+// outcomeFailGW answers every send as uncertain and every query with the
+// first child still working at the broker; it fails the first query and
+// closes the journal inside the failAt-th send.
 type outcomeFailGW struct {
 	j      *exec.Journal
+	first  exec.Child
 	sends  int
+	adds   int // submits and amends
 	failAt int
 	queryN int
 }
 
 func (g *outcomeFailGW) Send(c exec.Child) (exec.Outcome, error) {
 	g.sends++
+	if g.sends == 1 {
+		g.first = c
+	}
+	if c.Action != exec.ActCancel {
+		g.adds++
+	}
 	if g.sends == g.failAt {
 		g.j.Close()
 	}
@@ -176,11 +193,14 @@ func (g *outcomeFailGW) Query(string) (exec.View, error) {
 	if g.queryN == 1 {
 		return exec.View{}, errors.New("query down")
 	}
-	return exec.View{}, nil
+	return exec.View{Order: &exec.Order{Key: g.first.Key, Price: g.first.Price, Qty: g.first.Qty}}, nil
 }
 
 // An outcome append that fails on the last step of a Tick must surface from
-// that Tick, not only from the next one.
+// that Tick, not only from the next one. The kill switch makes every step of
+// the second Tick a cancel that stays uncertain and a reconcile that finds
+// the order still working. Cancels drive the count because E1's caps allow
+// no second submit after an uncertain one.
 func TestFaultOutcomeJournalFailureOnLastStep(t *testing.T) {
 	j, st, err := exec.OpenJournal(filepath.Join(t.TempDir(), "exec.journal"))
 	if err != nil {
@@ -188,7 +208,8 @@ func TestFaultOutcomeJournalFailureOnLastStep(t *testing.T) {
 	}
 	t.Cleanup(func() { j.Close() })
 	gw := &outcomeFailGW{j: j, failAt: 5} // 1 send in the first Tick, the 4th of the second is the 5th overall
-	e := exec.New(enabled(), j, st, gw, &exec.KillSwitch{})
+	kill := &exec.KillSwitch{}
+	e := exec.New(enabled(), j, st, gw, kill)
 	if err := e.Start(fixtureIntent(t), at(0)); err != nil {
 		t.Fatal(err)
 	}
@@ -196,12 +217,16 @@ func TestFaultOutcomeJournalFailureOnLastStep(t *testing.T) {
 	if err := e.Tick(at(0)); err == nil || gw.sends != 1 {
 		t.Fatalf("first tick: err %v sends %d", err, gw.sends)
 	}
+	kill.Engage()
 	err = e.Tick(at(0))
 	if gw.sends != 5 {
 		t.Fatalf("sends %d, want the 8th step to be the 5th send", gw.sends)
 	}
 	if !errors.Is(err, exec.ErrHalted) {
 		t.Fatalf("tick err %v, want ErrHalted", err)
+	}
+	if gw.adds != 1 {
+		t.Fatalf("%d submits or amends, want only the first", gw.adds)
 	}
 	if err := e.Tick(at(0)); !errors.Is(err, exec.ErrHalted) || gw.sends != 5 {
 		t.Fatalf("after halt: err %v sends %d", err, gw.sends)

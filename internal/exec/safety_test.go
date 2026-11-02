@@ -34,8 +34,13 @@ func TestAmbiguousSendIsNotResentUntilReconciled(t *testing.T) {
 				t.Fatalf("order %+v", st.Order)
 			}
 		} else {
-			// The order never reached the broker: a new decision, a new key.
-			equal(t, r.actions(), []string{"submit@70000x10", "submit@70000x10"})
+			// The order never reached the broker. E1 still counts the
+			// unanswered submit against the intent's caps (exposure.go), so
+			// a second submit would be refused: the executor finishes.
+			equal(t, r.actions(), []string{"submit@70000x10"})
+			if st.Order != nil || st.Done != exec.DoneE1Caps {
+				t.Fatalf("order %+v done %q", st.Order, st.Done)
+			}
 		}
 		r.safe()
 	}

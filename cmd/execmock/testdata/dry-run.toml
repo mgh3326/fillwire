@@ -1,0 +1,6 @@
+[e1]
+account = "kis_mock"
+send_enabled = false
+url = "http://127.0.0.1:8000/trading/api/execution-intents/child-requests"
+token_header = "X-Execution-Intent-Gateway-Token"
+timeout = "10s"

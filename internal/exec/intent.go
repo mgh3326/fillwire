@@ -169,7 +169,8 @@ func (in Intent) Cap() int64 {
 // TargetQty is the quantity the executor works: max_quantity, cut so the
 // whole quantity at Cap stays within max_notional_krw and the inventory
 // range. No buy is priced above Cap, so no buy can exceed either; a sell may
-// be priced above Cap, so its price is also held to notionalCeil.
+// be priced above Cap, so its price is also held to the notional room E1
+// leaves (State.fitNewOrder).
 func (in Intent) TargetQty() int64 {
 	q := in.MaxQuantity
 	if c := in.Cap(); c > 0 {
@@ -182,12 +183,6 @@ func (in Intent) TargetQty() int64 {
 		q = min(q, inv.PositionAtAuthorization-inv.MinPositionAfter)
 	}
 	return max(q, 0)
-}
-
-// notionalCeil is the highest grid price at which qty stays within
-// max_notional_krw. For qty up to TargetQty it is never below Cap.
-func (in Intent) notionalCeil(qty int64) int64 {
-	return FloorTick(in.MaxNotionalKRW / qty)
 }
 
 // worse reports whether price a is worse for the intent's side than b: higher

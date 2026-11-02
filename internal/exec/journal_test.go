@@ -163,8 +163,9 @@ func (g *acceptGW) Query(string) (exec.View, error) { return exec.View{}, nil }
 
 // TestLegacySellAboveNotionalReplays: a journal written before sells were
 // held to max_notional_krw (testdata: a sell of 10 opened at the 70,400 ask,
-// 704,000 KRW against a 700,000 cap) still opens, and the next step amends
-// the order back within max_notional_krw instead of stepping from the ask.
+// 704,000 KRW against a 700,000 cap) still opens. E1 counts each order
+// lineage at its high-water notional, so it would refuse any amend of that
+// order: the next step cancels it and the intent finishes e1_caps.
 func TestLegacySellAboveNotionalReplays(t *testing.T) {
 	data, err := os.ReadFile("testdata/legacy_sell_above_notional.journal")
 	if err != nil {
@@ -192,7 +193,10 @@ func TestLegacySellAboveNotionalReplays(t *testing.T) {
 	for _, c := range g.sends {
 		got = append(got, describe(c))
 	}
-	equal(t, got, []string{"amend@70000x10"})
+	equal(t, got, []string{"cancel"})
+	if st := e.State(); st.Done != exec.DoneE1Caps || st.Order != nil {
+		t.Fatalf("done %q order %+v", st.Done, st.Order)
+	}
 }
 
 // TestJournalOpensInUnreadableDir: an existing journal in a directory the
