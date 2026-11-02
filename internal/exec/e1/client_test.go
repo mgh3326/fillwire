@@ -447,11 +447,47 @@ func TestURLErrorsHideCredentials(t *testing.T) {
 		"http://user:s3cret-pw@127.0.0.1/child",
 		"http://user:s3cret-pw@[::1/child",
 		"ftp://user:s3cret-pw@gateway.example/child",
+		"https://s3cret-pw@gateway.example/child",
+		"http://s3cret-pw@127.0.0.1/child",
+		"https://gateway.example/child?access_token=s3cret-pw",
+		"http://127.0.0.1:8000/child?s3cret-pw",
+		"http://127.0.0.1:8000/child#s3cret-pw",
+		"http://gateway.example/child?access_token=s3cret-pw",
+		"ftp://gateway.example/child?access_token=s3cret-pw",
 	} {
-		_, err := e1.New(sendConfig(u), in, e1.Options{Token: tokenSource(t, false)})
-		if !errors.Is(err, e1.ErrConfig) || strings.Contains(err.Error(), "s3cret-pw") {
-			t.Errorf("%q: %v", u, err)
+		for _, cfg := range []e1.Config{sendConfig(u), {Account: e1.MockAccount, DryRun: true, URL: u}} {
+			_, err := e1.New(cfg, in, e1.Options{Token: tokenSource(t, false), Log: io.Discard})
+			if !errors.Is(err, e1.ErrConfig) || strings.Contains(err.Error(), "s3cret-pw") {
+				t.Errorf("%q (dry run %v): %v", u, cfg.DryRun, err)
+			}
 		}
+	}
+	// A bare "?" carries nothing but is refused all the same.
+	if _, err := e1.New(sendConfig("http://127.0.0.1:8000/child?"), in, e1.Options{Token: tokenSource(t, false)}); !errors.Is(err, e1.ErrConfig) {
+		t.Errorf("empty query: %v", err)
+	}
+}
+
+// TestTransportErrorOmitsURL: a transport error reaches the journal as the
+// outcome's reason, so it carries the cause, not the request URL.
+func TestTransportErrorOmitsURL(t *testing.T) {
+	in := fixtureIntent(t)
+	srv := newServer(t, nil)
+	u := srv.URL + "/trading/api/execution-intents/child-requests"
+	srv.Close() // connection refused
+	c, err := e1.New(sendConfig(u), in, e1.Options{Token: tokenSource(t, true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Send(submit(in))
+	if err == nil {
+		t.Fatal("send to a closed server: no error")
+	}
+	if strings.Contains(err.Error(), "/trading/api/") || strings.Contains(err.Error(), "http://") {
+		t.Fatalf("transport error names the URL: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("transport error lost its cause: %v", err)
 	}
 }
 

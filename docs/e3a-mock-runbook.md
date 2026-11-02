@@ -39,7 +39,7 @@ X-Execution-Intent-Confirm: <idempotency_key of this body>
 {"action":"submit","intent_id":"<uuid>","idempotency_key":"<uuid>:1","quantity":10,"limit_price_krw":70000}
 ```
 
-- **URL:** `https`, or `http` to a loopback host only (`localhost`, `127.0.0.0/8` or `::1`), because every request carries the token. A URL with credentials in it is refused. The client never follows a redirect.
+- **URL:** `https`, or `http` to a loopback host only (`localhost`, `127.0.0.0/8` or `::1`), because every request carries the token. A URL with credentials in it, or with a query string or fragment, is refused, so a configured URL is safe to log. Transport errors in the journal carry the cause, not the URL. The client never follows a redirect.
 - **Body:** exactly one E1 child request: submit, amend or cancel, with E1's field names and no other field. Keys are `<intent_id>:<n>`, which matches E1's key pattern.
 - **Auth:** a shared token in the header that `token_header` names. The default is `X-Execution-Intent-Gateway-Token`. The client reads the token only in send mode, and `execmock` never reads one in this build. `New` refuses a `token_header` that is not a valid header name or that names a header the client sets itself (`X-Execution-Intent-Confirm`, `Content-Type`, `Content-Length`, `Host`, `Transfer-Encoding`). It also refuses a token with control characters, non-ASCII bytes, or leading or trailing spaces. Such a config would otherwise fail every request as an unknown outcome.
 - **Per-action confirm:** the route passes `confirm=True` to `IntentGateway.handle` only when `X-Execution-Intent-Confirm` equals the body's `idempotency_key`. A missing or different value means `confirm=False`, and E1 answers `confirm_required`.

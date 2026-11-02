@@ -229,18 +229,25 @@ func New(cfg Config, in exec.Intent, opt Options) (*Client, error) {
 // URL with credentials in it is refused too: the token header is the only
 // credential.
 //
-// The errors never echo the URL as given: it may hold credentials. A URL
-// that parses is shown with its userinfo redacted; one that does not is not
-// shown.
+// A query or a fragment is refused for the same reason: the endpoint needs
+// neither, and a credential put there would travel in every request and in
+// every error that names the URL. An accepted URL is therefore safe to log.
+//
+// The errors never echo the URL as given. A URL that parses is shown without
+// its userinfo, query and fragment; one that does not is not shown.
 func checkURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("%w: url does not parse", ErrConfig)
 	}
-	shown := u.Redacted()
+	bare := *u
+	bare.User, bare.RawQuery, bare.ForceQuery, bare.Fragment, bare.RawFragment = nil, "", false, "", ""
+	shown := bare.String()
 	switch {
 	case u.User != nil:
 		return "", fmt.Errorf("%w: url %q: credentials in a url are refused; the token header is the only credential", ErrConfig, shown)
+	case u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "":
+		return "", fmt.Errorf("%w: url %q: a query or fragment is refused; the token header is the only credential", ErrConfig, shown)
 	case u.Host == "" || u.Hostname() == "" || u.Opaque != "":
 		return "", fmt.Errorf("%w: url %q", ErrConfig, shown)
 	}
@@ -329,6 +336,13 @@ func (c *Client) Send(ch exec.Child) (exec.Outcome, error) {
 	req.Header.Set(ConfirmHeader, ch.Key)
 	resp, err := c.http.Do(req)
 	if err != nil {
+		// Do wraps the cause in a *url.Error that names the URL. checkURL
+		// keeps credentials out of the URL; the journal still gets only the
+		// cause.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = fmt.Errorf("e1: post: %w", ue.Err)
+		}
 		return exec.Outcome{}, err // unknown: the request may have arrived
 	}
 	defer resp.Body.Close()
