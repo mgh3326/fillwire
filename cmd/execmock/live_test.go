@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
@@ -20,6 +21,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/exec"
 	"github.com/mgh3326/fillwire/internal/exec/e1"
 	"github.com/mgh3326/fillwire/internal/exec/exectest"
+	"github.com/mgh3326/fillwire/internal/kisread"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -531,38 +533,40 @@ func TestLiveLadderDoesNotRereadConfirmedTerminalOrders(t *testing.T) {
 }
 
 func TestPollDeadlineCancelsWorkingOrder(t *testing.T) {
-	in := liveIntent(t)
-	start := in.ExpiresAt.Add(-35 * time.Second)
-	gateway := exectest.New(in)
-	e, kill := liveExecutor(t, in, numericGateway{gateway}, true)
-	e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: start.UnixNano(), Synced: true})
-	if err := e.Tick(start.UnixNano()); err != nil {
-		t.Fatal(err)
-	}
-	parent := context.Background()
-	err := driveLive(parent, e, kill, false, time.Time{}, liveInputs{
-		Now: func() time.Time { return start.Add(time.Second) },
-		Ledger: func(context.Context) (e1.FillsSnapshot, error) {
-			return e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{{BrokerOrderID: "123", Fills: []e1.LedgerFill{}}}}, nil
-		},
-		Broker: func(ctx context.Context, _ exec.BrokerOrder) (brokerView, error) {
-			<-ctx.Done()
-			return brokerView{}, errors.New("readback unavailable")
-		},
-		Book: func(context.Context) (bookfeed.Snapshot, bool, error) {
-			t.Fatal("book read after failed broker poll")
-			return bookfeed.Snapshot{}, false, nil
-		},
+	synctest.Test(t, func(t *testing.T) {
+		in := liveIntent(t)
+		start := in.ExpiresAt.Add(-35 * time.Second)
+		gateway := exectest.New(in)
+		e, kill := liveExecutor(t, in, numericGateway{gateway}, true)
+		e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: start.UnixNano(), Synced: true})
+		if err := e.Tick(start.UnixNano()); err != nil {
+			t.Fatal(err)
+		}
+		parent := context.Background()
+		err := driveLive(parent, e, kill, false, time.Time{}, liveInputs{
+			Now: func() time.Time { return start.Add(time.Second) },
+			Ledger: func(context.Context) (e1.FillsSnapshot, error) {
+				return e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{{BrokerOrderID: "123", Fills: []e1.LedgerFill{}}}}, nil
+			},
+			Broker: func(ctx context.Context, _ exec.BrokerOrder) (brokerView, error) {
+				<-ctx.Done()
+				return brokerView{}, errors.New("readback unavailable")
+			},
+			Book: func(context.Context) (bookfeed.Snapshot, bool, error) {
+				t.Fatal("book read after failed broker poll")
+				return bookfeed.Snapshot{}, false, nil
+			},
+		})
+		if parent.Err() != nil {
+			t.Fatal("parent context unexpectedly canceled")
+		}
+		if !kill.Engaged() || len(gateway.Sends) != 2 || gateway.Sends[1].Action != exec.ActCancel {
+			t.Fatalf("poll deadline: kill=%v sends=%+v; want submit followed by cancel", kill.Engaged(), gateway.Sends)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) || e.State().Done != "" {
+			t.Fatalf("deadline lost or clean finish claimed: done=%q err=%v", e.State().Done, err)
+		}
 	})
-	if parent.Err() != nil {
-		t.Fatal("parent context unexpectedly canceled")
-	}
-	if !kill.Engaged() || len(gateway.Sends) != 2 || gateway.Sends[1].Action != exec.ActCancel {
-		t.Fatalf("poll deadline: kill=%v sends=%+v; want submit followed by cancel", kill.Engaged(), gateway.Sends)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) || e.State().Done != "" {
-		t.Fatalf("deadline lost or clean finish claimed: done=%q err=%v", e.State().Done, err)
-	}
 }
 
 func TestCachedTerminalReadbackStillChecksLedgerCumulativeQuantity(t *testing.T) {
@@ -591,4 +595,148 @@ func TestCachedTerminalReadbackStillChecksLedgerCumulativeQuantity(t *testing.T)
 	if calls != 1 {
 		t.Fatalf("terminal readback calls=%d, want 1", calls)
 	}
+}
+
+func TestLivePollHandlesSevenUnverifiedOrdersAtMockReadRate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		in := liveIntent(t)
+		base := time.Now()
+		in.ExpiresAt = base.Add(2 * time.Minute)
+		in.LimitPriceKRW = 71000
+		gateway := exectest.New(in)
+		journal, state, err := exec.OpenJournal(filepath.Join(t.TempDir(), "exec.journal"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer journal.Close()
+		cfg := exec.DefaultConfig()
+		cfg.SendEnabled = true
+		cfg.RequireLedgerComplete = true
+		kill := &exec.KillSwitch{}
+		e := exec.New(cfg, journal, state, gateway, kill)
+		if err := e.Start(in, base.UnixNano()); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 7; i++ {
+			if i > 0 {
+				time.Sleep(5 * time.Second)
+			}
+			e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: time.Now().UnixNano(), Synced: true})
+			if err := e.Tick(time.Now().UnixNano()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		orders, err := e.BrokerOrders()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(orders) != 7 {
+			t.Fatalf("journal orders=%d, want 7", len(orders))
+		}
+		var readTimes []time.Time
+		client := &kisread.Client{Mock: true, AppKey: "fixture", AppSecret: "fixture", Token: func() string { return "fixture" }, HTTP: &http.Client{Transport: brokerTransport(func(r *http.Request) (*http.Response, error) {
+			readTimes = append(readTimes, time.Now())
+			canceled := "N"
+			if kill.Engaged() {
+				canceled = "Y"
+			}
+			body, err := json.Marshal(map[string]any{"rt_cd": "0", "output1": []map[string]string{{"odno": r.URL.Query().Get("ODNO"), "ord_dt": r.URL.Query().Get("INQR_STRT_DT"), "pdno": in.Symbol, "sll_buy_dvsn_cd": "02", "ord_qty": "10", "tot_ccld_qty": "0", "cncl_yn": canceled, "rjct_qty": "0"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+		})}}
+		broker := historyRead{Client: client, Account: "fixture", Product: "fixture", Symbol: in.Symbol, Side: in.Side}
+		ticks := make(chan time.Time, 2)
+		ticks <- time.Time{}
+		ticks <- time.Time{}
+		bookReads := 0
+		err = driveLive(context.Background(), e, kill, false, time.Time{}, liveInputs{
+			Now: time.Now, Ticks: ticks, Broker: broker.read,
+			Ledger: func(context.Context) (e1.FillsSnapshot, error) {
+				snapshot := e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{}}
+				for _, o := range orders {
+					snapshot.Orders = append(snapshot.Orders, e1.LedgerOrder{BrokerOrderID: o.BrokerOrderID, Fills: []e1.LedgerFill{}})
+				}
+				return snapshot, nil
+			},
+			Book: func(context.Context) (bookfeed.Snapshot, bool, error) {
+				bookReads++
+				// Ending the test run happens only after all seven healthy readbacks.
+				// A pacing-induced deadline must never engage this switch first.
+				if bookReads == 1 && kill.Engaged() {
+					t.Fatal("healthy broker polling engaged kill")
+				}
+				kill.Engage()
+				snapshot := bookfeed.Snapshot{Symbol: in.Symbol, Exchange: time.Now(), Received: time.Now(), Source: "ws"}
+				snapshot.Bids[0].Price = 70000
+				snapshot.Asks[0].Price = 70200
+				return snapshot, true, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("healthy seven-order poll tripped deadline: reads=%d err=%v", len(readTimes), err)
+		}
+		if bookReads != 2 || e.State().Done != exec.DoneKilled || len(readTimes) != 14 {
+			t.Fatalf("book reads=%d broker reads=%d done=%q", bookReads, len(readTimes), e.State().Done)
+		}
+		for i := 1; i < len(readTimes); i++ {
+			if readTimes[i].Sub(readTimes[i-1]) < time.Second {
+				t.Fatal("mock 1/s throttle was bypassed")
+			}
+		}
+	})
+}
+
+func TestInterruptRetainsReasonWhenExecutorTickFails(t *testing.T) {
+	in := liveIntent(t)
+	start := in.ExpiresAt.Add(-35 * time.Second)
+	e, kill := liveExecutor(t, in, numericGateway{exectest.New(in)}, true)
+	e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: start.UnixNano(), Synced: true})
+	if err := e.Tick(start.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.OnLedgerFill("unknown", exec.Fill{FillID: "unknown-fill", Qty: 1, Price: 70000, AtNS: start.Add(time.Second).UnixNano()}); !errors.Is(err, exec.ErrAttribution) {
+		t.Fatalf("failed to reproduce executor halt: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := driveLive(ctx, e, kill, false, time.Time{}, liveInputs{
+		Now: func() time.Time { return start.Add(time.Second) },
+		Ledger: func(context.Context) (e1.FillsSnapshot, error) {
+			cancel()
+			return e1.FillsSnapshot{}, errors.New("read interrupted")
+		},
+	})
+	if !errors.Is(err, exec.ErrAttribution) || !strings.Contains(err.Error(), "interrupted; verify terminal broker/ledger evidence") || !strings.Contains(err.Error(), "ledger fill attribution failed") {
+		t.Fatalf("lost interrupt reason or cancel-tick error: %v", err)
+	}
+}
+
+func TestPollDeadlineRetainsReasonWhenExecutorTickFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		in := liveIntent(t)
+		start := in.ExpiresAt.Add(-35 * time.Second)
+		e, kill := liveExecutor(t, in, numericGateway{exectest.New(in)}, true)
+		e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: start.UnixNano(), Synced: true})
+		if err := e.Tick(start.UnixNano()); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.OnLedgerFill("unknown", exec.Fill{FillID: "unknown-fill", Qty: 1, Price: 70000, AtNS: start.Add(time.Second).UnixNano()}); !errors.Is(err, exec.ErrAttribution) {
+			t.Fatalf("failed to reproduce executor halt: %v", err)
+		}
+		err := driveLive(context.Background(), e, kill, false, time.Time{}, liveInputs{
+			Now: func() time.Time { return start.Add(time.Second) },
+			Ledger: func(context.Context) (e1.FillsSnapshot, error) {
+				return e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{{BrokerOrderID: "123", Fills: []e1.LedgerFill{}}}}, nil
+			},
+			Broker: func(ctx context.Context, _ exec.BrokerOrder) (brokerView, error) {
+				<-ctx.Done()
+				return brokerView{}, errors.New("readback unavailable")
+			},
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, exec.ErrAttribution) || !strings.Contains(err.Error(), "operator reconcile required") || !strings.Contains(err.Error(), "ledger fill attribution failed") {
+			t.Fatalf("lost deadline reason or cancel-tick error: %v", err)
+		}
+	})
 }

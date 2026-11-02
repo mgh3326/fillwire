@@ -24,10 +24,17 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const liveReadTimeout = 5 * time.Second
+
 type ledgerRead func(context.Context) (e1.FillsSnapshot, error)
 
 func refreshLedger(ctx context.Context, e *exec.Executor, read ledgerRead, broker brokerRead) error {
-	s, err := read(ctx)
+	ledgerCtx, cancelLedger := context.WithTimeout(ctx, liveReadTimeout)
+	s, err := read(ledgerCtx)
+	if ledgerCtx.Err() != nil {
+		err = ledgerCtx.Err()
+	}
+	cancelLedger()
 	if err != nil {
 		return err
 	}
@@ -89,7 +96,14 @@ func refreshLedger(ctx context.Context, e *exec.Executor, read ledgerRead, broke
 		if total != o.CumulativeQty {
 			return exec.ErrAttribution
 		}
-		view, err := broker(ctx, known)
+		// Each exact order owns its wait/transport budget. Pacing earlier
+		// reads must not consume the budget of later unverified orders.
+		orderCtx, cancelOrder := context.WithTimeout(ctx, liveReadTimeout)
+		view, err := broker(orderCtx, known)
+		if orderCtx.Err() != nil {
+			err = orderCtx.Err()
+		}
+		cancelOrder()
 		if err != nil {
 			return err
 		}
@@ -125,29 +139,27 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 	stopForReconcile := func(reason error) error {
 		kill.Engage()
 		if err := e.Tick(in.Now().UnixNano()); err != nil {
-			return err
+			return errors.Join(reason, err)
 		}
 		return reason
 	}
 
 	step := func() error {
-		pollCtx, cancelPoll := context.WithTimeout(ctx, 5*time.Second)
-		defer cancelPoll()
 		if !dry {
-			if err := refreshLedger(pollCtx, e, in.Ledger, in.Broker); err != nil {
-				if pollCtx.Err() != nil {
-					return pollCtx.Err()
-				}
+			if err := refreshLedger(ctx, e, in.Ledger, in.Broker); err != nil {
 				return err
 			}
 		}
-		s, ok, err := in.Book(pollCtx)
-		if pollCtx.Err() != nil {
-			return pollCtx.Err()
+		bookCtx, cancelBook := context.WithTimeout(ctx, liveReadTimeout)
+		s, ok, err := in.Book(bookCtx)
+		if bookCtx.Err() != nil {
+			err = bookCtx.Err()
 		}
+		cancelBook()
 		if err != nil {
 			return err
 		}
+
 		now := in.Now()
 		if ok {
 			if s.Symbol != e.State().Intent.Symbol {

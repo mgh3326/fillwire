@@ -110,8 +110,12 @@ Do not schedule the run until every item holds:
    request per second per client. Polls run at a 1-second cadence. Confirmed
    terminal exact-order readbacks are cached for that run, while ledger rows
    are refreshed and compared on every poll; working and terminal-unverified
-   orders are reread. A poll has a 5-second overall deadline. A poll deadline
-   engages the kill switch, attempts cancellation and stops for reconcile.
+   orders are reread. Each ledger fetch, exact-order broker read (including its
+   throttle wait), and book fetch has its own 5-second budget. A healthy scan
+   of several unverified orders may take longer than 5 seconds in total;
+   earlier reads do not consume later reads' budgets. A read deadline engages
+   the kill switch, attempts cancellation and stops for reconcile. If the cancel
+   tick also fails, the error preserves both the reconcile reason and that failure.
 4. **Intent:** one intent stored through `SqlAlchemyGatewayStore.store_intent`, with `account = "kis_mock"`. Use the smallest size: 1 share, `max_notional_krw` below 100,000, and expiry within 30 minutes.
 
 ## Run steps (operator present)
