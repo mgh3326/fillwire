@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -399,6 +400,94 @@ func TestTokenTravelsOnlyOverTLSOrLoopback(t *testing.T) {
 		if _, err := e1.New(sendConfig(u), in, e1.Options{Token: tokenSource(t, true)}); err != nil {
 			t.Errorf("%s: %v", u, err)
 		}
+	}
+}
+
+// TestBadHeaderConfigFailsInNew: a token header or token that Go cannot
+// write would fail every request as a transport error, which the executor
+// holds as uncertain with no way to reconcile. New refuses it instead.
+func TestBadHeaderConfigFailsInNew(t *testing.T) {
+	in := fixtureIntent(t)
+	srv := newServer(t, nil)
+	for _, h := range []string{"X Token", "X-Token:", "X-Token\n", "X-Tökén", "(X)", "x-execution-intent-confirm", "content-type", "Host"} {
+		for _, cfg := range []e1.Config{
+			{Account: e1.MockAccount, SendEnabled: true, URL: srv.URL, TokenHeader: h},
+			{Account: e1.MockAccount, DryRun: true, URL: srv.URL, TokenHeader: h},
+			{Account: e1.MockAccount, URL: srv.URL, TokenHeader: h},
+		} {
+			if _, err := e1.New(cfg, in, e1.Options{Token: tokenSource(t, false), Log: io.Discard}); !errors.Is(err, e1.ErrConfig) {
+				t.Errorf("header %q (send %v, dry run %v): %v", h, cfg.SendEnabled, cfg.DryRun, err)
+			}
+		}
+	}
+	for _, tok := range []string{"tok-secret\nb", "tok-secret\r\nX-Evil: 1", "tok-secret\x00", " tok-secret", "tok-secret ", "tok-secrét"} {
+		_, err := e1.New(sendConfig(srv.URL), in, e1.Options{Token: func() (string, error) { return tok, nil }})
+		if !errors.Is(err, e1.ErrConfig) || strings.Contains(err.Error(), "tok-secret") {
+			t.Errorf("token %q: %v", tok, err)
+		}
+	}
+	c, err := e1.New(e1.Config{Account: e1.MockAccount, SendEnabled: true, URL: srv.URL, TokenHeader: "X-Gateway_Token.v2"}, in, e1.Options{Token: tokenSource(t, true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Send(submit(in)); err != nil {
+		t.Fatalf("valid header: %v", err)
+	}
+	if srv.count() != 1 {
+		t.Fatalf("hits %d", srv.count())
+	}
+}
+
+// TestURLErrorsHideCredentials: a refused URL is never echoed with its
+// userinfo, since callers log these errors.
+func TestURLErrorsHideCredentials(t *testing.T) {
+	in := fixtureIntent(t)
+	for _, u := range []string{
+		"https://user:s3cret-pw@gateway.example/child",
+		"http://user:s3cret-pw@127.0.0.1/child",
+		"http://user:s3cret-pw@[::1/child",
+		"ftp://user:s3cret-pw@gateway.example/child",
+		"https://s3cret-pw@gateway.example/child",
+		"http://s3cret-pw@127.0.0.1/child",
+		"https://gateway.example/child?access_token=s3cret-pw",
+		"http://127.0.0.1:8000/child?s3cret-pw",
+		"http://127.0.0.1:8000/child#s3cret-pw",
+		"http://gateway.example/child?access_token=s3cret-pw",
+		"ftp://gateway.example/child?access_token=s3cret-pw",
+	} {
+		for _, cfg := range []e1.Config{sendConfig(u), {Account: e1.MockAccount, DryRun: true, URL: u}} {
+			_, err := e1.New(cfg, in, e1.Options{Token: tokenSource(t, false), Log: io.Discard})
+			if !errors.Is(err, e1.ErrConfig) || strings.Contains(err.Error(), "s3cret-pw") {
+				t.Errorf("%q (dry run %v): %v", u, cfg.DryRun, err)
+			}
+		}
+	}
+	// A bare "?" carries nothing but is refused all the same.
+	if _, err := e1.New(sendConfig("http://127.0.0.1:8000/child?"), in, e1.Options{Token: tokenSource(t, false)}); !errors.Is(err, e1.ErrConfig) {
+		t.Errorf("empty query: %v", err)
+	}
+}
+
+// TestTransportErrorOmitsURL: a transport error reaches the journal as the
+// outcome's reason, so it carries the cause, not the request URL.
+func TestTransportErrorOmitsURL(t *testing.T) {
+	in := fixtureIntent(t)
+	srv := newServer(t, nil)
+	u := srv.URL + "/trading/api/execution-intents/child-requests"
+	srv.Close() // connection refused
+	c, err := e1.New(sendConfig(u), in, e1.Options{Token: tokenSource(t, true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Send(submit(in))
+	if err == nil {
+		t.Fatal("send to a closed server: no error")
+	}
+	if strings.Contains(err.Error(), "/trading/api/") || strings.Contains(err.Error(), "http://") {
+		t.Fatalf("transport error names the URL: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("transport error lost its cause: %v", err)
 	}
 }
 

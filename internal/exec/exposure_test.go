@@ -1,6 +1,7 @@
 package exec_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/mgh3326/fillwire/internal/exec"
@@ -56,4 +57,39 @@ func TestNoSecondRootBeyondE1Caps(t *testing.T) {
 		t.Fatalf("done %q order %+v", st.Done, st.Order)
 	}
 	r.safe()
+}
+
+// TestSellBelowCapIsUnreachable: no sell order rests below the cap, so a
+// rested sell with !worse(Cap, price) is exactly at the cap and the cancel
+// at the cap is right. Apply refuses a submit, an amend or a reconciled
+// working order priced below a sell's cap, and replay runs every journaled
+// record through Apply, so no journal can hold one either.
+func TestSellBelowCapIsUnreachable(t *testing.T) {
+	in := sellIntent(t) // cap 69,700
+	st, err := exec.Apply(exec.State{}, exec.Record{Kind: exec.RecStart, Intent: &in})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := func(n string) string { return in.IntentID + ":" + n }
+	below := exec.Child{Action: exec.ActSubmit, IntentID: in.IntentID, Key: k("1"), Qty: 10, Price: 69_600}
+	if _, err := exec.Apply(st, exec.Record{Kind: exec.RecSend, Child: &below}); err == nil || !strings.Contains(err.Error(), "cap 69700") {
+		t.Fatal("submit below the sell cap applied")
+	}
+	c1 := exec.Child{Action: exec.ActSubmit, IntentID: in.IntentID, Key: k("1"), Qty: 10, Price: 69_800}
+	for _, r := range []exec.Record{
+		{Kind: exec.RecSend, Child: &c1},
+		{Kind: exec.RecOutcome, Outcome: &exec.Outcome{Key: c1.Key, Status: exec.StatusAccepted, BrokerOrderID: "b1"}},
+	} {
+		if st, err = exec.Apply(st, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	amend := exec.Child{Action: exec.ActAmend, IntentID: in.IntentID, Key: k("2"), TargetKey: c1.Key, Qty: 10, Price: 69_600}
+	if _, err := exec.Apply(st, exec.Record{Kind: exec.RecSend, Child: &amend}); err == nil || !strings.Contains(err.Error(), "cap 69700") {
+		t.Fatal("amend below the sell cap applied")
+	}
+	view := exec.View{Order: &exec.Order{Key: c1.Key, Price: 69_600, Qty: 10}}
+	if _, err := exec.Apply(st, exec.Record{Kind: exec.RecReconcile, View: &view}); err == nil || !strings.Contains(err.Error(), "beyond cap 69700") {
+		t.Fatal("reconciled sell order below the cap applied")
+	}
 }
