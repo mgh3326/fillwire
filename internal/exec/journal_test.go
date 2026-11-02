@@ -107,3 +107,114 @@ func TestJournalRefusesCorruption(t *testing.T) {
 		}
 	}
 }
+
+func TestReplayRefusesTrailingDataOnLine(t *testing.T) {
+	r := richRun(t)
+	data, _ := os.ReadFile(r.path)
+	if _, err := exec.ReplayJournal(bytes.NewReader(data)); err != nil {
+		t.Fatalf("untouched journal: %v", err)
+	}
+	lines := bytes.SplitAfter(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
+	for name, idx := range map[string]int{"first line": 0, "last line": len(lines) - 1} {
+		cp := make([][]byte, len(lines))
+		copy(cp, lines)
+		cp[idx] = append(bytes.TrimSuffix(cp[idx], []byte("\n")), '{', '}')
+		if idx != len(lines)-1 {
+			cp[idx] = append(cp[idx], '\n')
+		}
+		bad := append(bytes.Join(cp, nil), '\n')
+		if _, err := exec.ReplayJournal(bytes.NewReader(bad)); !errors.Is(err, exec.ErrCorrupt) {
+			t.Errorf("%s replay: err %v, want ErrCorrupt", name, err)
+		}
+		path := filepath.Join(t.TempDir(), "j.log")
+		if err := os.WriteFile(path, bad, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := exec.OpenJournal(path); !errors.Is(err, exec.ErrCorrupt) {
+			t.Errorf("%s open: err %v, want ErrCorrupt", name, err)
+		}
+	}
+}
+
+// TestJournalRefusesSecondOpen: a second handle on a journal that is open
+// would append at its own offset and overwrite the first one's records.
+func TestJournalRefusesSecondOpen(t *testing.T) {
+	r := newRig(t, fixtureIntent(t), enabled())
+	if j, _, err := exec.OpenJournal(r.path); !errors.Is(err, exec.ErrJournalLocked) {
+		if j != nil {
+			j.Close()
+		}
+		t.Fatalf("second open: err %v, want ErrJournalLocked", err)
+	}
+	if st := r.restart(); !st.Started() {
+		t.Fatal("reopen after close lost the start record")
+	}
+}
+
+// acceptGW accepts every child and reports no working order.
+type acceptGW struct{ sends []exec.Child }
+
+func (g *acceptGW) Send(c exec.Child) (exec.Outcome, error) {
+	g.sends = append(g.sends, c)
+	return exec.Outcome{Key: c.Key, Status: exec.StatusAccepted}, nil
+}
+
+func (g *acceptGW) Query(string) (exec.View, error) { return exec.View{}, nil }
+
+// TestLegacySellAboveNotionalReplays: a journal written before sells were
+// held to max_notional_krw (testdata: a sell of 10 opened at the 70,400 ask,
+// 704,000 KRW against a 700,000 cap) still opens, and the next step amends
+// the order back within max_notional_krw instead of stepping from the ask.
+func TestLegacySellAboveNotionalReplays(t *testing.T) {
+	data, err := os.ReadFile("testdata/legacy_sell_above_notional.journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "exec.journal")
+	if err := os.WriteFile(path, data, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	j, st, err := exec.OpenJournal(path)
+	if err != nil {
+		t.Fatalf("legacy journal: %v", err)
+	}
+	t.Cleanup(func() { j.Close() })
+	if st.Order == nil || st.Order.Price != 70_400 || st.Intent.MaxNotionalKRW != 700_000 {
+		t.Fatalf("replayed order %+v max notional %d", st.Order, st.Intent.MaxNotionalKRW)
+	}
+	g := &acceptGW{}
+	e := exec.New(enabled(), j, st, g, &exec.KillSwitch{})
+	e.OnBook(exec.Top{Bid: 69_800, Ask: 70_400, AtNS: at(5), Synced: true})
+	if err := e.Tick(at(5)); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range g.sends {
+		got = append(got, describe(c))
+	}
+	equal(t, got, []string{"amend@70000x10"})
+}
+
+// TestJournalOpensInUnreadableDir: an existing journal in a directory the
+// process may write and search but not list still opens; only a new, empty
+// journal needs its directory entry synced.
+func TestJournalOpensInUnreadableDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	r := newRig(t, fixtureIntent(t), enabled())
+	r.j.Close()
+	dir := filepath.Dir(r.path)
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	j, st, err := exec.OpenJournal(r.path)
+	if err != nil {
+		t.Fatalf("existing journal: %v", err)
+	}
+	r.j = j
+	if !st.Started() {
+		t.Fatal("replay lost the start record")
+	}
+}

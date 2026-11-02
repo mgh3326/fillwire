@@ -1,6 +1,8 @@
 package exec_test
 
 import (
+	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/mgh3326/fillwire/internal/exec"
@@ -149,5 +151,59 @@ func TestFaultProcessKillAndRestart(t *testing.T) {
 			equal(t, r.actions(), c.wantAfter)
 			r.safe()
 		})
+	}
+}
+
+// outcomeFailGW answers every send as uncertain and every query as "no order";
+// it fails the first query and closes the journal inside the failAt-th send.
+type outcomeFailGW struct {
+	j      *exec.Journal
+	sends  int
+	failAt int
+	queryN int
+}
+
+func (g *outcomeFailGW) Send(c exec.Child) (exec.Outcome, error) {
+	g.sends++
+	if g.sends == g.failAt {
+		g.j.Close()
+	}
+	return exec.Outcome{Key: c.Key, Status: exec.StatusUncertain}, nil
+}
+
+func (g *outcomeFailGW) Query(string) (exec.View, error) {
+	g.queryN++
+	if g.queryN == 1 {
+		return exec.View{}, errors.New("query down")
+	}
+	return exec.View{}, nil
+}
+
+// An outcome append that fails on the last step of a Tick must surface from
+// that Tick, not only from the next one.
+func TestFaultOutcomeJournalFailureOnLastStep(t *testing.T) {
+	j, st, err := exec.OpenJournal(filepath.Join(t.TempDir(), "exec.journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { j.Close() })
+	gw := &outcomeFailGW{j: j, failAt: 5} // 1 send in the first Tick, the 4th of the second is the 5th overall
+	e := exec.New(enabled(), j, st, gw, &exec.KillSwitch{})
+	if err := e.Start(fixtureIntent(t), at(0)); err != nil {
+		t.Fatal(err)
+	}
+	e.OnBook(exec.Top{Bid: 70_000, Ask: 70_400, AtNS: at(0), Synced: true})
+	if err := e.Tick(at(0)); err == nil || gw.sends != 1 {
+		t.Fatalf("first tick: err %v sends %d", err, gw.sends)
+	}
+	err = e.Tick(at(0))
+	if gw.sends != 5 {
+		t.Fatalf("sends %d, want the 8th step to be the 5th send", gw.sends)
+	}
+	if !errors.Is(err, exec.ErrHalted) {
+		t.Fatalf("tick err %v, want ErrHalted", err)
+	}
+	if err := e.Tick(at(0)); !errors.Is(err, exec.ErrHalted) || gw.sends != 5 {
+		t.Fatalf("after halt: err %v sends %d", err, gw.sends)
 	}
 }

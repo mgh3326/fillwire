@@ -163,6 +163,7 @@ func (s State) sentKey(key string) (Child, bool) {
 
 func (s State) clone() State {
 	c := s
+	c.Intent = s.Intent.clone()
 	c.Fills = maps.Clone(s.Fills)
 	c.Sent = slices.Clone(s.Sent)
 	if s.Order != nil {
@@ -199,7 +200,7 @@ func Apply(s State, r Record) (State, error) {
 		if err := r.Intent.Validate(); err != nil {
 			return bad("%v", err)
 		}
-		n = State{Intent: *r.Intent, Cap: r.Intent.Cap(), Target: r.Intent.TargetQty(), Fills: map[string]Fill{}}
+		n = State{Intent: r.Intent.clone(), Cap: r.Intent.Cap(), Target: r.Intent.TargetQty(), Fills: map[string]Fill{}}
 	case RecSend:
 		c := r.Child
 		switch {
@@ -384,9 +385,14 @@ func decide(s State, in inputs) decision {
 	if rem < 1 {
 		return decision{} // the broker reports fills the ledger has not shown yet
 	}
+	if s.Order != nil && s.Order.Price == s.Cap && in.now-s.LastMoveNS >= in.cfg.StepEvery.Nanoseconds() {
+		// The order rested a full step at the cap. Like every cancel, this
+		// one needs no fresh book.
+		return send(Child{Action: ActCancel}, DoneCap)
+	}
 	t := in.top
-	if t == nil || !t.Synced || in.now-t.AtNS > in.cfg.StaleAfter.Nanoseconds() || t.Bid < 1 || t.Ask < 1 {
-		return decision{} // stale book: no new send
+	if t == nil || !t.Synced || t.AtNS > in.now || in.now-t.AtNS > in.cfg.StaleAfter.Nanoseconds() || t.Bid < 1 || t.Ask < 1 {
+		return decision{} // stale or future-stamped book: no new send
 	}
 	if s.Order == nil {
 		p := t.Bid
@@ -396,14 +402,18 @@ func decide(s State, in inputs) decision {
 		if s.Intent.worse(p, s.Cap) {
 			p = s.Cap
 		}
+		// A sell may open above Cap, where the whole remaining quantity
+		// could exceed max_notional_krw: hold the price to notionalCeil.
+		p = min(p, s.Intent.notionalCeil(rem))
 		return send(Child{Action: ActSubmit, Qty: rem, Price: p}, "open")
 	}
 	if in.now-s.LastMoveNS < in.cfg.StepEvery.Nanoseconds() {
 		return decision{}
 	}
-	if s.Order.Price == s.Cap {
-		return send(Child{Action: ActCancel}, DoneCap)
-	}
-	p := stepToward(s.Intent.Side, s.Order.Price, s.Cap)
+	// stepToward stops at the cap, which the cancel above handles. The
+	// notional bound is applied here too, not in Apply: a sell journaled
+	// above it before the bound existed must still replay, and its next
+	// step brings it back within max_notional_krw.
+	p := min(stepToward(s.Intent.Side, s.Order.Price, s.Cap), s.Intent.notionalCeil(rem))
 	return send(Child{Action: ActAmend, Qty: rem, Price: p}, "step")
 }
