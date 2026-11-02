@@ -194,3 +194,27 @@ func TestLegacySellAboveNotionalReplays(t *testing.T) {
 	}
 	equal(t, got, []string{"amend@70000x10"})
 }
+
+// TestJournalOpensInUnreadableDir: an existing journal in a directory the
+// process may write and search but not list still opens; only a new, empty
+// journal needs its directory entry synced.
+func TestJournalOpensInUnreadableDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	r := newRig(t, fixtureIntent(t), enabled())
+	r.j.Close()
+	dir := filepath.Dir(r.path)
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	j, st, err := exec.OpenJournal(r.path)
+	if err != nil {
+		t.Fatalf("existing journal: %v", err)
+	}
+	r.j = j
+	if !st.Started() {
+		t.Fatal("replay lost the start record")
+	}
+}

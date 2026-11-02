@@ -62,14 +62,17 @@ func openJournal(f *os.File, path string) (*Journal, State, error) {
 		}
 		return nil, State{}, err
 	}
-	// Make the file's directory entry durable, so a synced record never
-	// outlives the name it is reached by.
-	if err := syncDir(filepath.Dir(path)); err != nil {
-		return nil, State{}, err
-	}
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, State{}, err
+	}
+	if len(data) == 0 {
+		// A new journal, or one created by an open that crashed before its
+		// first record: make its directory entry durable before any record
+		// is synced into it. A journal with records had this done already.
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			return nil, State{}, err
+		}
 	}
 	st, n, end, err := replay(data)
 	if err != nil {
