@@ -118,12 +118,16 @@ type liveInputs struct {
 }
 
 func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry bool, until time.Time, in liveInputs) error {
-	interrupt := func() error {
+	if !dry {
+		in.Broker = cacheTerminalBrokerViews(in.Broker)
+	}
+	interrupted := errors.New("execmock: interrupted; verify terminal broker/ledger evidence before restarting")
+	stopForReconcile := func(reason error) error {
 		kill.Engage()
 		if err := e.Tick(in.Now().UnixNano()); err != nil {
 			return err
 		}
-		return errors.New("execmock: interrupted; verify terminal broker/ledger evidence before restarting")
+		return reason
 	}
 
 	step := func() error {
@@ -131,10 +135,16 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 		defer cancelPoll()
 		if !dry {
 			if err := refreshLedger(pollCtx, e, in.Ledger, in.Broker); err != nil {
+				if pollCtx.Err() != nil {
+					return pollCtx.Err()
+				}
 				return err
 			}
 		}
 		s, ok, err := in.Book(pollCtx)
+		if pollCtx.Err() != nil {
+			return pollCtx.Err()
+		}
 		if err != nil {
 			return err
 		}
@@ -155,7 +165,10 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 		}
 		if err := step(); err != nil {
 			if ctx.Err() != nil {
-				return interrupt()
+				return stopForReconcile(interrupted)
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return stopForReconcile(fmt.Errorf("execmock: poll deadline exceeded; operator reconcile required: %w", err))
 			}
 			return err
 		}
@@ -164,7 +177,7 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 		}
 		select {
 		case <-ctx.Done():
-			return interrupt()
+			return stopForReconcile(interrupted)
 		case _, ok := <-in.Ticks:
 			if !ok {
 				return errors.New("execmock: clock stopped")
@@ -263,7 +276,7 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	timer := time.NewTicker(500 * time.Millisecond)
+	timer := time.NewTicker(time.Second)
 	defer timer.Stop()
 	return driveLive(ctx, e, kill, dry, now.Add(duration), liveInputs{Book: func(ctx context.Context) (bookfeed.Snapshot, bool, error) {
 		return bookfeed.Latest(ctx, r, intent.Symbol)

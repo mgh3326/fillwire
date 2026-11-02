@@ -90,7 +90,7 @@ Do not schedule the run until every item holds:
    and receive timestamps. New submits/amends require a book within 2 s by
    default. An order working through more than 30 s of book silence cancels
    and stops as `stale_book`; after restart with no book, the stop timer uses
-   the journal's last order move.
+   the journal's last order move. Unsynced books cannot postpone that stop.
 
    The live command polls committed effective ledger rows through E1, then
    binds their broker IDs to accepted submit/amend outcomes in its local
@@ -107,7 +107,11 @@ Do not schedule the run until every item holds:
    order with matching quantities can keep working; it cannot justify a clean
    finish. Cancel acceptance alone is not terminal ledger completeness. Broker
    readback uses the mock-only `VTTC0081R` GET transaction, bounded to one
-   request per second per client; a poll has a 5-second overall deadline.
+   request per second per client. Polls run at a 1-second cadence. Confirmed
+   terminal exact-order readbacks are cached for that run, while ledger rows
+   are refreshed and compared on every poll; working and terminal-unverified
+   orders are reread. A poll has a 5-second overall deadline. A poll deadline
+   engages the kill switch, attempts cancellation and stops for reconcile.
 4. **Intent:** one intent stored through `SqlAlchemyGatewayStore.store_intent`, with `account = "kis_mock"`. Use the smallest size: 1 share, `max_notional_krw` below 100,000, and expiry within 30 minutes.
 
 ## Run steps (operator present)

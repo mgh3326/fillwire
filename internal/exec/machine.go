@@ -453,9 +453,9 @@ func decide(s State, in inputs) decision {
 }
 
 // A restart has no book. Count silence from the last order move until a
-// snapshot arrives; a future timestamp cannot postpone the stop.
+// synced snapshot arrives; a future timestamp cannot postpone the stop.
 func bookSilentSince(s State, in inputs) int64 {
-	if in.top != nil && in.top.AtNS > 0 && in.top.AtNS <= in.now {
+	if in.top != nil && in.top.Synced && in.top.AtNS > 0 && in.top.AtNS <= in.now {
 		return in.top.AtNS
 	}
 	return s.LastMoveNS

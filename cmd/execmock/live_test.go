@@ -469,3 +469,126 @@ func TestInterruptDuringReadCancelsWorkingOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestLiveLadderDoesNotRereadConfirmedTerminalOrders(t *testing.T) {
+	in := liveIntent(t)
+	in.LimitPriceKRW = 71000
+	start := in.ExpiresAt.Add(-35 * time.Second)
+	gateway := exectest.New(in)
+	e, kill := liveExecutor(t, in, gateway, true)
+	seconds := []int{0, 5, 10, 15, 20, 25, 30, 31}
+	ticks := make(chan time.Time, len(seconds))
+	for range seconds {
+		ticks <- time.Time{}
+	}
+	current := start
+	index := 0
+	calls := map[string]int{}
+	err := driveLive(context.Background(), e, kill, false, time.Time{}, liveInputs{
+		Ticks: ticks, Now: func() time.Time { return current },
+		Ledger: func(context.Context) (e1.FillsSnapshot, error) {
+			orders, err := e.BrokerOrders()
+			if err != nil {
+				return e1.FillsSnapshot{}, err
+			}
+			snapshot := e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{}}
+			for _, o := range orders {
+				snapshot.Orders = append(snapshot.Orders, e1.LedgerOrder{BrokerOrderID: o.BrokerOrderID, Fills: []e1.LedgerFill{}})
+			}
+			return snapshot, nil
+		},
+		Broker: func(_ context.Context, o exec.BrokerOrder) (brokerView, error) {
+			calls[o.Key]++
+			working := e.State().Order
+			return brokerView{Terminal: working == nil || o.Key != working.Key}, nil
+		},
+		Book: func(context.Context) (bookfeed.Snapshot, bool, error) {
+			if index >= len(seconds) {
+				t.Fatal("ladder did not finish")
+			}
+			current = start.Add(time.Duration(seconds[index]) * time.Second)
+			index++
+			if current.Equal(start.Add(30 * time.Second)) {
+				kill.Engage()
+			}
+			snapshot := bookfeed.Snapshot{Symbol: in.Symbol, Exchange: current, Received: current, Source: "ws"}
+			snapshot.Bids[0].Price = 70000
+			snapshot.Asks[0].Price = 70200
+			return snapshot, true, nil
+		},
+	})
+	if err != nil || e.State().Done != exec.DoneKilled {
+		t.Fatalf("ladder did not finish: done=%q err=%v", e.State().Done, err)
+	}
+	if len(calls) != 6 {
+		t.Fatalf("checked %d orders, want 6", len(calls))
+	}
+	for key, count := range calls {
+		if count != 2 {
+			t.Fatalf("broker readbacks for %s=%d, want 2 (working then terminal)", key, count)
+		}
+	}
+}
+
+func TestPollDeadlineCancelsWorkingOrder(t *testing.T) {
+	in := liveIntent(t)
+	start := in.ExpiresAt.Add(-35 * time.Second)
+	gateway := exectest.New(in)
+	e, kill := liveExecutor(t, in, numericGateway{gateway}, true)
+	e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: start.UnixNano(), Synced: true})
+	if err := e.Tick(start.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	parent := context.Background()
+	err := driveLive(parent, e, kill, false, time.Time{}, liveInputs{
+		Now: func() time.Time { return start.Add(time.Second) },
+		Ledger: func(context.Context) (e1.FillsSnapshot, error) {
+			return e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{{BrokerOrderID: "123", Fills: []e1.LedgerFill{}}}}, nil
+		},
+		Broker: func(ctx context.Context, _ exec.BrokerOrder) (brokerView, error) {
+			<-ctx.Done()
+			return brokerView{}, errors.New("readback unavailable")
+		},
+		Book: func(context.Context) (bookfeed.Snapshot, bool, error) {
+			t.Fatal("book read after failed broker poll")
+			return bookfeed.Snapshot{}, false, nil
+		},
+	})
+	if parent.Err() != nil {
+		t.Fatal("parent context unexpectedly canceled")
+	}
+	if !kill.Engaged() || len(gateway.Sends) != 2 || gateway.Sends[1].Action != exec.ActCancel {
+		t.Fatalf("poll deadline: kill=%v sends=%+v; want submit followed by cancel", kill.Engaged(), gateway.Sends)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || e.State().Done != "" {
+		t.Fatalf("deadline lost or clean finish claimed: done=%q err=%v", e.State().Done, err)
+	}
+}
+
+func TestCachedTerminalReadbackStillChecksLedgerCumulativeQuantity(t *testing.T) {
+	in := liveIntent(t)
+	start := in.ExpiresAt.Add(-35 * time.Second)
+	e, _ := liveExecutor(t, in, numericGateway{exectest.New(in)}, true)
+	e.OnBook(exec.Top{Bid: 70000, Ask: 70200, AtNS: start.UnixNano(), Synced: true})
+	if err := e.Tick(start.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	broker := cacheTerminalBrokerViews(func(context.Context, exec.BrokerOrder) (brokerView, error) {
+		calls++
+		return brokerView{Terminal: true}, nil
+	})
+	snapshot := e1.FillsSnapshot{IntentID: in.IntentID, Orders: []e1.LedgerOrder{{BrokerOrderID: "123", Fills: []e1.LedgerFill{}}}}
+	read := func(context.Context) (e1.FillsSnapshot, error) { return snapshot, nil }
+	if err := refreshLedger(context.Background(), e, read, broker); err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Orders[0].CumulativeQty = 1
+	snapshot.Orders[0].Fills = []e1.LedgerFill{{FillID: "late-ledger-row", Side: in.Side, Qty: 1, Price: "70000", FilledAt: start.Add(time.Second), CommittedAt: start.Add(2 * time.Second)}}
+	if err := refreshLedger(context.Background(), e, read, broker); !errors.Is(err, exec.ErrIncomplete) {
+		t.Fatalf("cached terminal evidence hid a cumulative mismatch: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("terminal readback calls=%d, want 1", calls)
+	}
+}

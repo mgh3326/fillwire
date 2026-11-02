@@ -79,3 +79,20 @@ func (r historyRead) read(ctx context.Context, o exec.BrokerOrder) (brokerView, 
 	}
 	return *found, nil
 }
+
+// A terminal exact-order readback cannot acquire new fills. Retain that
+// evidence for this run; refreshLedger still compares every ledger snapshot
+// against it. Working and terminal-unverified orders are read again each poll.
+func cacheTerminalBrokerViews(read brokerRead) brokerRead {
+	terminal := make(map[exec.BrokerOrder]brokerView)
+	return func(ctx context.Context, order exec.BrokerOrder) (brokerView, error) {
+		if view, ok := terminal[order]; ok {
+			return view, nil
+		}
+		view, err := read(ctx, order)
+		if err == nil && view.Terminal {
+			terminal[order] = view
+		}
+		return view, err
+	}
+}

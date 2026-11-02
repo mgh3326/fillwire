@@ -3,6 +3,7 @@ package exec_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/fillwire/internal/exec"
 )
@@ -198,4 +199,24 @@ func TestDeferredCompletionSurvivesRestart(t *testing.T) {
 	if r.e.State().Done != exec.DoneKilled {
 		t.Fatalf("lost deferred finish after replay: %+v", r.e.State())
 	}
+}
+
+func TestUnsyncedBooksCannotPostponeStaleStop(t *testing.T) {
+	cfg := enabled()
+	cfg.StepEvery = time.Minute
+	r := newRig(t, fixtureIntent(t), cfg)
+	r.book(0, 70000, 70400)
+	if err := r.e.Tick(at(0)); err != nil {
+		t.Fatal(err)
+	}
+	for _, sec := range []float64{10, 20, 30, 31} {
+		r.e.OnBook(exec.Top{Bid: 70000, Ask: 70400, AtNS: at(sec), Synced: false})
+		if err := r.e.Tick(at(sec)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st := r.e.State(); st.Done != exec.DoneStaleBook || st.Order != nil {
+		t.Fatalf("unsynced books postponed stale stop: done=%q working=%v; want stale_book with no working order", st.Done, st.Order != nil)
+	}
+	equal(t, r.actions(), []string{"submit@70000x10", "cancel"})
 }
