@@ -16,7 +16,8 @@ import (
 )
 
 type fileConfig struct {
-	KIS struct {
+	Books bookSettings `toml:"books"`
+	KIS   struct {
 		Broker        string `toml:"broker"`
 		Endpoint      string `toml:"endpoint"`
 		AccountMode   string `toml:"account_mode"`

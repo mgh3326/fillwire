@@ -56,9 +56,8 @@ var (
 	ErrAccountNotMock = errors.New("e1: account is not kis_mock")
 	// ErrConfig refuses a config that cannot run as written.
 	ErrConfig = errors.New("e1: invalid config")
-	// ErrNoReconcile is Query's answer: E1 has no reconcile surface, so an
-	// unknown outcome stays unknown and the executor sends nothing more.
-	ErrNoReconcile = errors.New("e1: the gateway has no reconcile query; the child stays unresolved")
+	// ErrNoReconcile means the route has no usable reconciled view.
+	ErrNoReconcile = errors.New("e1: no usable reconcile view; the child stays unresolved")
 	// ErrNoAnswer is a dry-run send with no simulated answer: the outcome is
 	// unknown and the executor holds.
 	ErrNoAnswer = errors.New("e1: dry run, no answer")
@@ -399,10 +398,9 @@ func (c *Client) dryRun(ch exec.Child, body []byte) (exec.Outcome, error) {
 	return o.ToExec(ch), nil
 }
 
-// Query implements exec.Gateway. E1 has no reconcile surface yet (contract,
-// "Open items for E2 and E3"), so it always fails: an unknown outcome stays
-// unresolved and the executor sends nothing more for this intent.
-func (c *Client) Query(string) (exec.View, error) { return exec.View{}, ErrNoReconcile }
+// Query implements exec.Gateway using the authenticated intent read route.
+// An unresolved or missing view is never converted to an empty order.
+func (c *Client) Query(intentID string) (exec.View, error) { return c.query(intentID) }
 
 // Outcome is E1's GatewayOutcome (gateway.py) as JSON.
 type Outcome struct {

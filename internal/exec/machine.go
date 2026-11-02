@@ -100,14 +100,15 @@ const (
 // and it reads nothing but the state and the record, so replaying a journal
 // rebuilds the state exactly.
 type Record struct {
-	Kind    string   `json:"kind"`
-	AtNS    int64    `json:"at_ns"`
-	Intent  *Intent  `json:"intent,omitempty"`
-	Child   *Child   `json:"child,omitempty"`
-	Reason  string   `json:"reason,omitempty"`
-	Outcome *Outcome `json:"outcome,omitempty"`
-	View    *View    `json:"view,omitempty"`
-	Fill    *Fill    `json:"fill,omitempty"`
+	Kind        string   `json:"kind"`
+	DeferFinish bool     `json:"defer_finish,omitempty"`
+	AtNS        int64    `json:"at_ns"`
+	Intent      *Intent  `json:"intent,omitempty"`
+	Child       *Child   `json:"child,omitempty"`
+	Reason      string   `json:"reason,omitempty"`
+	Outcome     *Outcome `json:"outcome,omitempty"`
+	View        *View    `json:"view,omitempty"`
+	Fill        *Fill    `json:"fill,omitempty"`
 }
 
 // State is everything the executor knows about one intent.
@@ -251,7 +252,11 @@ func Apply(s State, r Record) (State, error) {
 		switch {
 		case o.Status == StatusAccepted && c.Action == ActCancel:
 			n.Order = nil
-			n.Done = s.InFlightReason
+			if r.DeferFinish {
+				n.Halt = s.InFlightReason
+			} else {
+				n.Done = s.InFlightReason
+			}
 		case o.Status == StatusAccepted && c.Action == ActSubmit:
 			n.Order = &Order{Key: c.Key, Price: c.Price, Qty: c.Qty}
 		case o.Status == StatusAccepted:
@@ -285,7 +290,11 @@ func Apply(s State, r Record) (State, error) {
 		}
 		n.BrokerFilled = max(s.BrokerFilled, v.FilledQty)
 		if s.InFlight != nil && s.InFlight.Action == ActCancel && n.Order == nil {
-			n.Done = s.InFlightReason
+			if r.DeferFinish {
+				n.Halt = s.InFlightReason
+			} else {
+				n.Done = s.InFlightReason
+			}
 		}
 		n.InFlight, n.InFlightStatus, n.InFlightReason = nil, "", ""
 	case RecFill:

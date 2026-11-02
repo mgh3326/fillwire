@@ -174,3 +174,28 @@ func TestLedgerBrokerIdentityNormalizationAndAmbiguity(t *testing.T) {
 		t.Fatalf("ambiguous order: %v", err)
 	}
 }
+
+func TestDeferredCompletionSurvivesRestart(t *testing.T) {
+	cfg := enabled()
+	cfg.RequireLedgerComplete = true
+	r := newRig(t, fixtureIntent(t), cfg)
+	r.book(0, 70000, 70400)
+	if err := r.e.Tick(at(0)); err != nil {
+		t.Fatal(err)
+	}
+	r.kill.Engage()
+	if err := r.e.Tick(at(1)); err != nil {
+		t.Fatal(err)
+	}
+	if r.e.State().Done != "" || r.e.State().Halt != exec.DoneKilled {
+		t.Fatalf("premature completion %+v", r.e.State())
+	}
+	r.restart()
+	r.e.SetLedgerComplete(true)
+	if err := r.e.Tick(at(2)); err != nil {
+		t.Fatal(err)
+	}
+	if r.e.State().Done != exec.DoneKilled {
+		t.Fatalf("lost deferred finish after replay: %+v", r.e.State())
+	}
+}

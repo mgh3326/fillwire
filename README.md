@@ -2,7 +2,9 @@
 
 Fillwire listens to broker execution feeds, persists decoded fills to Redis Streams, and delivers them through independent consumer groups.
 
-It is a runtime, not a broker client: protocol code lives in separate libraries (for example, `go-kis`). Fillwire never places orders — it listens, persists, and delivers.
+It is a runtime, not a broker client: protocol code lives in separate libraries (for example, `go-kis`). `fillwire` never places orders: it listens, persists, and delivers. The separate
+operator command [`execmock`](docs/e3a-mock-runbook.md) can send approved KIS mock
+intents, with sending off by default.
 
 ## Scope
 
@@ -438,11 +440,11 @@ rec.Tick(time.Now())                   // every 500 ms
 ```
 
 `bookrec record -out FILE < frames` does the same for raw frames piped one
-per line on stdin, stamping each with its read time. Nothing feeds a live
-KIS socket to it yet: KIS admits one websocket session per app key, and
-fillwire already holds that session for `fills:kis`. A live source needs
-either a second app key or the book and trade subscriptions inside the
-fillwire process.
+per line on stdin, stamping each with its read time. The optional [live book producer](docs/book-feed.md) subscribes `H0STASP0`
+inside fillwire's existing KIS session and writes `book:kis:<symbol>` to Redis.
+It does not open another session or change the offline evidence format. Mock
+mode has a read-only REST quotation fallback. Both the producer and execmock's
+send mode remain off by default.
 
 Each evidence line is one JSON object written with a single `write`:
 

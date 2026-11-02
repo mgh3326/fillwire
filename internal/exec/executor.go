@@ -13,6 +13,8 @@ type Config struct {
 	// child request of any kind, cancels included. It still reconciles and
 	// records fills, and finishes only as filled with no order working.
 	SendEnabled bool
+	// RequireLedgerComplete gates finishing on a fresh, terminal broker/ledger check.
+	RequireLedgerComplete bool
 	// StepEvery is how long an order rests at one price before it moves one
 	// tick toward the cap.
 	StepEvery time.Duration
@@ -51,18 +53,24 @@ func (k *KillSwitch) Engaged() bool { return k == nil || k.engaged.Load() }
 // Executor works one intent. It is driven from one goroutine: OnBook, OnFill
 // and Tick must not run concurrently.
 type Executor struct {
-	cfg   Config
-	j     *Journal
-	gw    Gateway
-	kill  *KillSwitch
-	state State
-	top   *Top
-	err   error
+	cfg            Config
+	j              *Journal
+	gw             Gateway
+	kill           *KillSwitch
+	state          State
+	top            *Top
+	err            error
+	ledgerComplete bool
 }
 
-// ErrOverfill is returned by OnFill when ledger fills exceed the target.
-// The fill is recorded; the executor sends nothing more but a cancel of its
-// working order. The caller should alert an operator.
+// ErrIncomplete means terminal broker evidence and committed ledger fills do not agree.
+var ErrIncomplete = errors.New("exec: incomplete ledger evidence; operator reconcile required")
+
+// SetLedgerComplete records the current poll's completeness decision in memory.
+// The live runner refreshes it before every Tick; it is false after restart.
+func (e *Executor) SetLedgerComplete(complete bool) { e.ledgerComplete = complete }
+
+// ErrOverfill records excess ledger fills and requires operator attention.
 var ErrOverfill = errors.New("exec: ledger fills exceed the target")
 
 // ErrHalted is returned once a journal write failed; the executor then does
@@ -124,16 +132,24 @@ func (e *Executor) Tick(nowNS int64) error {
 			if err != nil {
 				return fmt.Errorf("exec: reconcile: %w", err) // still unresolved; nothing is sent
 			}
-			if err := e.commit(Record{Kind: RecReconcile, AtNS: nowNS, View: &v}); err != nil {
+			if err := e.commit(Record{Kind: RecReconcile, AtNS: nowNS, View: &v, DeferFinish: e.cfg.RequireLedgerComplete}); err != nil {
 				return err
 			}
 		case d.rec != nil:
+			if d.rec.Kind == RecFinish && e.cfg.RequireLedgerComplete && !e.ledgerComplete {
+				e.err = ErrIncomplete
+				return e.err
+			}
 			if err := e.commit(*d.rec); err != nil {
 				return err
 			}
 			if d.rec.Kind == RecSend {
 				if err := e.send(*d.rec.Child, nowNS); err != nil {
 					return err
+				}
+				if e.cfg.RequireLedgerComplete {
+					e.ledgerComplete = false
+					return nil
 				}
 			}
 		default:
@@ -154,7 +170,7 @@ func (e *Executor) send(c Child, nowNS int64) error {
 	if out.Key != c.Key {
 		out = Outcome{Key: c.Key, Status: StatusUncertain, Reason: fmt.Sprintf("answer for key %q", out.Key)}
 	}
-	return e.commit(Record{Kind: RecOutcome, AtNS: nowNS, Outcome: &out})
+	return e.commit(Record{Kind: RecOutcome, AtNS: nowNS, Outcome: &out, DeferFinish: e.cfg.RequireLedgerComplete})
 }
 
 // commit applies r, journals it, and only then makes it the current state.

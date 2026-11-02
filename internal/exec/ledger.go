@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 )
@@ -98,4 +99,27 @@ func (e *Executor) OnLedgerFill(brokerOrderID string, f Fill) error {
 		return fail("ledger fill id changed evidence")
 	}
 	return e.OnFill(f)
+}
+
+// BrokerOrder is one accepted submit/amend identity projected from this journal.
+type BrokerOrder struct {
+	BrokerOrderID, Key, TradingDay string
+	Qty                            int64
+}
+
+func (e *Executor) BrokerOrders() ([]BrokerOrder, error) {
+	keys, err := e.j.brokerKeys()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]BrokerOrder, 0, len(keys))
+	for id, key := range keys {
+		child, ok := e.state.sentKey(key)
+		if !ok {
+			return nil, ErrAttribution
+		}
+		out = append(out, BrokerOrder{BrokerOrderID: id.number, Key: key, TradingDay: id.day, Qty: child.Qty})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
 }
