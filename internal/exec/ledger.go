@@ -48,7 +48,7 @@ func (j *Journal) brokerKeys() (map[orderDay]string, error) {
 		if r.Kind == RecSend && r.Child != nil {
 			sends[r.Child.Key] = r
 		}
-		if r.Kind != RecOutcome || r.Outcome == nil || r.Outcome.Status != StatusAccepted || NormalizeOrderNumber(r.Outcome.BrokerOrderID) == "" {
+		if r.Kind != RecOutcome || r.Outcome == nil || r.Outcome.Status != StatusAccepted || strings.TrimSpace(r.Outcome.BrokerOrderID) == "" {
 			return nil
 		}
 		send, ok := sends[r.Outcome.Key]
@@ -57,6 +57,13 @@ func (j *Journal) brokerKeys() (map[orderDay]string, error) {
 		}
 		if send.Child.Action == ActCancel {
 			return nil
+		}
+		// An accepted order whose number normalizes to nothing (all zeros) can
+		// never be matched to the ledger or read back from the broker. Skipping
+		// it would drop the order from BrokerOrders and let completion pass
+		// without checking its fills, so refuse instead.
+		if NormalizeOrderNumber(r.Outcome.BrokerOrderID) == "" {
+			return fmt.Errorf("%w: accepted order has an all-zero broker order number", ErrAttribution)
 		}
 		id := orderIdentity(r.Outcome.BrokerOrderID, send.AtNS)
 		if previous, exists := keys[id]; exists && previous != r.Outcome.Key {

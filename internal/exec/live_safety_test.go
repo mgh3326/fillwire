@@ -233,3 +233,35 @@ func TestNormalizeOrderNumber(t *testing.T) {
 		}
 	}
 }
+
+type zeroOrderID struct{ exec.Gateway }
+
+func (g zeroOrderID) Send(c exec.Child) (exec.Outcome, error) {
+	out, err := g.Gateway.Send(c)
+	if c.Action != exec.ActCancel {
+		out.BrokerOrderID = "0000000000"
+	}
+	return out, err
+}
+
+// An accepted order with an all-zero broker order number cannot be read back
+// or attributed, so it must stop the ledger check instead of being dropped
+// from the broker order set (which would let completion pass unchecked).
+func TestAllZeroBrokerOrderNumberFailsClosed(t *testing.T) {
+	r := newRig(t, fixtureIntent(t), enabled())
+	r.e = exec.New(r.cfg, r.j, r.e.State(), zeroOrderID{r.g}, r.kill)
+	r.book(0, 70000, 70400)
+	if err := r.e.Tick(at(0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.e.BrokerOrders(); !errors.Is(err, exec.ErrAttribution) {
+		t.Fatalf("BrokerOrders error %v, want ErrAttribution", err)
+	}
+	f := exec.Fill{FillID: "ledger-1", Qty: 1, Price: 70000, AtNS: at(1)}
+	if err := r.e.OnLedgerFill("0000000000", f); !errors.Is(err, exec.ErrAttribution) {
+		t.Fatalf("OnLedgerFill error %v, want ErrAttribution", err)
+	}
+	if r.e.State().Filled != 0 {
+		t.Fatal("counted a fill on an all-zero broker order number")
+	}
+}
