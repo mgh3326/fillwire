@@ -92,7 +92,7 @@ func (c *Client) Fills(ctx context.Context) (FillsSnapshot, error) {
 	ids := map[string]bool{}
 	orders := map[string]bool{}
 	for _, o := range s.Orders {
-		number := strings.TrimLeft(o.BrokerOrderID, "0")
+		number := exec.NormalizeOrderNumber(o.BrokerOrderID)
 		if number == "" || orders[number] || o.CumulativeQty < 0 || o.Fills == nil {
 			return s, errors.New("e1: invalid ledger order")
 		}

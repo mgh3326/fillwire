@@ -6,6 +6,7 @@ package sim
 import (
 	"bytes"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 
@@ -170,12 +171,16 @@ func RunOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path st
 		Sends: len(g.Sends), Done: s.Done, Violations: len(g.Violations),
 	}
 	if s.Filled > 0 {
-		avg := float64(s.FillNotional) / float64(s.Filled)
+		// Exact rational arithmetic, rounded once at the end, so a report
+		// value never depends on float evaluation order.
+		avg := new(big.Rat).SetFrac64(s.FillNotional, s.Filled)
 		r.AvgPrice = round2(avg)
 		if mid > 0 {
-			bps := (avg - mid) / mid * 10_000
+			m := new(big.Rat).SetFloat64(mid) // a half-integer: exact
+			bps := new(big.Rat).Sub(avg, m)
+			bps.Quo(bps, m).Mul(bps, big.NewRat(10_000, 1))
 			if in.Side == exec.Sell {
-				bps = -bps
+				bps.Neg(bps)
 			}
 			r.SlippageBps = round2(bps)
 		}
@@ -209,9 +214,16 @@ func through(side exec.Side, p, o int64) bool {
 	return p > o
 }
 
-func round2(v float64) float64 {
-	if v < 0 {
-		return -round2(-v)
+// round2 rounds v to 2 decimals, half away from zero, from its exact value.
+func round2(v *big.Rat) float64 {
+	x := new(big.Rat).Mul(v, big.NewRat(100, 1))
+	num := new(big.Int).Abs(x.Num())
+	q, rem := new(big.Int).QuoRem(num, x.Denom(), new(big.Int))
+	if rem.Lsh(rem, 1).Cmp(x.Denom()) >= 0 {
+		q.Add(q, big.NewInt(1))
 	}
-	return float64(int64(v*100+0.5)) / 100
+	if x.Sign() < 0 {
+		q.Neg(q)
+	}
+	return float64(q.Int64()) / 100
 }

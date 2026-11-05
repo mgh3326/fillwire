@@ -48,7 +48,7 @@ func (r historyRead) read(ctx context.Context, o exec.BrokerOrder) (brokerView, 
 	}
 	var found *brokerView
 	for _, row := range response.Rows {
-		if strings.TrimLeft(row.ID, "0") != o.BrokerOrderID || row.Day != day {
+		if exec.NormalizeOrderNumber(row.ID) != o.BrokerOrderID || row.Day != day {
 			continue
 		}
 		side := "02"

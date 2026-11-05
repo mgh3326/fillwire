@@ -60,7 +60,7 @@ func TestLedgerFillAttributedAfterRestart(t *testing.T) {
 }
 
 func TestLedgerAttributionErrorsStopExecutor(t *testing.T) {
-	for _, kind := range []string{"unknown_order", "missing_order", "unknown_key", "wrong_day", "changed_fill"} {
+	for _, kind := range []string{"unknown_order", "missing_order", "all_zero_order", "unknown_key", "wrong_day", "changed_fill"} {
 		t.Run(kind, func(t *testing.T) {
 			r := newRig(t, fixtureIntent(t), enabled())
 			r.book(0, 70000, 70400)
@@ -75,6 +75,8 @@ func TestLedgerAttributionErrorsStopExecutor(t *testing.T) {
 				id = "unknown"
 			case "missing_order":
 				id = ""
+			case "all_zero_order":
+				id = " 0000 "
 			case "unknown_key":
 				f.Key = "unknown"
 			case "wrong_day":
@@ -219,4 +221,15 @@ func TestUnsyncedBooksCannotPostponeStaleStop(t *testing.T) {
 		t.Fatalf("unsynced books postponed stale stop: done=%q working=%v; want stale_book with no working order", st.Done, st.Order != nil)
 	}
 	equal(t, r.actions(), []string{"submit@70000x10", "cancel"})
+}
+
+func TestNormalizeOrderNumber(t *testing.T) {
+	for in, want := range map[string]string{
+		"0000123": "123", " 123 ": "123", "123": "123", "1230": "1230",
+		"": "", "   ": "", "0000": "", "fake-x": "fake-x",
+	} {
+		if got := exec.NormalizeOrderNumber(in); got != want {
+			t.Errorf("NormalizeOrderNumber(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

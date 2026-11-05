@@ -252,14 +252,9 @@ func Apply(s State, r Record) (State, error) {
 		switch {
 		case o.Status == StatusAccepted && c.Action == ActCancel:
 			n.Order = nil
-			if r.DeferFinish {
-				n.Halt = s.InFlightReason
-			} else {
-				n.Done = s.InFlightReason
-			}
-		case o.Status == StatusAccepted && c.Action == ActSubmit:
-			n.Order = &Order{Key: c.Key, Price: c.Price, Qty: c.Qty}
+			n.resolveCancel(s.InFlightReason, r.DeferFinish)
 		case o.Status == StatusAccepted:
+			// An accepted submit or amend is the new working order.
 			n.Order = &Order{Key: c.Key, Price: c.Price, Qty: c.Qty}
 		case o.Status == StatusRefused && c.Action != ActCancel:
 			n.Halt = DoneRefused
@@ -290,11 +285,7 @@ func Apply(s State, r Record) (State, error) {
 		}
 		n.BrokerFilled = max(s.BrokerFilled, v.FilledQty)
 		if s.InFlight != nil && s.InFlight.Action == ActCancel && n.Order == nil {
-			if r.DeferFinish {
-				n.Halt = s.InFlightReason
-			} else {
-				n.Done = s.InFlightReason
-			}
+			n.resolveCancel(s.InFlightReason, r.DeferFinish)
 		}
 		n.InFlight, n.InFlightStatus, n.InFlightReason = nil, "", ""
 	case RecFill:
@@ -483,4 +474,15 @@ func (s State) fitNewOrder(rem, p int64) (q, price int64) {
 	// nRoom/q >= Cap and Cap is a grid price, so the floor stays at or above
 	// Cap.
 	return q, min(p, FloorTick(nRoom/q))
+}
+
+// resolveCancel ends the intent after its cancel resolved, by an accepted
+// outcome or by a reconcile showing no working order: it finishes with the
+// cancel's reason, or halts with it when the record defers finishing.
+func (n *State) resolveCancel(reason string, deferFinish bool) {
+	if deferFinish {
+		n.Halt = reason
+	} else {
+		n.Done = reason
+	}
 }

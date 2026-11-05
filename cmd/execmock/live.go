@@ -71,7 +71,7 @@ func refreshLedger(ctx context.Context, e *exec.Executor, read ledgerRead, broke
 	seenOrders := map[string]bool{}
 	complete := true
 	for _, o := range s.Orders {
-		number := strings.TrimLeft(o.BrokerOrderID, "0")
+		number := exec.NormalizeOrderNumber(o.BrokerOrderID)
 		known, ok := expected[number]
 		if !ok || seenOrders[number] {
 			return exec.ErrAttribution

@@ -33,8 +33,8 @@ func Poll(ctx context.Context, r RESTReader, symbol string, now func() time.Time
 	}
 	for i := range 5 {
 		n := strconv.Itoa(i + 1)
-		for key, p := range map[string]*int64{"bidp" + n: &s.Bids[i].Price, "bidp_rsqn" + n: &s.Bids[i].Qty, "askp" + n: &s.Asks[i].Price, "askp_rsqn" + n: &s.Asks[i].Qty} {
-			*p, err = strconv.ParseInt(response.Output[key], 10, 64)
+		for _, f := range levelFields(&s, i, "bidp"+n, "bidp_rsqn"+n, "askp"+n, "askp_rsqn"+n) {
+			*f.dst, err = strconv.ParseInt(response.Output[f.key], 10, 64)
 			if err != nil {
 				return s, errors.New("bookfeed: invalid asking-price level")
 			}

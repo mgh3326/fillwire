@@ -1,7 +1,6 @@
 package exec
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,12 +17,16 @@ var ErrAttribution = errors.New("exec: ledger fill attribution failed")
 
 type orderDay struct{ number, day string }
 
+// NormalizeOrderNumber is the one comparison form of a KIS broker order
+// number (ODNO): surrounding space and leading zeros removed, so "0000123",
+// " 123" and "123" are the same order. A blank or all-zero number normalizes
+// to "", which no caller accepts as an order identity.
+func NormalizeOrderNumber(number string) string {
+	return strings.TrimLeft(strings.TrimSpace(number), "0")
+}
+
 func orderIdentity(number string, atNS int64) orderDay {
-	number = strings.TrimLeft(strings.TrimSpace(number), "0")
-	if number == "" {
-		number = "0"
-	}
-	return orderDay{number, time.Unix(0, atNS).In(kst.Zone).Format("2006-01-02")}
+	return orderDay{NormalizeOrderNumber(number), time.Unix(0, atNS).In(kst.Zone).Format("2006-01-02")}
 }
 
 // brokerKeys derives identities from the durable send/outcome pairs, including
@@ -34,37 +37,38 @@ func (j *Journal) brokerKeys() (map[orderDay]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	dec := json.NewDecoder(io.NewSectionReader(j.f, 0, info.Size()))
+	data, err := io.ReadAll(io.NewSectionReader(j.f, 0, info.Size()))
+	if err != nil {
+		return nil, err
+	}
 	sends := map[string]Record{}
 	keys := map[orderDay]string{}
-	for {
-		var line journalLine
-		if err := dec.Decode(&line); err != nil {
-			if err == io.EOF {
-				return keys, nil
-			}
-			return nil, err
-		}
+	_, _, err = eachLine(data, func(_ uint64, line journalLine) error {
 		r := line.Rec
 		if r.Kind == RecSend && r.Child != nil {
 			sends[r.Child.Key] = r
 		}
-		if r.Kind != RecOutcome || r.Outcome == nil || r.Outcome.Status != StatusAccepted || strings.TrimSpace(r.Outcome.BrokerOrderID) == "" {
-			continue
+		if r.Kind != RecOutcome || r.Outcome == nil || r.Outcome.Status != StatusAccepted || NormalizeOrderNumber(r.Outcome.BrokerOrderID) == "" {
+			return nil
 		}
 		send, ok := sends[r.Outcome.Key]
 		if !ok {
-			return nil, ErrAttribution
+			return ErrAttribution
 		}
 		if send.Child.Action == ActCancel {
-			continue
+			return nil
 		}
 		id := orderIdentity(r.Outcome.BrokerOrderID, send.AtNS)
 		if previous, exists := keys[id]; exists && previous != r.Outcome.Key {
-			return nil, fmt.Errorf("%w: broker order has multiple journal keys", ErrAttribution)
+			return fmt.Errorf("%w: broker order has multiple journal keys", ErrAttribution)
 		}
 		keys[id] = r.Outcome.Key
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	return keys, nil
 }
 
 // OnLedgerFill binds a scoped ledger row to its journaled broker order. The
@@ -82,7 +86,7 @@ func (e *Executor) OnLedgerFill(brokerOrderID string, f Fill) error {
 		e.err = fmt.Errorf("%w: %s", ErrAttribution, why)
 		return e.err
 	}
-	if !e.state.Started() || strings.TrimSpace(brokerOrderID) == "" || f.AtNS <= 0 || f.FillID == "" || f.Qty <= 0 || f.Price <= 0 {
+	if !e.state.Started() || NormalizeOrderNumber(brokerOrderID) == "" || f.AtNS <= 0 || f.FillID == "" || f.Qty <= 0 || f.Price <= 0 {
 		return fail("incomplete ledger evidence")
 	}
 	keys, err := e.j.brokerKeys()
