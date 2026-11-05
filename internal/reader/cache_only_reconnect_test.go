@@ -10,9 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
-	"github.com/redis/go-redis/v9"
 )
 
 type reconnectFallback struct{ reissueCalls atomic.Int32 }
@@ -124,9 +123,7 @@ func (c pacedClock) After(delay time.Duration) <-chan time.Time {
 }
 
 func TestCacheOnlyReconnectOPSP0011TerminatesReader(t *testing.T) {
-	mini := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { _ = redisClient.Close() })
+	mini, redisClient := testutil.Redis(t)
 	if err := mini.Set(approvalCacheKey, "cached-synthetic-key"); err != nil {
 		t.Fatal(err)
 	}

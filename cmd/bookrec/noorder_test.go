@@ -15,6 +15,8 @@ import (
 var allowedDeps = map[string]bool{
 	"github.com/mgh3326/fillwire/cmd/bookrec":   true,
 	"github.com/mgh3326/fillwire/internal/book": true,
+	// kst is a single time.FixedZone constant; it imports only "time".
+	"github.com/mgh3326/fillwire/internal/kst": true,
 }
 
 // forbiddenStdDeps keeps bookrec free of any network client.

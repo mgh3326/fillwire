@@ -9,18 +9,21 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/mgh3326/fillwire/internal/exitcode"
 	"github.com/mgh3326/go-kis/kis"
 	"github.com/mgh3326/go-kis/kis/ws"
 )
 
 // ExitCodeSessionOccupied is reserved for KIS OPSP8996. A supervisor can use
 // it to distinguish the session-holder case from other process failures.
-const ExitCodeSessionOccupied = 42
+const ExitCodeSessionOccupied = exitcode.SessionOccupied
 
 // ExitCodeCacheOnlyApprovalUnavailable is reserved for a permanent loss of
 // the Redis-cached KIS approval key in cache-only mode.
-const ExitCodeCacheOnlyApprovalUnavailable = 78
-const ExitCodeConfiguration = 78
+const ExitCodeCacheOnlyApprovalUnavailable = exitcode.Config
+
+// ExitCodeConfiguration is returned for invalid configuration.
+const ExitCodeConfiguration = exitcode.Config
 
 // ErrEventsClosed reports that KIS stopped the event stream without a caller
 // initiated shutdown. Treating this as success would leave the process alive
@@ -259,5 +262,5 @@ func ProcessExitCode(err error) int {
 	if errors.Is(err, ws.ErrSessionOccupied) {
 		return ExitCodeSessionOccupied
 	}
-	return 1
+	return exitcode.Failure
 }

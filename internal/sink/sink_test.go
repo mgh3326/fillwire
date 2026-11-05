@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -728,9 +728,7 @@ func TestNewClientRejectsInvalidTokenHeader(t *testing.T) {
 
 func testQueue(t *testing.T, consumer string, batchSize int64, claimMinIdle time.Duration) (*redis.Client, *stream.Queue, *decode.Counters) {
 	t.Helper()
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
+	_, client := testutil.Redis(t)
 	counters := decode.NewCounters()
 	queue, err := stream.New(client, stream.Config{
 		Key: "fills:kis", MaxLen: 1000, Group: "fillwire-ingest", Consumer: consumer,

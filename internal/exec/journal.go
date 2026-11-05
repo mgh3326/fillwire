@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/mgh3326/fillwire/internal/jsonx"
 )
 
 // JournalVersion is the journal line format.
@@ -114,33 +116,44 @@ func ReplayJournal(r io.Reader) (State, error) {
 // replay applies every complete line and returns the state, the record count
 // and the byte offset just past the last complete line.
 func replay(data []byte) (st State, n uint64, end int, err error) {
+	n, end, err = eachLine(data, func(seq uint64, l journalLine) error {
+		next, err := Apply(st, l.Rec)
+		if err != nil {
+			return fmt.Errorf("%w: line %d: %v", ErrCorrupt, seq, err)
+		}
+		if next.Digest() != l.State {
+			return fmt.Errorf("%w: line %d: state digest differs", ErrCorrupt, seq)
+		}
+		st = next
+		return nil
+	})
+	return st, n, end, err
+}
+
+// eachLine is the one journal line reader. It strictly decodes every complete
+// line, checks its version and sequence, and calls fn in order. A torn tail
+// (bytes after the last newline) was never synced or acted on and is skipped.
+// It returns the count of lines fn accepted and the byte offset just past the
+// last of them.
+func eachLine(data []byte, fn func(seq uint64, l journalLine) error) (n uint64, end int, err error) {
 	for end < len(data) {
 		i := bytes.IndexByte(data[end:], '\n')
 		if i < 0 {
-			return st, n, end, nil // torn tail: never synced, never acted on
+			return n, end, nil // torn tail: never synced, never acted on
 		}
 		var l journalLine
-		dec := json.NewDecoder(bytes.NewReader(data[end : end+i]))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&l); err != nil {
-			return st, n, end, fmt.Errorf("%w: line %d: %v", ErrCorrupt, n+1, err)
-		}
-		if _, err := dec.Token(); err != io.EOF {
-			return st, n, end, fmt.Errorf("%w: line %d: trailing data", ErrCorrupt, n+1)
+		if err := jsonx.DecodeStrict(data[end:end+i], &l); err != nil {
+			return n, end, fmt.Errorf("%w: line %d: %v", ErrCorrupt, n+1, err)
 		}
 		if l.V != JournalVersion || l.Seq != n+1 {
-			return st, n, end, fmt.Errorf("%w: line %d: version %d seq %d", ErrCorrupt, n+1, l.V, l.Seq)
+			return n, end, fmt.Errorf("%w: line %d: version %d seq %d", ErrCorrupt, n+1, l.V, l.Seq)
 		}
-		next, err := Apply(st, l.Rec)
-		if err != nil {
-			return st, n, end, fmt.Errorf("%w: line %d: %v", ErrCorrupt, n+1, err)
+		if err := fn(n+1, l); err != nil {
+			return n, end, err
 		}
-		if next.Digest() != l.State {
-			return st, n, end, fmt.Errorf("%w: line %d: state digest differs", ErrCorrupt, n+1)
-		}
-		st, n, end = next, n+1, end+i+1
+		n, end = n+1, end+i+1
 	}
-	return st, n, end, nil
+	return n, end, nil
 }
 
 // append writes r with the digest of after and syncs it.

@@ -9,10 +9,11 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/book"
+	"github.com/mgh3326/fillwire/internal/kst"
 	"github.com/redis/go-redis/v9"
 )
 
-var KST = time.FixedZone("KST", 9*60*60)
+var KST = kst.Zone
 
 type Snapshot struct {
 	Symbol             string
@@ -105,14 +106,31 @@ func Decode(v map[string]any) (Snapshot, error) {
 	}
 	for i := range 5 {
 		n := strconv.Itoa(i + 1)
-		for k, p := range map[string]*int64{"bid_price_" + n: &s.Bids[i].Price, "bid_qty_" + n: &s.Bids[i].Qty, "ask_price_" + n: &s.Asks[i].Price, "ask_qty_" + n: &s.Asks[i].Qty} {
-			*p, err = strconv.ParseInt(get(k), 10, 64)
+		for _, f := range levelFields(&s, i, "bid_price_"+n, "bid_qty_"+n, "ask_price_"+n, "ask_qty_"+n) {
+			*f.dst, err = strconv.ParseInt(get(f.key), 10, 64)
 			if err != nil {
 				return s, errors.New("bookfeed: invalid level number")
 			}
 		}
 	}
 	return s, s.Validate()
+}
+
+type levelField struct {
+	key string
+	dst *int64
+}
+
+// levelFields lists level i's four numbers in a fixed order (bid price, bid
+// quantity, ask price, ask quantity), so parsing stops at the same field, with
+// the same partly filled Snapshot, on every run.
+func levelFields(s *Snapshot, i int, bidPrice, bidQty, askPrice, askQty string) [4]levelField {
+	return [4]levelField{
+		{bidPrice, &s.Bids[i].Price},
+		{bidQty, &s.Bids[i].Qty},
+		{askPrice, &s.Asks[i].Price},
+		{askQty, &s.Asks[i].Qty},
+	}
 }
 
 func Publish(ctx context.Context, r redis.Cmdable, s Snapshot) error {

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,7 +19,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/exec/e1"
 	"github.com/mgh3326/fillwire/internal/exec/exectest"
 	"github.com/mgh3326/fillwire/internal/kisread"
-	"github.com/pelletier/go-toml/v2"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -72,7 +71,7 @@ func refreshLedger(ctx context.Context, e *exec.Executor, read ledgerRead, broke
 	seenOrders := map[string]bool{}
 	complete := true
 	for _, o := range s.Orders {
-		number := strings.TrimLeft(o.BrokerOrderID, "0")
+		number := exec.NormalizeOrderNumber(o.BrokerOrderID)
 		known, ok := expected[number]
 		if !ok || seenOrders[number] {
 			return exec.ErrAttribution
@@ -135,7 +134,7 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 	if !dry {
 		in.Broker = cacheTerminalBrokerViews(in.Broker)
 	}
-	interrupted := errors.New("execmock: interrupted; verify terminal broker/ledger evidence before restarting")
+	interrupted := errors.New("interrupted; verify terminal broker/ledger evidence before restarting")
 	stopForReconcile := func(reason error) error {
 		kill.Engage()
 		if err := e.Tick(in.Now().UnixNano()); err != nil {
@@ -163,7 +162,7 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 		now := in.Now()
 		if ok {
 			if s.Symbol != e.State().Intent.Symbol {
-				return errors.New("execmock: wrong book symbol")
+				return errors.New("wrong book symbol")
 			}
 			e.OnBook(exec.Top{Bid: s.Bids[0].Price, Ask: s.Asks[0].Price, AtNS: s.At().UnixNano(), Synced: !s.Exchange.After(now) && !s.Received.After(now)})
 		}
@@ -180,7 +179,7 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 				return stopForReconcile(interrupted)
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
-				return stopForReconcile(fmt.Errorf("execmock: poll deadline exceeded; operator reconcile required: %w", err))
+				return stopForReconcile(fmt.Errorf("poll deadline exceeded; operator reconcile required: %w", err))
 			}
 			return err
 		}
@@ -192,13 +191,13 @@ func driveLive(ctx context.Context, e *exec.Executor, kill *exec.KillSwitch, dry
 			return stopForReconcile(interrupted)
 		case _, ok := <-in.Ticks:
 			if !ok {
-				return errors.New("execmock: clock stopped")
+				return errors.New("clock stopped")
 			}
 		}
 	}
 }
 
-func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal string, duration time.Duration, stdout io.Writer) error {
+func liveRun(fc fileConfig, cfg e1.Config, ecfg exec.Config, intentPath, journal string, duration time.Duration, stdout io.Writer) error {
 	data, err := os.ReadFile(intentPath)
 	if err != nil {
 		return err
@@ -210,24 +209,13 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 	if intent.Account != e1.MockAccount {
 		return e1.ErrAccountNotMock
 	}
-	var fc fileConfig
-	data, err = os.ReadFile(path)
+	redisURL := os.Getenv(fc.Redis.URLEnv)
+	if err := netpolicy.ValidateRedisURL(redisURL); err != nil {
+		return configErrorf("redis.url_env: %v", err)
+	}
+	options, err := redis.ParseURL(redisURL)
 	if err != nil {
-		return err
-	}
-	dec := toml.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&fc); err != nil {
-		return err
-	}
-	options, err := redis.ParseURL(os.Getenv(fc.Redis.URLEnv))
-	if err != nil {
-		return errors.New("execmock: invalid redis.url_env")
-	}
-	host, _, splitErr := net.SplitHostPort(options.Addr)
-	ip := net.ParseIP(host)
-	if options.Network != "unix" && options.TLSConfig == nil && (splitErr != nil || host != "localhost" && (ip == nil || !ip.IsLoopback())) {
-		return errors.New("execmock: Redis requires TLS outside loopback")
+		return configErrorf("redis.url_env: %v", netpolicy.ErrRedisURLInvalid)
 	}
 	options.ReadTimeout = time.Second
 	options.WriteTimeout = time.Second
@@ -236,7 +224,10 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 	defer r.Close()
 	dry := cfg.DryRun
 	if !dry && (journal == "" || fc.E1.TokenEnv == "" || !strings.HasSuffix(cfg.URL, "/execution-intents/children")) {
-		return errors.New("execmock: send needs -journal, e1.token_env, and the /execution-intents/children route")
+		return configErrorf("send needs -journal, e1.token_env, and the /execution-intents/children route")
+	}
+	if !dry && os.Getenv(fc.E1.TokenEnv) == "" {
+		return configErrorf("required environment variable %s is unset", fc.E1.TokenEnv)
 	}
 	if dry {
 		dir, err := os.MkdirTemp("", "execmock-live-")
@@ -252,7 +243,7 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 	}
 	defer j.Close()
 	if st.Started() && !reflect.DeepEqual(st.Intent, intent) {
-		return errors.New("execmock: journal intent differs from supplied intent")
+		return errors.New("journal intent differs from supplied intent")
 	}
 	fake := exectest.New(intent)
 	client, err := e1.New(cfg, intent, e1.Options{Log: stdout, Answer: fakeAnswer(fake), Token: func() (string, error) { return os.Getenv(fc.E1.TokenEnv), nil }})
@@ -263,7 +254,7 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 	if !dry {
 		for _, name := range []string{fc.BrokerRead.AppKeyEnv, fc.BrokerRead.AppSecretEnv, fc.BrokerRead.TokenEnv, fc.BrokerRead.AccountEnv, fc.BrokerRead.ProductEnv} {
 			if name == "" || os.Getenv(name) == "" {
-				return errors.New("execmock: broker_read credential environment is incomplete")
+				return configErrorf("broker_read credential environment is incomplete")
 			}
 		}
 		k := &kisread.Client{Mock: true, AppKey: os.Getenv(fc.BrokerRead.AppKeyEnv), AppSecret: os.Getenv(fc.BrokerRead.AppSecretEnv), Token: func() string { return os.Getenv(fc.BrokerRead.TokenEnv) }}
@@ -274,7 +265,8 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 	ecfg.RequireLedgerComplete = !dry
 	kill := &exec.KillSwitch{}
 	e := exec.New(ecfg, j, st, client, kill)
-	now := time.Now()
+	clock := time.Now
+	now := clock()
 	if !st.Started() {
 		if err := e.Start(intent, now.UnixNano()); err != nil {
 			return err
@@ -284,7 +276,7 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 		if err := refreshLedger(context.Background(), e, client.Fills, broker); err != nil {
 			return err
 		}
-		return errors.New("execmock: journal already finished; inspect it before another run")
+		return errors.New("journal already finished; inspect it before another run")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -292,5 +284,5 @@ func liveRun(path string, cfg e1.Config, ecfg exec.Config, intentPath, journal s
 	defer timer.Stop()
 	return driveLive(ctx, e, kill, dry, now.Add(duration), liveInputs{Book: func(ctx context.Context) (bookfeed.Snapshot, bool, error) {
 		return bookfeed.Latest(ctx, r, intent.Symbol)
-	}, Ledger: client.Fills, Broker: broker, Now: time.Now, Ticks: timer.C})
+	}, Ledger: client.Fills, Broker: broker, Now: clock, Ticks: timer.C})
 }

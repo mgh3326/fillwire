@@ -3,7 +3,6 @@ package sim_test
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,9 +13,8 @@ import (
 	"github.com/mgh3326/fillwire/internal/book"
 	"github.com/mgh3326/fillwire/internal/exec"
 	"github.com/mgh3326/fillwire/internal/exec/sim"
+	"github.com/mgh3326/fillwire/internal/testutil"
 )
-
-var update = flag.Bool("update", false, "rewrite testdata/sim.evidence.jsonl")
 
 // t0 is 2026-11-02 09:00:00 KST, the fixture session start.
 var t0 = time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
@@ -96,7 +94,9 @@ func writeFixture(t *testing.T, path string) {
 
 func load(t *testing.T) ([]byte, []exec.Intent) {
 	t.Helper()
-	if *update {
+	// -update regenerates the evidence input that bookfeed, execsim and
+	// execmock tests also read; regenerate those next (see testutil.Update).
+	if *testutil.Update {
 		writeFixture(t, "testdata/sim.evidence.jsonl")
 	}
 	evidence, err := os.ReadFile("testdata/sim.evidence.jsonl")

@@ -522,7 +522,8 @@ Rules for a consumer:
 ### Build guarantee
 
 `cmd/bookrec/noorder_test.go` builds the binary and fails if it links any
-non-standard package outside an allowlist (`internal/book` only), links
+non-standard package outside an allowlist (`internal/book` and the
+single-constant `internal/kst` only), links
 `net`, `net/http` or `crypto/tls`, has a symbol shaped like an order client,
 or contains a KIS order path (`/trading/order…`) or order transaction ID.
 
@@ -551,6 +552,39 @@ The sink posts batches of 1–200 records to `/trading/api/execution-ledger/fill
 Authentication is a dedicated ingest token sent verbatim — no `Bearer` prefix — under the header named by `ingest.token_header`. The default is `X-Execution-Ledger-Ingest-Token`, matching the default of auto_trader's `EXECUTION_LEDGER_INGEST_TOKEN_HEADER` (auto_trader `app/core/config.py`; contract in its `docs/runbooks/execution-ledger-ingest.md`). If the server overrides that variable, set `token_header` to the same name — a mismatch makes every POST fail with 401. Exactly one header carries the token: no `Authorization` header is sent unless `token_header` is literally `Authorization`. The name must be a valid HTTP field name (RFC 7230 token); an invalid value fails at config load with exit 78. Configurations without `token_header` keep working unchanged.
 
 The KIS raw websocket frame is not forwarded. `raw_payload_json` is a reparsable structured object containing `tr`, decrypted `fields`, and `received_at`, plus duplicate-hint metadata when applicable. It contains no approval key or ingest credential.
+
+## Exit codes
+
+Every binary (`fillwire`, `execmock`, `execsim`, `bookrec`) uses the one table in
+`internal/exitcode`:
+
+| Code | Meaning |
+|---|---|
+| 0 | clean exit |
+| 1 | runtime failure a retry or restart may clear (network, Redis, broker 5xx, lock timeout, unreadable input) |
+| 2 | bad command line: unknown flag, missing or conflicting arguments; nothing was read or sent |
+| 42 | KIS session occupied (`OPSP8996`), `fillwire` only |
+| 78 | configuration error: invalid settings, missing credentials, or a policy refusal (for example a non-mock `execmock` account, or plaintext Redis to a non-loopback host) |
+
+Loopback and Redis URL rules come from `internal/netpolicy`, so every binary accepts and
+refuses the same addresses.
+
+## Golden files
+
+Tests share one `-update` flag (`internal/testutil`). Some fixtures feed other packages,
+so regenerate in this order and review the diff:
+
+```bash
+go test ./internal/exec/sim -update
+```
+
+```bash
+go test ./cmd/execsim -update
+```
+
+```bash
+go test ./cmd/execmock ./internal/book -update
+```
 
 ## Internal observations
 

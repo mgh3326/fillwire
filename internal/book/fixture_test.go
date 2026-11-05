@@ -2,16 +2,14 @@ package book
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-)
 
-var update = flag.Bool("update", false, "rewrite testdata golden files")
+	"github.com/mgh3326/fillwire/internal/testutil"
+)
 
 // t0 is the fixture session start: 2026-11-02 09:00:00 KST.
 var t0 = time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
@@ -107,17 +105,5 @@ func recordScenario(t *testing.T) []byte {
 
 func golden(t *testing.T, name string, got []byte) {
 	t.Helper()
-	path := "testdata/" + name
-	if *update {
-		if err := os.WriteFile(path, got, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("%s differs from output (rerun with -update after checking the diff)\ngot:\n%s", path, got)
-	}
+	testutil.Golden(t, "testdata/"+name, got)
 }

@@ -22,14 +22,13 @@ import (
 	fillreader "github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
 
 func TestT20ShutdownDrainsReceivedEventToStream(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
+	_, client := testutil.Redis(t)
 	counters := decode.NewCounters()
 	queue, err := stream.New(client, stream.Config{
 		Key: "fills:kis", MaxLen: 100, Group: "fillwire-ingest", Consumer: "consumer",
@@ -541,6 +540,30 @@ func TestIngestTokenHeaderConfig(t *testing.T) {
 		if strings.Contains(err.Error(), "fixture-ingest") {
 			t.Fatalf("config error leaked token: %v", err)
 		}
+	}
+}
+
+func TestBooksSettingsFailAtConfigLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		books    bookSettings
+		wantFail bool
+	}{
+		{"disabled ignores fields", bookSettings{}, false},
+		{"enabled and complete", bookSettings{Enabled: true, Symbol: "005930", AccessTokenEnv: "KIS_ACCESS_TOKEN"}, false},
+		{"missing symbol", bookSettings{Enabled: true, AccessTokenEnv: "KIS_ACCESS_TOKEN"}, true},
+		{"invalid symbol", bookSettings{Enabled: true, Symbol: "../x", AccessTokenEnv: "KIS_ACCESS_TOKEN"}, true},
+		{"missing token env name", bookSettings{Enabled: true, Symbol: "005930"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validStaticConfig()
+			cfg.Redis.URL = "rediss://redis.example.invalid:6380/0"
+			cfg.Ingest.URL = "https://auto-trader.example.invalid/trading/api/execution-ledger/fills/ingest"
+			cfg.Books = tc.books
+			if err := cfg.validateStatic(); (err != nil) != tc.wantFail {
+				t.Fatalf("validateStatic() error = %v, wantFail %t", err, tc.wantFail)
+			}
+		})
 	}
 }
 

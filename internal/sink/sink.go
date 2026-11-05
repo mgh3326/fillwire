@@ -10,13 +10,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/ctxwait"
 	"github.com/mgh3326/fillwire/internal/decode"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 	"github.com/mgh3326/fillwire/internal/stream"
 )
 
@@ -120,20 +121,11 @@ func ValidateIngestURL(raw string) error {
 	case "https":
 		return nil
 	case "http":
-		if isLoopbackHost(parsed.Hostname()) {
+		if netpolicy.IsLoopbackHost(parsed.Hostname()) {
 			return nil
 		}
 	}
 	return errors.New("sink: ingest URL scheme is not permitted")
-}
-
-func isLoopbackHost(host string) bool {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // Envelope is the only HTTP request shape fillwire sends.
@@ -302,7 +294,7 @@ func (r *Runner) deliverWithRetry(ctx context.Context, messages []stream.Message
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := wait(ctx, r.retryDelay(attempt)); err != nil {
+		if err := ctxwait.Sleep(ctx, r.retryDelay(attempt)); err != nil {
 			return err
 		}
 	}
@@ -398,17 +390,6 @@ func (r *Runner) retryDelay(attempt int) time.Duration {
 		delay = next
 	}
 	return delay
-}
-
-func wait(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 func (r *Runner) logFailure(err error) {

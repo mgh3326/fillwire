@@ -41,14 +41,14 @@ func (r historyRead) read(ctx context.Context, o exec.BrokerOrder) (brokerView, 
 	}
 	err := r.Client.Read(ctx, "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", "VTTC0081R", map[string]string{"CANO": r.Account, "ACNT_PRDT_CD": r.Product, "INQR_STRT_DT": day, "INQR_END_DT": day, "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "INQR_DVSN_3": "00", "INQR_DVSN_1": "", "CTX_AREA_FK100": "", "CTX_AREA_NK100": "", "ORD_GNO_BRNO": "", "ODNO": o.BrokerOrderID, "PDNO": r.Symbol, "CCLD_DVSN": "00", "EXCG_ID_DVSN_CD": "KRX"}, &response)
 	if err != nil {
-		return brokerView{}, errors.New("execmock: mock broker readback unavailable")
+		return brokerView{}, errors.New("mock broker readback unavailable")
 	}
 	if strings.TrimSpace(response.Next) != "" {
-		return brokerView{}, errors.New("execmock: paginated broker readback requires reconcile")
+		return brokerView{}, errors.New("paginated broker readback requires reconcile")
 	}
 	var found *brokerView
 	for _, row := range response.Rows {
-		if strings.TrimLeft(row.ID, "0") != o.BrokerOrderID || row.Day != day {
+		if exec.NormalizeOrderNumber(row.ID) != o.BrokerOrderID || row.Day != day {
 			continue
 		}
 		side := "02"
@@ -56,26 +56,26 @@ func (r historyRead) read(ctx context.Context, o exec.BrokerOrder) (brokerView, 
 			side = "01"
 		}
 		if row.Symbol != r.Symbol || row.Side != side || found != nil {
-			return brokerView{}, errors.New("execmock: ambiguous broker readback identity")
+			return brokerView{}, errors.New("ambiguous broker readback identity")
 		}
 		qty, e1 := strconv.ParseInt(row.Qty, 10, 64)
 		filled, e2 := strconv.ParseInt(row.Filled, 10, 64)
 		if e1 != nil || e2 != nil || qty != o.Qty || filled < 0 || filled > qty {
-			return brokerView{}, errors.New("execmock: invalid broker readback quantities")
+			return brokerView{}, errors.New("invalid broker readback quantities")
 		}
 		rejected := int64(0)
 		if row.Rejected != "" {
 			var err error
 			rejected, err = strconv.ParseInt(row.Rejected, 10, 64)
 			if err != nil || rejected < 0 || rejected > qty {
-				return brokerView{}, errors.New("execmock: invalid broker rejection quantity")
+				return brokerView{}, errors.New("invalid broker rejection quantity")
 			}
 		}
 		v := brokerView{Filled: filled, Terminal: filled == qty || row.Cancelled == "Y" || rejected == qty}
 		found = &v
 	}
 	if found == nil {
-		return brokerView{}, errors.New("execmock: exact broker order/day absent; reconcile required")
+		return brokerView{}, errors.New("exact broker order/day absent; reconcile required")
 	}
 	return *found, nil
 }

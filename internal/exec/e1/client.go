@@ -27,13 +27,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/exec"
+	"github.com/mgh3326/fillwire/internal/jsonx"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 )
 
 // MockAccount is the one account surface E1 marks as mock (auto_trader
@@ -253,7 +254,7 @@ func checkURL(raw string) (string, error) {
 	switch u.Scheme {
 	case "https":
 	case "http":
-		if !loopback(u.Hostname()) {
+		if !netpolicy.IsLoopbackHost(u.Hostname()) {
 			return "", fmt.Errorf("%w: url %q: http only to a loopback host; use https", ErrConfig, shown)
 		}
 	default:
@@ -289,14 +290,6 @@ func headerValue(s string) bool {
 		}
 	}
 	return strings.TrimSpace(s) == s
-}
-
-func loopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // Mode reports the client's mode.
@@ -416,14 +409,9 @@ type Outcome struct {
 // ParseOutcome decodes one E1 outcome and refuses unknown fields, so a
 // changed contract is an unknown outcome, not a guess.
 func ParseOutcome(data []byte) (Outcome, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	var o Outcome
-	if err := dec.Decode(&o); err != nil {
+	if err := jsonx.DecodeStrict(data, &o); err != nil {
 		return Outcome{}, fmt.Errorf("e1: outcome: %w", err)
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		return Outcome{}, errors.New("e1: outcome: trailing data")
 	}
 	if o.Status == "" {
 		return Outcome{}, errors.New("e1: outcome: no status")

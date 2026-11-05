@@ -60,7 +60,7 @@ func TestLedgerFillAttributedAfterRestart(t *testing.T) {
 }
 
 func TestLedgerAttributionErrorsStopExecutor(t *testing.T) {
-	for _, kind := range []string{"unknown_order", "missing_order", "unknown_key", "wrong_day", "changed_fill"} {
+	for _, kind := range []string{"unknown_order", "missing_order", "all_zero_order", "unknown_key", "wrong_day", "changed_fill"} {
 		t.Run(kind, func(t *testing.T) {
 			r := newRig(t, fixtureIntent(t), enabled())
 			r.book(0, 70000, 70400)
@@ -75,6 +75,8 @@ func TestLedgerAttributionErrorsStopExecutor(t *testing.T) {
 				id = "unknown"
 			case "missing_order":
 				id = ""
+			case "all_zero_order":
+				id = " 0000 "
 			case "unknown_key":
 				f.Key = "unknown"
 			case "wrong_day":
@@ -219,4 +221,47 @@ func TestUnsyncedBooksCannotPostponeStaleStop(t *testing.T) {
 		t.Fatalf("unsynced books postponed stale stop: done=%q working=%v; want stale_book with no working order", st.Done, st.Order != nil)
 	}
 	equal(t, r.actions(), []string{"submit@70000x10", "cancel"})
+}
+
+func TestNormalizeOrderNumber(t *testing.T) {
+	for in, want := range map[string]string{
+		"0000123": "123", " 123 ": "123", "123": "123", "1230": "1230",
+		"": "", "   ": "", "0000": "", "fake-x": "fake-x",
+	} {
+		if got := exec.NormalizeOrderNumber(in); got != want {
+			t.Errorf("NormalizeOrderNumber(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+type zeroOrderID struct{ exec.Gateway }
+
+func (g zeroOrderID) Send(c exec.Child) (exec.Outcome, error) {
+	out, err := g.Gateway.Send(c)
+	if c.Action != exec.ActCancel {
+		out.BrokerOrderID = "0000000000"
+	}
+	return out, err
+}
+
+// An accepted order with an all-zero broker order number cannot be read back
+// or attributed, so it must stop the ledger check instead of being dropped
+// from the broker order set (which would let completion pass unchecked).
+func TestAllZeroBrokerOrderNumberFailsClosed(t *testing.T) {
+	r := newRig(t, fixtureIntent(t), enabled())
+	r.e = exec.New(r.cfg, r.j, r.e.State(), zeroOrderID{r.g}, r.kill)
+	r.book(0, 70000, 70400)
+	if err := r.e.Tick(at(0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.e.BrokerOrders(); !errors.Is(err, exec.ErrAttribution) {
+		t.Fatalf("BrokerOrders error %v, want ErrAttribution", err)
+	}
+	f := exec.Fill{FillID: "ledger-1", Qty: 1, Price: 70000, AtNS: at(1)}
+	if err := r.e.OnLedgerFill("0000000000", f); !errors.Is(err, exec.ErrAttribution) {
+		t.Fatalf("OnLedgerFill error %v, want ErrAttribution", err)
+	}
+	if r.e.State().Filled != 0 {
+		t.Fatal("counted a fill on an all-zero broker order number")
+	}
 }

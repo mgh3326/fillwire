@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/ctxwait"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
@@ -101,7 +102,7 @@ func NewApprovalProviderConfig(client redis.UniversalClient, issuer ApprovalIssu
 	if client == nil || issuer == nil || (mode != "" && mode != ApprovalModeCacheOnly) || (accountMode != "live" && accountMode != "mock") || margin <= 0 || margin > MaxRefreshMargin {
 		return nil, ErrApprovalConfig
 	}
-	return &ApprovalProvider{redis: client, issuer: issuer, logger: logger, mode: mode, accountMode: accountMode, margin: margin, metrics: &ApprovalMetrics{}, now: time.Now, wait: realWait, failureCh: make(chan struct{})}, nil
+	return &ApprovalProvider{redis: client, issuer: issuer, logger: logger, mode: mode, accountMode: accountMode, margin: margin, metrics: &ApprovalMetrics{}, now: time.Now, wait: ctxwait.Sleep, failureCh: make(chan struct{})}, nil
 }
 
 func (p *ApprovalProvider) Metrics() *ApprovalMetrics { return p.metrics }
@@ -376,17 +377,6 @@ func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejecte
 	}
 	p.noteLive(ApprovalCacheTTL)
 	return issued, nil
-}
-
-func realWait(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 func refreshRetryDelay(base time.Duration) time.Duration {

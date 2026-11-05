@@ -1,7 +1,6 @@
 package e1
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/exec"
+	"github.com/mgh3326/fillwire/internal/jsonx"
 )
 
 // FillsSnapshot matches auto_trader PR #2273 ac5e8676f04f4f5bcdb3f6d2c978a55bc60afbbd.
@@ -47,13 +47,11 @@ func (f LedgerFill) Execution() (exec.Fill, error) {
 }
 
 func strict(data []byte, out any) error {
-	d := json.NewDecoder(bytes.NewReader(data))
-	d.DisallowUnknownFields()
-	if err := d.Decode(out); err != nil {
-		return errors.New("e1: invalid read response")
-	}
-	if _, err := d.Token(); err != io.EOF {
+	switch err := jsonx.DecodeStrict(data, out); {
+	case errors.Is(err, jsonx.ErrTrailingData):
 		return errors.New("e1: trailing read response")
+	case err != nil:
+		return errors.New("e1: invalid read response")
 	}
 	return nil
 }
@@ -94,7 +92,7 @@ func (c *Client) Fills(ctx context.Context) (FillsSnapshot, error) {
 	ids := map[string]bool{}
 	orders := map[string]bool{}
 	for _, o := range s.Orders {
-		number := strings.TrimLeft(o.BrokerOrderID, "0")
+		number := exec.NormalizeOrderNumber(o.BrokerOrderID)
 		if number == "" || orders[number] || o.CumulativeQty < 0 || o.Fills == nil {
 			return s, errors.New("e1: invalid ledger order")
 		}
