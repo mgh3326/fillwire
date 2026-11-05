@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/ctxwait"
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/netpolicy"
 	"github.com/mgh3326/fillwire/internal/stream"
@@ -293,7 +294,7 @@ func (r *Runner) deliverWithRetry(ctx context.Context, messages []stream.Message
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := wait(ctx, r.retryDelay(attempt)); err != nil {
+		if err := ctxwait.Sleep(ctx, r.retryDelay(attempt)); err != nil {
 			return err
 		}
 	}
@@ -389,17 +390,6 @@ func (r *Runner) retryDelay(attempt int) time.Duration {
 		delay = next
 	}
 	return delay
-}
-
-func wait(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 func (r *Runner) logFailure(err error) {

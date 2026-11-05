@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/mgh3326/fillwire/internal/jsonx"
 )
 
 // JournalVersion is the journal line format.
@@ -120,13 +122,8 @@ func replay(data []byte) (st State, n uint64, end int, err error) {
 			return st, n, end, nil // torn tail: never synced, never acted on
 		}
 		var l journalLine
-		dec := json.NewDecoder(bytes.NewReader(data[end : end+i]))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&l); err != nil {
+		if err := jsonx.DecodeStrict(data[end:end+i], &l); err != nil {
 			return st, n, end, fmt.Errorf("%w: line %d: %v", ErrCorrupt, n+1, err)
-		}
-		if _, err := dec.Token(); err != io.EOF {
-			return st, n, end, fmt.Errorf("%w: line %d: trailing data", ErrCorrupt, n+1)
 		}
 		if l.V != JournalVersion || l.Seq != n+1 {
 			return st, n, end, fmt.Errorf("%w: line %d: version %d seq %d", ErrCorrupt, n+1, l.V, l.Seq)

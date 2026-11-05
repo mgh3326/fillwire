@@ -6,6 +6,8 @@ import (
 
 	// The distroless image has no zoneinfo; embed it for America/New_York.
 	_ "time/tzdata"
+
+	"github.com/mgh3326/fillwire/internal/kst"
 )
 
 // Session labels written to the stream's session field.
@@ -19,7 +21,7 @@ const (
 )
 
 // KST is Korea Standard Time. Korea observes no daylight saving time.
-var KST = time.FixedZone("KST", 9*60*60)
+var KST = kst.Zone
 
 // Eastern is US Eastern time, for the US session windows.
 var Eastern = mustLoad("America/New_York")

@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/mgh3326/fillwire/internal/kst"
 )
 
 // ErrAttribution stops execution when ledger evidence cannot be bound uniquely
@@ -21,7 +23,7 @@ func orderIdentity(number string, atNS int64) orderDay {
 	if number == "" {
 		number = "0"
 	}
-	return orderDay{number, time.Unix(0, atNS).In(time.FixedZone("KST", 9*60*60)).Format("2006-01-02")}
+	return orderDay{number, time.Unix(0, atNS).In(kst.Zone).Format("2006-01-02")}
 }
 
 // brokerKeys derives identities from the durable send/outcome pairs, including

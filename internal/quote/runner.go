@@ -543,7 +543,7 @@ func (r *Runner) writeLoop(ctx context.Context) {
 			cancel()
 			if err != nil {
 				r.counters.XAddErrors.Add(1)
-				if now := time.Now(); now.Sub(lastErrorLog) >= time.Minute {
+				if now := r.cfg.Clock.Now(); now.Sub(lastErrorLog) >= time.Minute {
 					lastErrorLog = now
 					r.cfg.Logger.Warn("quote XADD failed; tick dropped", "xadd_errors", r.counters.XAddErrors.Load())
 				}

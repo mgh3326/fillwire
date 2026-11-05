@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/exec"
+	"github.com/mgh3326/fillwire/internal/jsonx"
 	"github.com/mgh3326/fillwire/internal/netpolicy"
 )
 
@@ -408,14 +409,9 @@ type Outcome struct {
 // ParseOutcome decodes one E1 outcome and refuses unknown fields, so a
 // changed contract is an unknown outcome, not a guess.
 func ParseOutcome(data []byte) (Outcome, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	var o Outcome
-	if err := dec.Decode(&o); err != nil {
+	if err := jsonx.DecodeStrict(data, &o); err != nil {
 		return Outcome{}, fmt.Errorf("e1: outcome: %w", err)
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		return Outcome{}, errors.New("e1: outcome: trailing data")
 	}
 	if o.Status == "" {
 		return Outcome{}, errors.New("e1: outcome: no status")

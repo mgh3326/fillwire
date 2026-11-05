@@ -5,13 +5,12 @@
 package exec
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"regexp"
 	"time"
+
+	"github.com/mgh3326/fillwire/internal/jsonx"
 )
 
 // Intent mirrors auto_trader's ExecutionIntentV1 (app/schemas/execution_intent.py,
@@ -77,14 +76,9 @@ var ErrIntent = errors.New("exec: invalid intent")
 
 // ParseIntent decodes one E1 intent and refuses unknown fields, as E1 does.
 func ParseIntent(data []byte) (Intent, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	var in Intent
-	if err := dec.Decode(&in); err != nil {
+	if err := jsonx.DecodeStrict(data, &in); err != nil {
 		return Intent{}, fmt.Errorf("%w: %v", ErrIntent, err)
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		return Intent{}, fmt.Errorf("%w: trailing data", ErrIntent)
 	}
 	return in, in.Validate()
 }

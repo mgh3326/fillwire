@@ -9,10 +9,11 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/book"
+	"github.com/mgh3326/fillwire/internal/kst"
 	"github.com/redis/go-redis/v9"
 )
 
-var KST = time.FixedZone("KST", 9*60*60)
+var KST = kst.Zone
 
 type Snapshot struct {
 	Symbol             string

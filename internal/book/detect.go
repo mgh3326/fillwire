@@ -1,6 +1,10 @@
 package book
 
-import "time"
+import (
+	"time"
+
+	"github.com/mgh3326/fillwire/internal/kst"
+)
 
 // Class is the verdict on one book or trade record.
 type Class string
@@ -70,7 +74,7 @@ type tracker struct {
 }
 
 // kstOffset is KRX's fixed UTC offset; Korea has no daylight saving.
-const kstOffset = 9 * time.Hour
+const kstOffset = kst.Offset
 
 func exchangeDay(atNS int64) int64 {
 	return (atNS + int64(kstOffset)) / int64(24*time.Hour)

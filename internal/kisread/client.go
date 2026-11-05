@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/ctxwait"
 	"github.com/mgh3326/go-kis/kis"
 )
 
@@ -39,12 +40,8 @@ func (c *Client) Read(ctx context.Context, path, tr string, query map[string]str
 	defer c.mu.Unlock()
 	if c.Mock {
 		if delay := time.Until(c.next); delay > 0 {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-timer.C:
+			if err := ctxwait.Sleep(ctx, delay); err != nil {
+				return err
 			}
 		}
 		c.next = time.Now().Add(time.Second)

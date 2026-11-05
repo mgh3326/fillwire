@@ -10,10 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/kst"
 	"github.com/mgh3326/go-kis/kis/ws"
 )
 
-var kst = time.FixedZone("KST", 9*60*60)
+var kstZone = kst.Zone
 
 // Config supplies the immutable ledger attributes for a KIS decoder.
 type Config struct {
@@ -219,12 +220,12 @@ func (d *Decoder) drop(reason string, execution *ws.Execution) {
 }
 
 func combineKSTDate(receivedAt time.Time, filledAt string) (time.Time, error) {
-	clock, err := time.ParseInLocation("150405", filledAt, kst)
+	clock, err := time.ParseInLocation("150405", filledAt, kstZone)
 	if err != nil {
 		return time.Time{}, err
 	}
-	receivedKST := receivedAt.In(kst)
-	candidate := time.Date(receivedKST.Year(), receivedKST.Month(), receivedKST.Day(), clock.Hour(), clock.Minute(), clock.Second(), 0, kst)
+	receivedKST := receivedAt.In(kstZone)
+	candidate := time.Date(receivedKST.Year(), receivedKST.Month(), receivedKST.Day(), clock.Hour(), clock.Minute(), clock.Second(), 0, kstZone)
 	if candidate.After(receivedKST.Add(time.Hour)) {
 		candidate = candidate.AddDate(0, 0, -1)
 	}
