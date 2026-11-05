@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
@@ -23,9 +23,7 @@ func TestT8ValidationDrop(t *testing.T) {
 		{name: "empty order", mutate: func(event *ws.Event) { event.Execution.OrderNo = "   "; event.Fields[2] = "   " }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			mini := miniredis.RunT(t)
-			client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-			defer client.Close()
+			_, client := testutil.Redis(t)
 			counters := decode.NewCounters()
 			queue, err := stream.New(client, stream.Config{Key: "fills:kis", MaxLen: 10, Group: "fillwire-ingest", Consumer: "consumer", BatchSize: 1, Counters: counters})
 			if err != nil {
@@ -88,9 +86,7 @@ func TestT13FillSeqUsesAllFields(t *testing.T) {
 }
 
 func TestT14DuplicateSuspectStreamEntry(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer client.Close()
+	_, client := testutil.Redis(t)
 	counters := decode.NewCounters()
 	queue, err := stream.New(client, stream.Config{Key: "fills:kis", MaxLen: 10, Group: "fillwire-ingest", Consumer: "consumer", BatchSize: 1, Counters: counters})
 	if err != nil {

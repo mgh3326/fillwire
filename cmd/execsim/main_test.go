@@ -2,13 +2,11 @@ package main
 
 import (
 	"bytes"
-	"flag"
-	"os"
 	"strings"
 	"testing"
-)
 
-var update = flag.Bool("update", false, "rewrite testdata/sim.golden.jsonl")
+	"github.com/mgh3326/fillwire/internal/testutil"
+)
 
 const (
 	evidence = "../../internal/exec/sim/testdata/sim.evidence.jsonl"
@@ -31,18 +29,7 @@ func TestReplayFixtureIsDeterministicAndPrintsBothRules(t *testing.T) {
 	if _, second, _ := execsim(t, "-in", evidence, "-intents", intents); second != first {
 		t.Fatalf("second run differs:\n%s\n%s", first, second)
 	}
-	if *update {
-		if err := os.WriteFile(golden, []byte(first), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	want, err := os.ReadFile(golden)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != string(want) {
-		t.Fatalf("output differs from %s:\n%s", golden, first)
-	}
+	testutil.Golden(t, golden, []byte(first))
 	lines := strings.Split(strings.TrimSpace(first), "\n")
 	if len(lines) != 4 {
 		t.Fatalf("%d lines, want 2 intents x 2 rules", len(lines))

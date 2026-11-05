@@ -12,10 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/mgh3326/fillwire/internal/kisread"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
-	"github.com/redis/go-redis/v9"
 )
 
 func fixture(t *testing.T) Snapshot {
@@ -43,9 +42,7 @@ func fixture(t *testing.T) Snapshot {
 }
 
 func TestRecordedStreamSnapshotRoundTrip(t *testing.T) {
-	m := miniredis.RunT(t)
-	r := redis.NewClient(&redis.Options{Addr: m.Addr()})
-	defer r.Close()
+	_, r := testutil.Redis(t)
 	s := fixture(t)
 	if err := Publish(context.Background(), r, s); err != nil {
 		t.Fatal(err)
@@ -91,9 +88,7 @@ func asking(t *testing.T, calls *atomic.Int64) *kisread.Client {
 }
 
 func TestMockRESTFallbackPublishesAfterWebsocketUnavailable(t *testing.T) {
-	m := miniredis.RunT(t)
-	r := redis.NewClient(&redis.Options{Addr: m.Addr()})
-	defer r.Close()
+	_, r := testutil.Redis(t)
 	var calls atomic.Int64
 	rest := asking(t, &calls)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -167,9 +162,7 @@ func TestRecentWebsocketArrivalSuppressesFallbackWithStaleExchangeClock(t *testi
 	fields[1] = received.Add(-time.Minute).In(KST).Format("150405")
 	parts[3] = strings.Join(fields, "^")
 	event := ws.Event{Raw: []byte(strings.Join(parts, "|")), ReceivedAt: received}
-	m := miniredis.RunT(t)
-	r := redis.NewClient(&redis.Options{Addr: m.Addr()})
-	defer r.Close()
+	_, r := testutil.Redis(t)
 	var calls atomic.Int64
 	rest := asking(t, &calls)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -22,6 +22,7 @@ import (
 	fillreader "github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
@@ -167,9 +168,7 @@ func readerConfig(transport *fakeTransport, approval ws.ApprovalKeyProvider) fil
 }
 
 func TestT1NormalPipeline(t *testing.T) {
-	mini := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer redisClient.Close()
+	_, redisClient := testutil.Redis(t)
 	counters := decode.NewCounters()
 	queue, err := stream.New(redisClient, stream.Config{
 		Key:          "fills:kis",
@@ -564,9 +563,7 @@ func TestT10Backpressure(t *testing.T) {
 }
 
 func TestT11ApprovalProvider(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer client.Close()
+	mini, client := testutil.Redis(t)
 	fallback := &fakeApproval{}
 	provider, err := fillreader.NewApprovalProvider(client, fallback)
 	if err != nil {
@@ -597,9 +594,7 @@ func TestT11ApprovalProvider(t *testing.T) {
 }
 
 func TestCacheOnlyApprovalHitInitialSubscription(t *testing.T) {
-	mini := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { _ = redisClient.Close() })
+	mini, redisClient := testutil.Redis(t)
 	fallback := &fakeApproval{}
 	logger, logs := readerJSONLogger()
 	provider, err := fillreader.NewApprovalProviderWithMode(redisClient, fallback, fillreader.ApprovalModeCacheOnly, logger)

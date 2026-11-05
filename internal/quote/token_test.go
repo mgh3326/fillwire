@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -46,9 +46,7 @@ func (h *commandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.
 }
 
 func TestCachedTokenReadsOnlyWithGET(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer client.Close()
+	mini, client := testutil.Redis(t)
 	hook := &commandHook{}
 	client.AddHook(hook)
 	now := time.Date(2026, 9, 30, 13, 0, 0, 0, KST)

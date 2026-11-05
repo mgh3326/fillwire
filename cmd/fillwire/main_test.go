@@ -22,14 +22,13 @@ import (
 	fillreader "github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
 
 func TestT20ShutdownDrainsReceivedEventToStream(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
+	_, client := testutil.Redis(t)
 	counters := decode.NewCounters()
 	queue, err := stream.New(client, stream.Config{
 		Key: "fills:kis", MaxLen: 100, Group: "fillwire-ingest", Consumer: "consumer",

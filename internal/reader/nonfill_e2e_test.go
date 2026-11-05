@@ -12,13 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/mgh3326/fillwire/internal/decode"
 	fillreader "github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
-	"github.com/redis/go-redis/v9"
 )
 
 // h0stcni0 renders a real-shape 26-field H0STCNI0 frame. The order is for 5
@@ -45,9 +44,7 @@ func TestNonFillNoticesNeverReachIngestEndToEnd(t *testing.T) {
 		h0stcni0("0", "3", "71200", "093015", "0", "2", "2"), // the fill
 	}
 
-	mini := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer redisClient.Close()
+	_, redisClient := testutil.Redis(t)
 	counters := decode.NewCounters()
 	queue, err := stream.New(redisClient, stream.Config{
 		Key: "fills:kis", MaxLen: 100, Group: "fillwire-ingest", Consumer: "test-consumer",

@@ -24,6 +24,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/exec/e1"
 	"github.com/mgh3326/fillwire/internal/exec/exectest"
 	"github.com/mgh3326/fillwire/internal/kisread"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -172,9 +173,7 @@ func TestLiveBookDryRunRecordedStreamBodiesWithinBounds(t *testing.T) {
 	if err := scan.Err(); err != nil {
 		t.Fatal(err)
 	}
-	m := miniredis.RunT(t)
-	r := redis.NewClient(&redis.Options{Addr: m.Addr()})
-	defer r.Close()
+	_, r := testutil.Redis(t)
 	in := liveIntent(t)
 	g := exectest.New(in)
 	var out bytes.Buffer

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
@@ -86,9 +86,7 @@ func eventFromFrame(tr string, fields []string) ws.Event {
 
 func newQueue(t *testing.T, counters *decode.Counters) (*stream.Queue, *redis.Client) {
 	t.Helper()
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
+	_, client := testutil.Redis(t)
 	queue, err := stream.New(client, stream.Config{Key: "fills:kis", MaxLen: 100, Group: "fillwire-ingest", Consumer: "consumer", BatchSize: 10, Counters: counters})
 	if err != nil {
 		t.Fatal(err)

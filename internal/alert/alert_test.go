@@ -11,9 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/mgh3326/fillwire/internal/reader"
-	"github.com/redis/go-redis/v9"
+	"github.com/mgh3326/fillwire/internal/testutil"
 )
 
 func TestTelegramSendSuppressionAndFailure(t *testing.T) {
@@ -87,9 +86,7 @@ func (i fakeApprovalHTTP) Issue(ctx context.Context) (string, error) {
 	return "new-key", nil
 }
 func TestRecoverableApprovalFailureUsesTelegramRateLimit(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer client.Close()
+	mini, client := testutil.Redis(t)
 	var approvalCalls, telegramCalls atomic.Int32
 	approvalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { approvalCalls.Add(1); w.WriteHeader(503) }))
 	defer approvalServer.Close()

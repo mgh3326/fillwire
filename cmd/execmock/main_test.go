@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/mgh3326/fillwire/internal/exec"
+	"github.com/mgh3326/fillwire/internal/testutil"
 )
 
 const evidence = "../../internal/exec/sim/testdata/sim.evidence.jsonl"
@@ -47,13 +48,7 @@ func TestDryRunPrintsRequests(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errs)
 	}
-	want, err := os.ReadFile("testdata/dry-run.golden.jsonl")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out != string(want) {
-		t.Fatalf("dry run output differs from testdata/dry-run.golden.jsonl:\n%s", out)
-	}
+	testutil.Golden(t, "testdata/dry-run.golden.jsonl", []byte(out))
 	// The dry run goes through the E1 client and lands where execsim's fake
 	// gateway lands for the same intent and rule.
 	lines := strings.Split(strings.TrimSpace(out), "\n")

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/mgh3326/fillwire/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -48,9 +49,7 @@ func (i httpIssuer) Issue(ctx context.Context) (string, error) {
 }
 func newApprovalFixture(t *testing.T, mode string, handler http.HandlerFunc) (*miniredis.Miniredis, *redis.Client, *ApprovalProvider) {
 	t.Helper()
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() { _ = client.Close() })
+	mini, client := testutil.Redis(t)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	provider, err := NewApprovalProviderConfig(client, httpIssuer{server.URL, server.Client()}, "", mode, DefaultRefreshMargin, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -559,9 +558,7 @@ func TestApprovalNoLiveKeyFailureIsTerminal(t *testing.T) {
 }
 
 func TestApprovalCancelMidIssueDoesNotLatch(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer client.Close()
+	mini, client := testutil.Redis(t)
 	entered := make(chan struct{})
 	p, err := NewApprovalProviderConfig(client, issuerFunc(func(ctx context.Context) (string, error) { close(entered); <-ctx.Done(); return "", ctx.Err() }), "", "live", DefaultRefreshMargin, nil)
 	if err != nil {
@@ -693,9 +690,7 @@ func TestApprovalPublishDeadlineUnderLockTTL(t *testing.T) {
 }
 
 func TestApprovalRefreshMarginConstructorBoundary(t *testing.T) {
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	defer client.Close()
+	_, client := testutil.Redis(t)
 	issuer := issuerFunc(func(context.Context) (string, error) { return "fixture", nil })
 	if _, err := NewApprovalProviderConfig(client, issuer, "", "live", MaxRefreshMargin, nil); err != nil {
 		t.Fatalf("2h margin rejected: %v", err)
