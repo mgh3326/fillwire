@@ -3,13 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/alert"
+	"github.com/mgh3326/fillwire/internal/bookfeed"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/pelletier/go-toml/v2"
@@ -187,36 +187,17 @@ func (cfg runtimeConfig) validateStatic() error {
 	if err := sink.ValidateIngestTokenHeader(cfg.Ingest.TokenHeader); err != nil {
 		return errors.New("config: invalid ingest token_header")
 	}
+	// The access token itself is read lazily on each REST call, since its
+	// owner refreshes it; only the name is checked here.
+	if cfg.Books.Enabled && (!bookfeed.SymbolOK(cfg.Books.Symbol) || strings.TrimSpace(cfg.Books.AccessTokenEnv) == "") {
+		return errors.New("config: books symbol and access_token_env required")
+	}
 	return nil
 }
 
 func validateRedisURL(raw string) error {
-	parsed, err := url.ParseRequestURI(raw)
-	if err != nil || parsed.Scheme == "" {
-		return errors.New("config: Redis URL is invalid")
+	if err := netpolicy.ValidateRedisURL(raw); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
-	switch strings.ToLower(parsed.Scheme) {
-	case "rediss":
-		if parsed.Host != "" {
-			return nil
-		}
-	case "redis":
-		if redisLoopbackHost(parsed.Hostname()) {
-			return nil
-		}
-	case "unix":
-		if parsed.Path != "" || parsed.Opaque != "" {
-			return nil
-		}
-	}
-	return errors.New("config: Redis URL scheme is not permitted")
-}
-
-func redisLoopbackHost(host string) bool {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return nil
 }

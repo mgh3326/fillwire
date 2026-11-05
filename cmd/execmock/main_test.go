@@ -85,14 +85,14 @@ func TestConfigThatWouldSendSendsNothing(t *testing.T) {
 		name, toml string
 		code       int
 	}{
-		{"empty config", "", 2},
-		{"empty e1 table", "[e1]\n", 2},
-		{"send_enabled without account", "[e1]\nsend_enabled = true\nurl = \"" + srv.URL + "\"\n", 2},
+		{"empty config", "", 78},
+		{"empty e1 table", "[e1]\n", 78},
+		{"send_enabled without account", "[e1]\nsend_enabled = true\nurl = \"" + srv.URL + "\"\n", 78},
 		{"account without send_enabled", "[e1]\naccount = \"kis_mock\"\nurl = \"" + srv.URL + "\"\n", 0},
-		{"kis_live", "[e1]\naccount = \"kis_live\"\nsend_enabled = true\nurl = \"" + srv.URL + "\"\n", 2},
-		{"unknown account", "[e1]\naccount = \"paper\"\nsend_enabled = true\nurl = \"" + srv.URL + "\"\n", 2},
+		{"kis_live", "[e1]\naccount = \"kis_live\"\nsend_enabled = true\nurl = \"" + srv.URL + "\"\n", 78},
+		{"unknown account", "[e1]\naccount = \"paper\"\nsend_enabled = true\nurl = \"" + srv.URL + "\"\n", 78},
 		{"both set: not wired in this build", "[e1]\naccount = \"kis_mock\"\nsend_enabled = true\nurl = \"" + srv.URL + "\"\n", 2},
-		{"unknown key", "[e1]\naccount = \"kis_mock\"\nlive = true\n", 2},
+		{"unknown key", "[e1]\naccount = \"kis_mock\"\nlive = true\n", 78},
 	}
 	for _, c := range cases {
 		code, out, errs := execmock("-config", writeConfig(t, c.toml), "-intent", "testdata/intent.json", "-in", evidence)
@@ -144,5 +144,31 @@ func TestRecordedDryRunBodiesStayWithinIntentBounds(t *testing.T) {
 	}
 	if count == 0 {
 		t.Fatal("no bodies checked")
+	}
+}
+
+func TestExitCodesFollowSharedTable(t *testing.T) {
+	mock := writeConfig(t, "[e1]\naccount = \"kis_mock\"\nurl = \"https://e1.example.invalid/execution-intents/children\"\n[redis]\nurl_env = \"EXECMOCK_EXIT_REDIS_URL\"\n")
+	for _, tc := range []struct {
+		name, redisURL string
+		args           []string
+		want           int
+	}{
+		{"unknown rule is usage", "", []string{"-in", evidence, "-dry-run", "-rule", "sideways"}, 2},
+		{"missing config file is config", "", []string{"-config", "testdata/absent.toml"}, 78},
+		{"plaintext remote Redis is config", "redis://redis.example.invalid:6379/0", []string{"-live-book", "-dry-run"}, 78},
+		{"unparsable Redis URL is config", "", []string{"-live-book", "-dry-run"}, 78},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EXECMOCK_EXIT_REDIS_URL", tc.redisURL)
+			args := append([]string{"-config", mock, "-intent", "testdata/intent.json"}, tc.args...)
+			code, _, errs := execmock(args...)
+			if code != tc.want {
+				t.Fatalf("exit %d, want %d: %s", code, tc.want, errs)
+			}
+			if strings.Count(errs, "execmock:") > 1 {
+				t.Fatalf("error prefixed more than once: %q", errs)
+			}
+		})
 	}
 }

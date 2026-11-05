@@ -18,6 +18,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/exec/e1"
 	"github.com/mgh3326/fillwire/internal/exec/exectest"
 	"github.com/mgh3326/fillwire/internal/exec/sim"
+	"github.com/mgh3326/fillwire/internal/exitcode"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -46,16 +47,29 @@ type fileConfig struct {
 	} `toml:"broker_read"`
 }
 
-func loadConfig(path string, dryRun bool) (e1.Config, error) {
+// configError marks a failure the operator fixes in the config file or the
+// environment it names. It exits exitcode.Config, like fillwire.
+type configError struct{ msg string }
+
+func (e *configError) Error() string { return e.msg }
+
+func configErrorf(format string, args ...any) error {
+	return &configError{msg: fmt.Sprintf(format, args...)}
+}
+
+// loadConfig decodes the config file once. The [e1] table becomes the client
+// config; the whole file is returned for the live-book path, which reads the
+// [redis] and [broker_read] tables.
+func loadConfig(path string, dryRun bool) (fileConfig, e1.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return e1.Config{}, err
+		return fileConfig{}, e1.Config{}, configErrorf("%s: %v", path, err)
 	}
 	var fc fileConfig
 	dec := toml.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&fc); err != nil {
-		return e1.Config{}, fmt.Errorf("%s: %w", path, err)
+		return fileConfig{}, e1.Config{}, configErrorf("%s: %v", path, err)
 	}
 	cfg := e1.Config{
 		Account: fc.E1.Account, SendEnabled: fc.E1.SendEnabled, DryRun: dryRun,
@@ -63,16 +77,31 @@ func loadConfig(path string, dryRun bool) (e1.Config, error) {
 	}
 	if fc.E1.Timeout != "" {
 		if cfg.Timeout, err = time.ParseDuration(fc.E1.Timeout); err != nil || cfg.Timeout <= 0 {
-			return e1.Config{}, fmt.Errorf("%s: e1.timeout %q", path, fc.E1.Timeout)
+			return fileConfig{}, e1.Config{}, configErrorf("%s: e1.timeout %q", path, fc.E1.Timeout)
 		}
 	}
-	return cfg, nil
+	return fc, cfg, nil
 }
 
-type liveRunner func(string, e1.Config, exec.Config, string, string, time.Duration, io.Writer) error
+type liveRunner func(fileConfig, e1.Config, exec.Config, string, string, time.Duration, io.Writer) error
 
 func run(args []string, stdout, stderr io.Writer) int {
 	return runWithLive(args, stdout, stderr, liveRun)
+}
+
+// fail prints err once, with the command prefix, and maps it to an exit code.
+func fail(stderr io.Writer, err error) int {
+	fmt.Fprintln(stderr, "execmock:", err)
+	var ce *configError
+	if errors.As(err, &ce) {
+		return exitcode.Config
+	}
+	return exitcode.Failure
+}
+
+func usageError(stderr io.Writer, msg string) int {
+	fmt.Fprintln(stderr, "execmock:", msg)
+	return exitcode.Usage
 }
 
 func runWithLive(args []string, stdout, stderr io.Writer, runLive liveRunner) int {
@@ -91,56 +120,51 @@ func runWithLive(args []string, stdout, stderr io.Writer, runLive liveRunner) in
 	fs.DurationVar(&ecfg.StepEvery, "step", ecfg.StepEvery, "time at one price before stepping a tick")
 	fs.DurationVar(&ecfg.StaleAfter, "stale", ecfg.StaleAfter, "oldest book a send may be priced from")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return exitcode.Usage
 	}
 	if *configPath == "" || *intentPath == "" || fs.NArg() > 0 || ecfg.StepEvery <= 0 || ecfg.StaleAfter <= 0 {
 		fmt.Fprintln(stderr, "usage: execmock -config FILE -intent INTENT {-in EVIDENCE -dry-run | -live-book {-dry-run | -send -journal FILE}}")
-		return 2
+		return exitcode.Usage
 	}
-	cfg, err := loadConfig(*configPath, *dryRun)
+	if !sim.ValidRule(sim.Rule(*rule)) {
+		return usageError(stderr, fmt.Sprintf("-rule %q: want through or touch", *rule))
+	}
+	fc, cfg, err := loadConfig(*configPath, *dryRun)
 	if err != nil {
-		fmt.Fprintln(stderr, "execmock:", err)
-		return 2
+		return fail(stderr, err)
 	}
 	mode, err := cfg.Mode()
 	if err != nil {
-		fmt.Fprintln(stderr, "execmock:", err)
-		return 2
+		return fail(stderr, &configError{msg: err.Error()})
 	}
 	switch mode {
 	case e1.Off:
 		if *send {
-			fmt.Fprintln(stderr, "execmock: -send also requires e1.send_enabled=true")
-			return 2
+			return usageError(stderr, "-send also requires e1.send_enabled=true")
 		}
 		fmt.Fprintln(stderr, "execmock: e1.send_enabled is not set: nothing sent")
-		return 0
+		return exitcode.OK
 	case e1.Send:
 		if !*send || !*live || *in != "" {
-			fmt.Fprintln(stderr, "execmock: send requires -send and -live-book; recorded evidence cannot send")
-			return 2
+			return usageError(stderr, "send requires -send and -live-book; recorded evidence cannot send")
 		}
 	}
 	if *live {
 		if *in != "" || *duration <= 0 {
-			fmt.Fprintln(stderr, "execmock: -live-book conflicts with -in and needs a positive duration")
-			return 2
+			return usageError(stderr, "-live-book conflicts with -in and needs a positive duration")
 		}
-		if err := runLive(*configPath, cfg, ecfg, *intentPath, *journal, *duration, stdout); err != nil {
-			fmt.Fprintln(stderr, "execmock:", err)
-			return 1
+		if err := runLive(fc, cfg, ecfg, *intentPath, *journal, *duration, stdout); err != nil {
+			return fail(stderr, err)
 		}
-		return 0
+		return exitcode.OK
 	}
 	if *in == "" {
-		fmt.Fprintln(stderr, "execmock: -dry-run needs -in EVIDENCE")
-		return 2
+		return usageError(stderr, "-dry-run needs -in EVIDENCE")
 	}
 	if err := dryRunReplay(cfg, ecfg, *intentPath, *in, sim.Rule(*rule), stdout); err != nil {
-		fmt.Fprintln(stderr, "execmock:", err)
-		return 1
+		return fail(stderr, err)
 	}
-	return 0
+	return exitcode.OK
 }
 
 func dryRunReplay(cfg e1.Config, ecfg exec.Config, intentPath, evidencePath string, rule sim.Rule, stdout io.Writer) error {

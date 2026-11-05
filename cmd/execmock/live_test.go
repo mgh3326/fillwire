@@ -240,7 +240,7 @@ func TestSendRequiresMockConfigAndExplicitFlag(t *testing.T) {
 		want               int
 		called             bool
 	}{
-		{"default_off", "kis_mock", false, false, false, 0, false}, {"flag_without_config", "kis_mock", false, true, false, 2, false}, {"config_without_flag", "kis_mock", true, false, false, 2, false}, {"live_account", "kis_live", true, true, false, 2, false}, {"mock_explicit", "kis_mock", true, true, false, 0, true}, {"dry_run_wins", "kis_mock", true, true, true, 0, true},
+		{"default_off", "kis_mock", false, false, false, 0, false}, {"flag_without_config", "kis_mock", false, true, false, 2, false}, {"config_without_flag", "kis_mock", true, false, false, 2, false}, {"live_account", "kis_live", true, true, false, 78, false}, {"mock_explicit", "kis_mock", true, true, false, 0, true}, {"dry_run_wins", "kis_mock", true, true, true, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := "[e1]\naccount = " + strconvQuote(tc.account) + "\nsend_enabled = " + map[bool]string{true: "true", false: "false"}[tc.enabled] + "\n"
@@ -252,7 +252,7 @@ func TestSendRequiresMockConfigAndExplicitFlag(t *testing.T) {
 				args = append(args, "-dry-run")
 			}
 			called := false
-			code := runWithLive(args, io.Discard, io.Discard, func(_ string, cfg e1.Config, _ exec.Config, _, _ string, _ time.Duration, _ io.Writer) error {
+			code := runWithLive(args, io.Discard, io.Discard, func(_ fileConfig, cfg e1.Config, _ exec.Config, _, _ string, _ time.Duration, _ io.Writer) error {
 				called = true
 				if cfg.Account != e1.MockAccount || cfg.DryRun != tc.dry {
 					t.Fatal("wrong live config")

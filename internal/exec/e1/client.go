@@ -27,13 +27,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/exec"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 )
 
 // MockAccount is the one account surface E1 marks as mock (auto_trader
@@ -253,7 +253,7 @@ func checkURL(raw string) (string, error) {
 	switch u.Scheme {
 	case "https":
 	case "http":
-		if !loopback(u.Hostname()) {
+		if !netpolicy.IsLoopbackHost(u.Hostname()) {
 			return "", fmt.Errorf("%w: url %q: http only to a loopback host; use https", ErrConfig, shown)
 		}
 	default:
@@ -289,14 +289,6 @@ func headerValue(s string) bool {
 		}
 	}
 	return strings.TrimSpace(s) == s
-}
-
-func loopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // Mode reports the client's mode.

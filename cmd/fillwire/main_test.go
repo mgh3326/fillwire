@@ -544,6 +544,30 @@ func TestIngestTokenHeaderConfig(t *testing.T) {
 	}
 }
 
+func TestBooksSettingsFailAtConfigLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		books    bookSettings
+		wantFail bool
+	}{
+		{"disabled ignores fields", bookSettings{}, false},
+		{"enabled and complete", bookSettings{Enabled: true, Symbol: "005930", AccessTokenEnv: "KIS_ACCESS_TOKEN"}, false},
+		{"missing symbol", bookSettings{Enabled: true, AccessTokenEnv: "KIS_ACCESS_TOKEN"}, true},
+		{"invalid symbol", bookSettings{Enabled: true, Symbol: "../x", AccessTokenEnv: "KIS_ACCESS_TOKEN"}, true},
+		{"missing token env name", bookSettings{Enabled: true, Symbol: "005930"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validStaticConfig()
+			cfg.Redis.URL = "rediss://redis.example.invalid:6380/0"
+			cfg.Ingest.URL = "https://auto-trader.example.invalid/trading/api/execution-ledger/fills/ingest"
+			cfg.Books = tc.books
+			if err := cfg.validateStatic(); (err != nil) != tc.wantFail {
+				t.Fatalf("validateStatic() error = %v, wantFail %t", err, tc.wantFail)
+			}
+		})
+	}
+}
+
 func TestApprovalAndAlertSettingDefaultsAndValidation(t *testing.T) {
 	t.Setenv("KIS_APP_KEY", "fixture-app")
 	t.Setenv("KIS_APP_SECRET", "fixture-secret")

@@ -3,6 +3,7 @@ package quote
 import (
 	"sort"
 	"time"
+
 	// The distroless image has no zoneinfo; embed it for America/New_York.
 	_ "time/tzdata"
 )

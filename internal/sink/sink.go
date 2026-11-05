@@ -10,13 +10,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/decode"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 	"github.com/mgh3326/fillwire/internal/stream"
 )
 
@@ -120,20 +120,11 @@ func ValidateIngestURL(raw string) error {
 	case "https":
 		return nil
 	case "http":
-		if isLoopbackHost(parsed.Hostname()) {
+		if netpolicy.IsLoopbackHost(parsed.Hostname()) {
 			return nil
 		}
 	}
 	return errors.New("sink: ingest URL scheme is not permitted")
-}
-
-func isLoopbackHost(host string) bool {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // Envelope is the only HTTP request shape fillwire sends.

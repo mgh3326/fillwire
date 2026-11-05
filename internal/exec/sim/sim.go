@@ -30,6 +30,9 @@ const (
 // Rules is both rules, conservative first.
 var Rules = []Rule{Through, Touch}
 
+// ValidRule reports whether r is one of Rules.
+func ValidRule(r Rule) bool { return r == Through || r == Touch }
+
 // Result is one intent's replay under one rule.
 type Result struct {
 	IntentID string    `json:"intent_id"`
@@ -55,7 +58,7 @@ type Result struct {
 // its own executor, journal (in a temporary directory, removed after) and
 // fake gateway.
 func Run(evidence []byte, intents []exec.Intent, cfg exec.Config, rule Rule) ([]Result, error) {
-	if rule != Through && rule != Touch {
+	if !ValidRule(rule) {
 		return nil, fmt.Errorf("sim: unknown rule %q", rule)
 	}
 	dir, err := os.MkdirTemp("", "execsim-")
@@ -79,7 +82,7 @@ func Run(evidence []byte, intents []exec.Intent, cfg exec.Config, rule Rule) ([]
 // returns the gateway the executor sends through, which must reach the fake
 // (e1's dry-run client does, through its simulated answer).
 func RunOne(evidence []byte, in exec.Intent, cfg exec.Config, rule Rule, path string, wrap func(*exectest.Gateway) (exec.Gateway, error)) (Result, error) {
-	if rule != Through && rule != Touch {
+	if !ValidRule(rule) {
 		return Result{}, fmt.Errorf("sim: unknown rule %q", rule)
 	}
 	j, st, err := exec.OpenJournal(path)
