@@ -4,6 +4,15 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The measurement path for a branch: workflow_run only fires from the
+  # default branch, so a branch's main stage is dispatched explicitly.
+  workflow_dispatch:
+
+concurrency:
+  # A newer push to main cancels the older main-stage run. Pull request and
+  # dispatch runs keep their own group, so their behaviour is unchanged.
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && format('ci-main-{0}', github.ref) || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -29,11 +38,18 @@ jobs:
         run: GOMAXPROCS=4 go vet -p=4 ./...
       - name: go test
         run: GOMAXPROCS=4 go test -count=1 -p=4 ./...
+      # The full -race suite is the deploy stage's job (operator decision
+      # 2026-11-07, hk:doc decision/2026-11-07/fleet-ci-three-tiers-r2 §1);
+      # pull requests keep today's check unchanged.
       - name: go test -race
+        if: github.event_name == 'pull_request'
         run: GOMAXPROCS=4 go test -race -p=4 ./... -count=1
       - name: go build
         run: GOMAXPROCS=4 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p=4 -trimpath -ldflags='-s -w' -o /tmp/fillwire ./cmd/fillwire
+      # The main stage's image build is publish (below), which builds and
+      # pushes the same image to GHCR. Pull requests keep the local build.
       - name: container build
+        if: github.event_name == 'pull_request'
         run: docker buildx build --load --platform linux/amd64 --tag "fillwire:pr-${GITHUB_SHA}" .
 
   secrets:
@@ -86,3 +102,52 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 scripts/test-auto-tag.py
       - run: python3 scripts/test-repair-release.py
+
+  ci-ok-status:
+    name: ci-ok status
+    # Main-stage aggregation (r2 §1). A cancelled needed job is unknown, so
+    # this job is skipped and no status is posted (a newer push owns the ref).
+    # A failed needed job posts failure and fails this job, so a failed main
+    # stage cannot trigger the deploy stage.
+    if: ${{ always() && github.event_name != 'pull_request' && (contains(needs.*.result, 'failure') || !contains(needs.*.result, 'cancelled')) }}
+    needs: [verify, secrets, publish, auto-tag-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Post ci-ok commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          SECRETS_RESULT: ${{ needs.secrets.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          AUTO_TAG_RESULT: ${{ needs.auto-tag-test.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          state=success
+          for result in "$VERIFY_RESULT" "$SECRETS_RESULT" "$AUTO_TAG_RESULT"; do
+            [ "$result" = success ] || state=failure
+          done
+          if [ "$EVENT" = push ]; then
+            [ "$PUBLISH_RESULT" = success ] || state=failure
+          else
+            case "$PUBLISH_RESULT" in
+              success|skipped) ;;
+              *) state=failure ;;
+            esac
+          fi
+          if [ "$state" = success ]; then
+            description="main stage: success"
+          else
+            description="main stage: failure"
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context=ci-ok \
+            -f target_url="$RUN_URL" \
+            -f description="$description"
+          [ "$state" = success ]
