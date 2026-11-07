@@ -128,10 +128,11 @@ jobs:
     # Main-stage aggregation (r2 §1). A run whose only non-success results are
     # cancellations is unknown, so this job is skipped and no status is posted
     # (a newer push owns the ref). A skipped needed job runs it red, except
-    # publish outside a push, where skipped is its normal result.
+    # publish outside a push, where skipped is its normal result, and publish
+    # skipped because verify or secrets was cancelled, which is a cancellation.
     # A failed needed job posts failure and fails this job, so a failed main
     # stage cannot trigger the deploy stage.
-    if: ${{ always() && github.event_name != 'pull_request' && (inputs.suite || 'all') != 'deploy' && (contains(needs.*.result, 'failure') || !contains(needs.*.result, 'cancelled') || needs.verify.result == 'skipped' || needs.secrets.result == 'skipped' || needs.auto-tag-test.result == 'skipped' || (github.event_name == 'push' && needs.publish.result == 'skipped')) }}
+    if: ${{ always() && github.event_name != 'pull_request' && (inputs.suite || 'all') != 'deploy' && (contains(needs.*.result, 'failure') || !contains(needs.*.result, 'cancelled') || needs.verify.result == 'skipped' || needs.secrets.result == 'skipped' || needs.auto-tag-test.result == 'skipped' || (github.event_name == 'push' && needs.publish.result == 'skipped' && !contains(needs.*.result, 'cancelled'))) }}
     needs: [verify, secrets, publish, auto-tag-test]
     runs-on: ubuntu-latest
     permissions:
