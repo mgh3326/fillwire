@@ -1,0 +1,229 @@
+name: Deploy
+
+# The heavy stage (operator decision 2026-11-07,
+# hk:doc decision/2026-11-07/fleet-ci-three-tiers-r2 §1, §4-2). It starts only
+# from a successful main-stage (CI) run for that run's head sha, or from the
+# manual ref path, and posts the deploy-ok commit status as candidate evidence.
+# It never deploys, publishes, tags or pushes anything.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Ref (branch, tag or 40-hex sha) to deploy-check; empty uses this dispatch's ref
+        required: false
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: Ref (branch, tag or 40-hex sha) to deploy-check; empty uses the caller's ref
+        required: false
+        default: ''
+        type: string
+
+# Read-only by default. Only deploy-ok can write a commit status, and it runs
+# no candidate code; every candidate checkout drops its credential.
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a deploy: a running check finishes, because a cancelled run
+  # proves nothing and would leave a half-written verdict. One deploy per
+  # repository; GitHub keeps only the newest pending entry, so a newer head
+  # replaces an older queued one (r2 §1).
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    # Only a successful main-stage run for the sha it ran on, or the manual
+    # paths (a workflow_call from CI's suite=deploy dispatch, and deploy.yml's
+    # own workflow_dispatch after merge). The workflow_run trigger itself has
+    # no conclusion filter.
+    if: ${{ github.event_name == 'workflow_call' || github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') }}
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      policy: ${{ steps.policy.outputs.revision }}
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
+      - name: Resolve the candidate sha
+        id: sha
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "candidate sha: $sha"
+      - name: Read the policy revision
+        id: policy
+        run: |
+          revision="$(git rev-parse HEAD:.mergewake/policy.yaml)"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "policy revision: $revision"
+
+  race:
+    needs: candidate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.27.x"
+          cache: true
+      # The full -race suite. No test is excluded: the same run is green on
+      # every pull request today.
+      - name: go test -race (full suite)
+        run: GOMAXPROCS=4 go test -race -p=4 ./... -count=1
+
+  macos:
+    needs: candidate
+    # The release workflow ships darwin/amd64 and darwin/arm64 binaries, so
+    # the target platform runs the format, vet, build and test checks here.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build ./...
+      - name: go test
+        run: go test -count=1 ./...
+
+  release:
+    needs: candidate
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version: "1.27.x"
+          cache: true
+      # The same four CGO-disabled artifacts, flags and checksums release.yml
+      # ships on a v* tag (a dry-run tag here, because nothing is published).
+      - name: Cross-build the four release artifacts
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist/release
+          RELEASE_TAG="v0.0.0-dryrun.${{ github.run_number }}"
+          COMMIT="$(git rev-parse HEAD)"
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath \
+              -ldflags="-s -w -X main.version=$RELEASE_TAG -X main.commit=$COMMIT" \
+              -o "dist/release/fillwire-${target%/*}-${target#*/}" ./cmd/fillwire
+          done
+          (cd dist/release && sha256sum fillwire-* > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Test-install smoke (built artifact)
+        run: |
+          ./dist/release/fillwire-linux-amd64 --help > help.txt 2>&1
+          grep -q 'Usage of' help.txt
+          grep -q -- '-config string' help.txt
+          cat help.txt
+      - name: Digest the artifact set
+        id: digest
+        run: echo "digest=$(sha256sum dist/release/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+  deploy-ok:
+    name: deploy-ok
+    needs: [candidate, race, macos, release]
+    # The verdict is always posted, including on a failure, so the head is
+    # never left looking green by a missing status. A skipped candidate means
+    # the triggering run was not a successful push to main, so nothing is
+    # posted for it.
+    if: ${{ always() && needs.candidate.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Post deploy-ok commit status with candidate evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RESOLVED_SHA: ${{ needs.candidate.outputs.sha }}
+          REQUESTED_REF: ${{ inputs.ref }}
+          DEFAULT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          POLICY_REVISION: ${{ needs.candidate.outputs.policy }}
+          ARTIFACT_DIGEST: ${{ needs.release.outputs.digest }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RACE_RESULT: ${{ needs.race.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+        shell: bash
+        run: |
+          # The status goes to the candidate that was requested. Without a resolved
+          # sha, only a run with no explicit ref can fall back (its candidate is the
+          # triggering sha); an explicit ref that did not resolve gets no status
+          # rather than one on an unrelated commit.
+          TARGET_SHA="$RESOLVED_SHA"
+          if [ -z "$TARGET_SHA" ]; then
+            if [ -n "$REQUESTED_REF" ]; then
+              echo "::error::candidate ref '$REQUESTED_REF' did not resolve; no deploy-ok posted" >&2
+              exit 1
+            fi
+            TARGET_SHA="$DEFAULT_SHA"
+          fi
+          state=success result=success
+          for r in "$RACE_RESULT" "$MACOS_RESULT" "$RELEASE_RESULT"; do
+            case "$r" in
+              success) ;;
+              cancelled) state=error ;;
+              *) state=failure ;;
+            esac
+          done
+          if [ "$state" = error ]; then result=cancelled
+          elif [ "$state" = failure ]; then result=failure
+          fi
+          short_sha=${TARGET_SHA:0:12}
+          short_policy=${POLICY_REVISION:0:12}
+          short_digest=${ARTIFACT_DIGEST:0:16}
+          # repo and run id are in the target URL and the step summary, so the
+          # description stays under 140 characters for any repository name.
+          description="sha=$short_sha policy=$short_policy suite=deploy env=ci $result digest=$short_digest"
+          if [ "${#description}" -gt 140 ]; then
+            echo "deploy-ok description is ${#description} characters, over the 140 limit" >&2
+            exit 1
+          fi
+          {
+            echo "## deploy-ok candidate evidence"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| repo | \`$REPO\` |"
+            echo "| sha | \`$TARGET_SHA\` |"
+            echo "| policy_revision | \`$POLICY_REVISION\` |"
+            echo "| suite | deploy |"
+            echo "| environment | ci |"
+            echo "| run_id | \`$RUN_ID\` |"
+            echo "| result | $result |"
+            echo "| artifact digest | \`$ARTIFACT_DIGEST\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh api "repos/${REPO}/statuses/${TARGET_SHA}" \
+            -f state="$state" \
+            -f context=deploy-ok \
+            -f target_url="$RUN_URL" \
+            -f description="$description"
