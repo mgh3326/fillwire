@@ -25,9 +25,10 @@ on:
         default: ''
         type: string
 
+# Read-only by default. Only deploy-ok can write a commit status, and it runs
+# no candidate code; every candidate checkout drops its credential.
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   # Never cancel a deploy: a running check finishes, because a cancelled run
@@ -52,6 +53,7 @@ jobs:
       - name: Check out the candidate
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
       - name: Resolve the candidate sha
         id: sha
@@ -72,6 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
       - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
         with:
@@ -90,6 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
       - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
         with:
@@ -112,6 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
       - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
         with:
@@ -151,12 +156,16 @@ jobs:
     # posted for it.
     if: ${{ always() && needs.candidate.result != 'skipped' }}
     runs-on: ubuntu-latest
+    permissions:
+      statuses: write
     steps:
       - name: Post deploy-ok commit status with candidate evidence
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          TARGET_SHA: ${{ needs.candidate.outputs.sha || github.event.workflow_run.head_sha || github.sha }}
+          RESOLVED_SHA: ${{ needs.candidate.outputs.sha }}
+          REQUESTED_REF: ${{ inputs.ref }}
+          DEFAULT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
           POLICY_REVISION: ${{ needs.candidate.outputs.policy }}
           ARTIFACT_DIGEST: ${{ needs.release.outputs.digest }}
           RUN_ID: ${{ github.run_id }}
@@ -166,6 +175,18 @@ jobs:
           RELEASE_RESULT: ${{ needs.release.result }}
         shell: bash
         run: |
+          # The status goes to the candidate that was requested. Without a resolved
+          # sha, only a run with no explicit ref can fall back (its candidate is the
+          # triggering sha); an explicit ref that did not resolve gets no status
+          # rather than one on an unrelated commit.
+          TARGET_SHA="$RESOLVED_SHA"
+          if [ -z "$TARGET_SHA" ]; then
+            if [ -n "$REQUESTED_REF" ]; then
+              echo "::error::candidate ref '$REQUESTED_REF' did not resolve; no deploy-ok posted" >&2
+              exit 1
+            fi
+            TARGET_SHA="$DEFAULT_SHA"
+          fi
           state=success result=success
           for r in "$RACE_RESULT" "$MACOS_RESULT" "$RELEASE_RESULT"; do
             case "$r" in
@@ -180,7 +201,9 @@ jobs:
           short_sha=${TARGET_SHA:0:12}
           short_policy=${POLICY_REVISION:0:12}
           short_digest=${ARTIFACT_DIGEST:0:16}
-          description="repo=$REPO sha=$short_sha policy=$short_policy suite=deploy env=ci run=$RUN_ID $result digest=$short_digest"
+          # repo and run id are in the target URL and the step summary, so the
+          # description stays under 140 characters for any repository name.
+          description="sha=$short_sha policy=$short_policy suite=deploy env=ci $result digest=$short_digest"
           if [ "${#description}" -gt 140 ]; then
             echo "deploy-ok description is ${#description} characters, over the 140 limit" >&2
             exit 1
