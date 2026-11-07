@@ -5,8 +5,25 @@ on:
   push:
     branches: [main]
   # The measurement path for a branch: workflow_run only fires from the
-  # default branch, so a branch's main stage is dispatched explicitly.
+  # default branch, so a branch's main stage is dispatched explicitly. GitHub
+  # only dispatches workflows that exist on the default branch, so
+  # suite=deploy is the pre-merge path to the deploy stage (deploy.yml also
+  # keeps its own workflow_dispatch for after merge).
   workflow_dispatch:
+    inputs:
+      suite:
+        description: 'main stage (all) or the deploy stage only (deploy)'
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - deploy
+      ref:
+        description: Candidate ref/sha for suite=deploy; empty uses this dispatch's ref
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   # A newer push to main cancels the older main-stage run. Pull request and
@@ -19,6 +36,7 @@ permissions:
 
 jobs:
   verify:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.suite != 'deploy' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,6 +71,7 @@ jobs:
         run: docker buildx build --load --platform linux/amd64 --tag "fillwire:pr-${GITHUB_SHA}" .
 
   secrets:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.suite != 'deploy' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -97,6 +116,7 @@ jobs:
           printf '%s\n' '### GHCR image' "- image: \`$IMAGE\`" "- digest: \`$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
 
   auto-tag-test:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.suite != 'deploy' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -109,7 +129,7 @@ jobs:
     # this job is skipped and no status is posted (a newer push owns the ref).
     # A failed needed job posts failure and fails this job, so a failed main
     # stage cannot trigger the deploy stage.
-    if: ${{ always() && github.event_name != 'pull_request' && (contains(needs.*.result, 'failure') || !contains(needs.*.result, 'cancelled')) }}
+    if: ${{ always() && github.event_name != 'pull_request' && (inputs.suite || 'all') != 'deploy' && (contains(needs.*.result, 'failure') || !contains(needs.*.result, 'cancelled')) }}
     needs: [verify, secrets, publish, auto-tag-test]
     runs-on: ubuntu-latest
     permissions:
@@ -151,3 +171,15 @@ jobs:
             -f target_url="$RUN_URL" \
             -f description="$description"
           [ "$state" = success ]
+
+  deploy-dispatch:
+    # Pre-merge manual path to the deploy stage. It runs the same reusable
+    # workflow as the automatic workflow_run path, so it posts the same
+    # deploy-ok status on the resolved sha.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'deploy' }}
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
