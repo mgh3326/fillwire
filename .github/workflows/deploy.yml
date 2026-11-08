@@ -76,10 +76,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
-      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+      # The candidate ref is not github.sha, so the composite action comes from
+      # this workflow's own revision, never from the candidate checkout (an
+      # older candidate has no action). It is checked out after the candidate,
+      # because the candidate checkout cleans the workspace.
+      - name: Load the CI composite action from this workflow's revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          go-version: "1.27.x"
-          cache: true
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/actions
+          path: .ci-actions
+          persist-credentials: false
+      - name: Set up Go
+        uses: ./.ci-actions/.github/actions/setup-go-cached
       # The full -race suite. No test is excluded: the same run is green on
       # every pull request today.
       - name: go test -race (full suite)
@@ -95,10 +104,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
-      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+      # The candidate ref is not github.sha, so the composite action comes from
+      # this workflow's own revision, never from the candidate checkout (an
+      # older candidate has no action). It is checked out after the candidate,
+      # because the candidate checkout cleans the workspace.
+      - name: Load the CI composite action from this workflow's revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          go-version: "1.27.x"
-          cache: true
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/actions
+          path: .ci-actions
+          persist-credentials: false
+      - name: Set up Go
+        uses: ./.ci-actions/.github/actions/setup-go-cached
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - name: go vet
@@ -118,10 +136,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.candidate.outputs.sha }}
-      - uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+      # The candidate ref is not github.sha, so the composite action comes from
+      # this workflow's own revision, never from the candidate checkout (an
+      # older candidate has no action). It is checked out after the candidate,
+      # because the candidate checkout cleans the workspace.
+      - name: Load the CI composite action from this workflow's revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          go-version: "1.27.x"
-          cache: true
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/actions
+          path: .ci-actions
+          persist-credentials: false
+      - name: Set up Go
+        uses: ./.ci-actions/.github/actions/setup-go-cached
       # The same four CGO-disabled artifacts, flags and checksums release.yml
       # ships on a v* tag (a dry-run tag here, because nothing is published).
       - name: Cross-build the four release artifacts
