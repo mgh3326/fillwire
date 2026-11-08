@@ -45,6 +45,13 @@ def target_from_title(title: str) -> str | None:
     return match.group(1) if match else None
 
 
+def record_matches_target(recorded_sha: str, target_sha: str) -> bool:
+    return (
+        target_from_title(run_title(recorded_sha)) == recorded_sha
+        and recorded_sha == target_sha
+    )
+
+
 def attempt_url(run: dict[str, Any]) -> str:
     return f"{str(run.get('html_url', '')).rstrip('/')}/attempts/{run.get('run_attempt', 1)}"
 
@@ -142,8 +149,8 @@ def _gh_json(args: list[str]) -> Any:
     return _retry(request)
 
 
-def _run_details(repo: str, run_id: str) -> dict[str, Any]:
-    return _gh_json([f"repos/{repo}/actions/runs/{run_id}"])
+def _run_details(repo: str, run_id: str, attempt: int) -> dict[str, Any]:
+    return _gh_json([f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}"])
 
 
 def _fetch_jobs(repo: str, run_id: int, attempt: int) -> list[dict[str, Any]]:
@@ -177,23 +184,36 @@ def _is_ancestor(repo: str, sha: str) -> bool:
     return status in {"behind", "identical"}
 
 
-def _fetch_statuses(repo: str, sha: str) -> list[dict[str, Any]]:
-    return _gh_json([f"repos/{repo}/commits/{sha}/statuses?per_page=100"])
+def _latest_context_statuses(
+    statuses: list[dict[str, Any]], watched: list[str]
+) -> dict[str, dict[str, Any]]:
+    """The status API is newest-first; keep the first status for each context."""
+    latest: dict[str, dict[str, Any]] = {}
+    for status in statuses:
+        context = str(status.get("context", ""))
+        if context in watched and context not in latest:
+            latest[context] = status
+    return latest
 
 
-def _download_record(repo: str, run_id: int, watched: list[str]) -> list[str]:
+def _download_record(
+    repo: str, run_id: int, attempt: int, target_sha: str, watched: list[str]
+) -> list[str]:
     def request() -> list[str]:
         with tempfile.TemporaryDirectory(prefix="any-ref-target-") as directory:
             subprocess.run(
-                ["gh", "run", "download", str(run_id), "--repo", repo, "--name", ARTIFACT_NAME, "--dir", directory],
+                [
+                    "gh", "run", "download", str(run_id), "--repo", repo,
+                    "--name", f"{ARTIFACT_NAME}-{attempt}", "--dir", directory,
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             target_dir = Path(directory)
             sha = (target_dir / "sha.txt").read_text(encoding="utf-8").strip()
-            if target_from_title(run_title(sha)) != sha:
-                raise ValueError("recorded target must be a lowercase 40-hex SHA")
+            if not record_matches_target(sha, target_sha):
+                raise ValueError("recorded target must match the run title's lowercase 40-hex SHA")
             names = (target_dir / "expected-checks.txt").read_text(encoding="utf-8").splitlines()
             if sorted(names) != sorted(watched):
                 raise ValueError("recorded check names differ from the names this workflow publishes")
@@ -203,12 +223,17 @@ def _download_record(repo: str, run_id: int, watched: list[str]) -> list[str]:
 
 
 def _plan_for_run(
-    repo: str, run_id: int, jobs: list[dict[str, Any]], watched: list[str]
+    repo: str,
+    run_id: int,
+    attempt: int,
+    sha: str,
+    jobs: list[dict[str, Any]],
+    watched: list[str],
 ) -> dict[str, tuple[str, str]]:
     if not records_target(jobs):
         return failed_verdicts(watched, "validation or target recording did not succeed")
     try:
-        _download_record(repo, run_id, watched)
+        _download_record(repo, run_id, attempt, sha, watched)
     except (subprocess.CalledProcessError, OSError, ValueError, TypeError, AttributeError) as error:
         return failed_verdicts(watched, f"target record unavailable ({type(error).__name__})")
     return verdicts(jobs, watched)
@@ -302,7 +327,7 @@ def reconcile_newer_poster(
     failed = _publish_plan(
         repo,
         sha,
-        _plan_for_run(repo, newer[0], jobs, watched),
+        _plan_for_run(repo, newer[0], newer[1], sha, jobs, watched),
         attempt_url(newer_run),
         posted_file,
         post_status,
@@ -341,10 +366,21 @@ def _newer_published_contexts(
     watched: list[str],
 ) -> set[str]:
     source = attempt_url(run)
+    latest: dict[str, dict[str, Any]] = {}
+    page = 1
+    while True:
+        batch = _gh_json(
+            [f"repos/{repo}/commits/{sha}/statuses?per_page={JOBS_PAGE_SIZE}&page={page}"]
+        )
+        for context, status in _latest_context_statuses(batch, watched).items():
+            latest.setdefault(context, status)
+        if set(watched).issubset(latest) or len(batch) < JOBS_PAGE_SIZE:
+            break
+        page += 1
     return {
-        str(status.get("context"))
-        for status in _fetch_statuses(repo, sha)
-        if status.get("target_url") == source and status.get("context") in watched
+        context
+        for context, status in latest.items()
+        if status.get("target_url") == source
     }
 
 
@@ -379,7 +415,11 @@ def _fallback(
             posted_file.write_text("", encoding="utf-8")
             jobs = fetch_jobs(newer[0], newer[1])
             failures = _publish_plan(
-                repo, sha, _plan_for_run(repo, newer[0], jobs, watched), target_url, posted_file
+                repo,
+                sha,
+                _plan_for_run(repo, newer[0], newer[1], sha, jobs, watched),
+                target_url,
+                posted_file,
             )
             if failures:
                 raise RuntimeError(f"newer verdict status writes failed: {', '.join(failures)}")
@@ -438,7 +478,7 @@ def _post_run(
 
     posted_file.write_text("", encoding="utf-8")
     jobs = _fetch_jobs(repo, run_id, run_attempt)
-    plan = _plan_for_run(repo, run_id, jobs, watched)
+    plan = _plan_for_run(repo, run_id, run_attempt, sha, jobs, watched)
 
     failed = _publish_plan(repo, sha, plan, attempt_url(run), posted_file, post_status)
     if failed:
@@ -469,7 +509,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        run = _run_details(args.repo, args.run_id)
+        run_attempt = int(args.run_attempt)
+        if run_attempt < 1:
+            raise ValueError("run attempt must be a positive integer")
+        run = _run_details(args.repo, args.run_id, run_attempt)
+        if int(run.get("run_attempt", run_attempt)) != run_attempt:
+            raise ValueError("workflow run attempt response does not match the requested attempt")
         run.setdefault("html_url", args.run_url)
         if not _current_run_is_supported(run, args.repo):
             print("not a main-dispatched run of this repository's any-ref workflow; nothing posted")
@@ -478,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         if sha is None:
             print("run title does not contain a canonical any-ref SHA; nothing posted", file=sys.stderr)
             return 1
-        if not _is_ancestor(args.repo, sha):
+        if args.mode == "post" and not _is_ancestor(args.repo, sha):
             print(f"{sha} is not on {TARGET_BRANCH}'s history; nothing posted", file=sys.stderr)
             return 2
         posted_file = Path(args.posted_file)

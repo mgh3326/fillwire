@@ -362,6 +362,9 @@ func TestAnyRefWorkflowContract(t *testing.T) {
 	if strings.Contains(strings.Join(anyRef.lines, "\n"), "./.github/workflows/deploy.yml") {
 		t.Error("any-ref workflow must not invoke deploy.yml")
 	}
+	if !strings.Contains(strings.Join(anyRef.lines, "\n"), "name: any-ref-target-${{ github.run_attempt }}") {
+		t.Error("target record artifact name must identify its workflow run attempt")
+	}
 	for _, name := range []string{"verify", "secrets"} {
 		job, ok := jobNamed(anyRef, name)
 		if !ok {
@@ -405,8 +408,11 @@ func TestAnyRefWorkflowContract(t *testing.T) {
 	if statusPermissionLines != 1 {
 		t.Errorf("poster workflow must have exactly one statuses: write permission, got %d", statusPermissionLines)
 	}
-	if !strings.Contains(strings.Join(post.lines, "\n"), "github.event.workflow_run.id") {
-		t.Error("poster concurrency group must be unique per run so pending posters cannot replace each other")
+	if !hasLine(post.lines, "group: ci-any-ref-status-${{ github.event.workflow_run.display_title }}") {
+		t.Error("poster concurrency group must serialize runs for the same candidate SHA")
+	}
+	if !hasLine(post.lines, "cancel-in-progress: false") {
+		t.Error("same-SHA posters must serialize without cancelling the active poster")
 	}
 	if !ok || len(post.steps) == 0 || !strings.Contains(strings.Join(post.steps[0].lines, "\n"), "github.event.repository.default_branch") {
 		t.Error("poster must check out the default branch")

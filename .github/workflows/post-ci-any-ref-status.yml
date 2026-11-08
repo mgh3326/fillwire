@@ -20,9 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      # A distinct group per parent run and attempt prevents a newer pending
-      # poster from replacing an older one. The helper reconciles stale posts.
-      group: ci-any-ref-status-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+      # Serialize posters for the same candidate SHA so a stale poster cannot
+      # append a status after the newest run has reconciled.
+      group: ci-any-ref-status-${{ github.event.workflow_run.display_title }}
       cancel-in-progress: false
     permissions:
       actions: read

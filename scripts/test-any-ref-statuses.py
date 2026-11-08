@@ -40,6 +40,18 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(statuses.target_from_title("any-ref " + "a" * 40), "a" * 40)
         self.assertIsNone(statuses.target_from_title("any-ref " + "A" * 40))
 
+    def test_recorded_sha_must_match_run_title_target(self) -> None:
+        target = "a" * 40
+        other = "b" * 40
+        self.assertTrue(statuses.record_matches_target(target, target))
+        self.assertFalse(statuses.record_matches_target(other, target))
+        self.assertFalse(statuses.record_matches_target("not-a-sha", target))
+
+    def test_run_details_fetches_requested_attempt(self) -> None:
+        with patch.object(statuses, "_gh_json", return_value={"run_attempt": 2}) as request:
+            self.assertEqual(statuses._run_details("owner/repo", "11", 2), {"run_attempt": 2})
+        request.assert_called_once_with(["repos/owner/repo/actions/runs/11/attempts/2"])
+
     def test_cancelled_is_red(self) -> None:
         self.assertEqual(self.verdict([job("verify", "cancelled")]), "failure")
 
@@ -85,7 +97,7 @@ class VerdictTests(unittest.TestCase):
         run_details = {
             "id": 11,
             "run_attempt": 1,
-            "display_title": "any-ref sha",
+            "display_title": "any-ref " + "a" * 40,
             "event": "workflow_dispatch",
             "head_branch": "main",
             "head_repository": {"full_name": "owner/repo"},
@@ -153,6 +165,34 @@ class VerdictTests(unittest.TestCase):
             )
             self.assertEqual(posted_file.read_text(encoding="utf-8").splitlines(), ["verify", "secrets"])
 
+    def test_stale_poster_republishes_newer_verdict_when_older_status_is_latest(self) -> None:
+        run_list = [recorded_run()]
+        newer_jobs = [
+            job("validate ref", "success"),
+            job("record any-ref target", "success"),
+            job("verify", "success"),
+            job("secrets", "failure"),
+        ]
+        posted = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            posted_file = Path(temp_dir) / "posted.txt"
+            posted_file.write_text("verify\nsecrets\n", encoding="utf-8")
+
+            def publish(repo, sha, context, state, reason, url):
+                posted.append((context, state, url))
+                return True
+
+            with patch.object(statuses, "_download_record", return_value=["verify", "secrets"]), patch.object(
+                statuses, "_newer_published_contexts", return_value={"secrets"}
+            ):
+                result = statuses.reconcile_newer_poster(
+                    "owner/repo", "sha", 11, 1, ["verify", "secrets"], run_list,
+                    lambda *_: newer_jobs, publish, posted_file,
+                )
+        self.assertEqual(result, (True, (12, 1)))
+        self.assertEqual([item[0] for item in posted], ["verify", "secrets"])
+        self.assertTrue(all(item[2] == "https://example.invalid/run/12/attempts/1" for item in posted))
+
     def test_failed_reconciliation_clears_old_post_markers(self) -> None:
         run_list = [recorded_run()]
         newer_jobs = [
@@ -199,6 +239,19 @@ class VerdictTests(unittest.TestCase):
                 ["secrets"],
             )
 
+    def test_only_latest_status_per_context_counts_as_newer_published(self) -> None:
+        newer = recorded_run()
+        statuses_history = [
+            {"context": "verify", "target_url": "https://example.invalid/old/attempts/1"},
+            {"context": "secrets", "target_url": statuses.attempt_url(newer)},
+            {"context": "verify", "target_url": statuses.attempt_url(newer)},
+        ]
+        with patch.object(statuses, "_gh_json", return_value=statuses_history):
+            self.assertEqual(
+                statuses._newer_published_contexts("owner/repo", "sha", newer, ["verify", "secrets"]),
+                {"secrets"},
+            )
+
     def test_missing_record_produces_red_verdicts(self) -> None:
         jobs = [
             job("validate ref", "success"),
@@ -207,7 +260,7 @@ class VerdictTests(unittest.TestCase):
             job("secrets", "success"),
         ]
         self.assertEqual(
-            statuses._plan_for_run("owner/repo", 11, jobs, ["verify", "secrets"]),
+            statuses._plan_for_run("owner/repo", 11, 1, "sha", jobs, ["verify", "secrets"]),
             {
                 "verify": ("failure", "validation or target recording did not succeed"),
                 "secrets": ("failure", "validation or target recording did not succeed"),
@@ -255,6 +308,61 @@ class VerdictTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         post.assert_not_called()
+
+    def test_fallback_reconciles_when_newer_run_is_not_latest_for_every_context(self) -> None:
+        run = recorded_run(run_id=11)
+        run["display_title"] = "any-ref sha"
+        newer = recorded_run()
+        jobs = [job("validate ref", "success"), job("record any-ref target", "success")]
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            statuses, "_dispatch_runs", return_value=[newer]
+        ), patch.object(statuses, "_fetch_jobs", return_value=jobs), patch.object(
+            statuses, "_newer_published_contexts", return_value={"secrets"}
+        ), patch.object(statuses, "_download_record", return_value=["verify", "secrets"]), patch.object(
+            statuses, "_publish_plan", return_value=[]
+        ) as publish:
+            result = statuses._fallback(
+                "owner/repo", "sha", run, ["verify", "secrets"], Path(temp_dir) / "posted.txt"
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(publish.call_args.args[2], {
+            "verify": ("failure", "0 jobs match, expected one"),
+            "secrets": ("failure", "0 jobs match, expected one"),
+        })
+
+    def test_fallback_posts_failures_for_sha_outside_main_history(self) -> None:
+        sha = "a" * 40
+        run = {
+            "id": 11,
+            "run_attempt": 1,
+            "display_title": "any-ref " + sha,
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "head_repository": {"full_name": "owner/repo"},
+            "repository": {"full_name": "owner/repo"},
+            "path": ".github/workflows/ci-any-ref.yml@refs/heads/main",
+            "html_url": "https://example.invalid/run/11",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            statuses, "_run_details", return_value=run
+        ) as run_details, patch.object(statuses, "_current_run_is_supported", return_value=True), patch.object(
+            statuses, "_is_ancestor", return_value=False
+        ) as is_ancestor, patch.object(statuses, "_dispatch_runs", return_value=[]), patch.object(
+            statuses, "_publish_plan", return_value=[]
+        ) as publish:
+            result = statuses.main(
+                ["--mode", "fallback", "--repo", "owner/repo", "--run-id", "11",
+                 "--run-attempt", "1", "--run-url", run["html_url"],
+                 "--posted-file", str(Path(temp_dir) / "posted.txt"),
+                 "--watch", "verify", "--watch", "secrets"]
+            )
+        self.assertEqual(result, 0)
+        run_details.assert_called_once_with("owner/repo", "11", 1)
+        is_ancestor.assert_not_called()
+        self.assertEqual(publish.call_args.args[2], {
+            "verify": ("failure", "any-ref poster failed before publishing this context"),
+            "secrets": ("failure", "any-ref poster failed before publishing this context"),
+        })
 
 
 if __name__ == "__main__":
