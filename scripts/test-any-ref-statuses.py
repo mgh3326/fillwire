@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
@@ -70,13 +71,64 @@ class VerdictTests(unittest.TestCase):
         with patch.object(statuses, "_is_ancestor", return_value=True), patch.object(
             statuses, "_dispatch_runs", return_value=run_list
         ), patch.object(statuses, "_fetch_jobs", side_effect=OSError("unavailable")):
-            with redirect_stderr(StringIO()):
+            with tempfile.TemporaryDirectory() as temp_dir, redirect_stderr(StringIO()):
                 result = statuses.main(
                     ["--repo", "owner/repo", "--sha", "sha", "--run-id", "11",
                      "--run-attempt", "1", "--target-url", "https://example.invalid/run",
-                     "--watch", "verify"]
+                     "--posted-file", str(Path(temp_dir) / "posted.txt"), "--watch", "verify"]
                 )
         self.assertEqual(result, 1)
+
+    def test_github_calls_retry_after_transient_errors(self) -> None:
+        calls = 0
+
+        def flaky_call() -> str:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise OSError("temporary API failure")
+            return "ok"
+
+        with patch.object(statuses.time, "sleep") as sleep:
+            self.assertEqual(statuses._retry(flaky_call), "ok")
+        self.assertEqual(calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_stale_poster_reconciles_newer_completed_verdict(self) -> None:
+        run_list = [{
+            "id": 12,
+            "run_attempt": 1,
+            "display_title": "any-ref sha",
+            "status": "completed",
+            "html_url": "https://example.invalid/run/12",
+        }]
+        newer_jobs = [
+            job("validate ref", "success"),
+            job("record any-ref target", "success"),
+            job("verify", "success"),
+            job("secrets", "failure"),
+        ]
+        posted = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            posted_file = Path(temp_dir) / "posted.txt"
+
+            def publish(repo, sha, context, state, reason, url):
+                posted.append((context, state, url))
+                return True
+
+            result = statuses.reconcile_newer_poster(
+                "owner/repo", "sha", 11, 1, ["verify", "secrets"], run_list,
+                lambda *_: newer_jobs, publish, posted_file,
+            )
+            self.assertEqual(result, (True, (12, 1)))
+            self.assertEqual(
+                posted,
+                [
+                    ("verify", "success", "https://example.invalid/run/12"),
+                    ("secrets", "failure", "https://example.invalid/run/12"),
+                ],
+            )
+            self.assertEqual(posted_file.read_text(encoding="utf-8").splitlines(), ["verify", "secrets"])
 
 
 if __name__ == "__main__":

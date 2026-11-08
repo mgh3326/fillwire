@@ -62,7 +62,9 @@ jobs:
     needs: resolve
     if: ${{ needs.resolve.outputs.has_target == 'true' }}
     concurrency:
-      group: ci-any-ref-status-${{ needs.resolve.outputs.sha }}
+      # A distinct group per run prevents GitHub's single pending slot from
+      # silently replacing an older poster. The helper reconciles stale posts.
+      group: ci-any-ref-status-${{ needs.resolve.outputs.sha }}-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -100,5 +102,36 @@ jobs:
             --run-id "$RUN_ID" \
             --run-attempt "$RUN_ATTEMPT" \
             --target-url "$RUN_URL" \
+            --posted-file "$RUNNER_TEMP/any-ref-posted.txt" \
             --watch verify \
             --watch secrets
+
+      - name: Post failure for any status not written
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          posted="$RUNNER_TEMP/any-ref-posted.txt"
+          for context in verify secrets; do
+            if [ -f "$posted" ] && grep -Fxq "$context" "$posted"; then
+              continue
+            fi
+            attempt=1
+            until gh api "repos/${REPO}/statuses/${SHA}" \
+              -f state=failure \
+              -f context="$context" \
+              -f target_url="$RUN_URL" \
+              -f description="any-ref CI could not publish its verdict; retry required"; do
+              if [ "$attempt" -ge 4 ]; then
+                echo "could not post fallback failure for $context" >&2
+                exit 1
+              fi
+              sleep "$attempt"
+              attempt=$((attempt + 1))
+            done
+          done

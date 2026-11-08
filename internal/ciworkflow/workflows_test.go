@@ -314,6 +314,12 @@ func TestAnyRefWorkflowContract(t *testing.T) {
 	if !ok || len(validate.steps) == 0 || !strings.Contains(strings.Join(validate.steps[0].lines, "\n"), "40-hex") {
 		t.Error("the validator's first step must validate the exact 40-hex ref")
 	}
+	if ok && len(validate.steps) > 0 {
+		first := strings.Join(validate.steps[0].lines, "\n")
+		if !strings.Contains(first, "[0-9a-f]{40}") || strings.Contains(first, "[0-9a-fA-F]") {
+			t.Error("the validator must require a canonical lowercase SHA")
+		}
+	}
 	for _, step := range validate.steps {
 		if hasAction(step.uses(), "actions/checkout") {
 			t.Error("ref validation must precede every checkout")
@@ -396,6 +402,9 @@ func TestAnyRefWorkflowContract(t *testing.T) {
 	if statusPermissionLines != 1 {
 		t.Errorf("poster workflow must have exactly one statuses: write permission, got %d", statusPermissionLines)
 	}
+	if !strings.Contains(strings.Join(post.lines, "\n"), "github.event.workflow_run.id") {
+		t.Error("poster concurrency group must be unique per run so pending posters cannot replace each other")
+	}
 	if !ok || len(post.steps) == 0 || !strings.Contains(strings.Join(post.steps[0].lines, "\n"), "github.event.repository.default_branch") {
 		t.Error("poster must check out the default branch")
 	}
@@ -406,6 +415,30 @@ func TestAnyRefWorkflowContract(t *testing.T) {
 		if job.name != "post" && hasLine(job.lines, "statuses: write") {
 			t.Errorf("non-poster job %q has statuses: write", job.name)
 		}
+	}
+	if !strings.Contains(strings.Join(post.lines, "\n"), "if: ${{ failure() }}") {
+		t.Error("poster must attempt failure statuses for contexts it did not write before failing")
+	}
+
+	ci, foundCI := workflowFile{}, false
+	for _, wf := range loadWorkflows(t) {
+		if wf.name == "ci.yml" {
+			ci, foundCI = wf, true
+		}
+	}
+	if foundCI {
+		autoTag, foundJob := jobNamed(ci, "auto-tag-test")
+		foundTest := false
+		for _, step := range autoTag.steps {
+			if strings.Contains(strings.Join(step.lines, "\n"), "scripts/test-any-ref-statuses.py") {
+				foundTest = true
+			}
+		}
+		if !foundJob || !foundTest {
+			t.Error("CI must run the any-ref verdict tests in its existing Python test job")
+		}
+	} else {
+		t.Error("ci.yml was not loaded while checking the any-ref test gate")
 	}
 }
 

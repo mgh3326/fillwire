@@ -120,6 +120,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: python3 scripts/test-auto-tag.py
       - run: python3 scripts/test-repair-release.py
+      - run: python3 scripts/test-any-ref-statuses.py
 
   ci-ok-status:
     name: ci-ok status

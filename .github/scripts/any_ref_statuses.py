@@ -7,12 +7,15 @@ import argparse
 import json
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 TARGET_BRANCH = "main"
 VALIDATE_JOB = "validate ref"
 RECORD_JOB = "record any-ref target"
 DESCRIPTION_LIMIT = 140
 JOBS_PAGE_SIZE = 100
+API_RETRY_ATTEMPTS = 4
 
 
 class UnreadableNewerRun(RuntimeError):
@@ -100,9 +103,24 @@ def description(name: str, reason: str) -> str:
     return f"any-ref CI {name}: {reason}"[:DESCRIPTION_LIMIT]
 
 
+def _retry(operation):
+    """Retry transient GitHub CLI/API failures with short bounded backoff."""
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except (subprocess.CalledProcessError, OSError, ValueError, TypeError, AttributeError):
+            if attempt + 1 == API_RETRY_ATTEMPTS:
+                raise
+            time.sleep(2**attempt)
+    raise AssertionError("unreachable")
+
+
 def _gh_json(args: list[str]) -> dict:
-    out = subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True).stdout
-    return json.loads(out)
+    def request() -> dict:
+        out = subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True).stdout
+        return json.loads(out)
+
+    return _retry(request)
 
 
 def _fetch_jobs(repo: str, run_id: str, attempt: str) -> list[dict]:
@@ -137,14 +155,67 @@ def _is_ancestor(repo: str, sha: str) -> bool:
 
 
 def _post(repo: str, sha: str, context: str, state: str, reason: str, url: str) -> bool:
-    proc = subprocess.run(
-        ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{sha}", "-f", f"state={state}",
-         "-f", f"context={context}", "-f", f"target_url={url}", "-f",
-         f"description={description(context, reason)}"],
-        capture_output=True,
-        text=True,
+    def request() -> bool:
+        proc = subprocess.run(
+            ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{sha}", "-f", f"state={state}",
+             "-f", f"context={context}", "-f", f"target_url={url}", "-f",
+             f"description={description(context, reason)}"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, proc.args, proc.stdout, proc.stderr)
+        return True
+
+    return _retry(request)
+
+
+def _mark_posted(path: Path, context: str) -> None:
+    with path.open("a", encoding="utf-8") as posted:
+        posted.write(context + "\n")
+
+
+def reconcile_newer_poster(
+    repo: str,
+    sha: str,
+    run_id: int,
+    run_attempt: int,
+    watched: list[str],
+    runs: list[dict],
+    fetch_jobs,
+    post_status,
+    posted_file: Path,
+) -> tuple[bool, tuple[int, int] | None]:
+    """Re-publish a newer completed run if it appeared while this poster ran."""
+    superseded, newer = supersession_decision(
+        runs,
+        run_title(sha),
+        run_id,
+        run_attempt,
+        fetch_jobs,
     )
-    return proc.returncode == 0
+    if not superseded:
+        return False, None
+    newer_run = next(
+        run for run in runs
+        if int(run["id"]) == newer[0]
+        and int(run.get("run_attempt", 1)) == newer[1]
+    )
+    # An in-progress run has not emitted its own workflow_run completion event
+    # yet. Its default-branch poster will publish after its jobs finish.
+    if newer_run.get("status") != "completed":
+        return True, newer
+    jobs = fetch_jobs(newer[0], newer[1])
+    if not records_target(jobs):
+        return True, newer
+    plan = verdicts(jobs, watched)
+    target_url = str(newer_run.get("html_url", ""))
+    for context, (state, reason) in plan.items():
+        if post_status(repo, sha, context, state, reason, target_url):
+            _mark_posted(posted_file, context)
+        else:
+            raise RuntimeError(f"could not reconcile {context} from newer run {newer[0]}")
+    return True, newer
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--run-attempt", required=True)
     parser.add_argument("--target-url", required=True)
+    parser.add_argument("--posted-file", required=True)
     parser.add_argument("--watch", action="append", required=True)
     args = parser.parse_args(argv)
 
@@ -173,14 +245,35 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run {newer[0]} attempt {newer[1]} recorded a target for {args.sha}; run {args.run_id} posts nothing")
         return 0
 
+    posted_file = Path(args.posted_file)
+    posted_file.write_text("", encoding="utf-8")
     plan = verdicts(_fetch_jobs(args.repo, args.run_id, args.run_attempt), args.watch)
     failed = []
     for name, (state, reason) in plan.items():
         print(f"{name}: {state} ({reason})")
-        if not _post(args.repo, args.sha, name, state, reason, args.target_url):
+        try:
+            _post(args.repo, args.sha, name, state, reason, args.target_url)
+            _mark_posted(posted_file, name)
+        except (subprocess.CalledProcessError, OSError, ValueError, TypeError, AttributeError):
             failed.append(name)
     if failed:
         print(f"could not post: {', '.join(failed)}", file=sys.stderr)
+        return 1
+
+    try:
+        reconcile_newer_poster(
+            args.repo,
+            args.sha,
+            int(args.run_id),
+            int(args.run_attempt),
+            args.watch,
+            _dispatch_runs(args.repo),
+            lambda run_id, attempt: _fetch_jobs(args.repo, str(run_id), str(attempt)),
+            _post,
+            posted_file,
+        )
+    except UnreadableNewerRun as error:
+        print(str(error), file=sys.stderr)
         return 1
     return 0
 
