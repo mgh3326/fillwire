@@ -52,6 +52,30 @@ class VerdictTests(unittest.TestCase):
             self.assertEqual(statuses._run_details("owner/repo", "11", 2), {"run_attempt": 2})
         request.assert_called_once_with(["repos/owner/repo/actions/runs/11/attempts/2"])
 
+    def test_current_run_identity_matches_the_runs_api_shape(self) -> None:
+        # Fields as GET repos/{repo}/actions/runs/{id}/attempts/{n} returned them for a
+        # main-dispatched any-ref run (2026-11-08): "path" carries no "@ref" suffix.
+        run = {
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "head_repository": {"full_name": "owner/repo"},
+            "repository": {"full_name": "owner/repo"},
+            "path": ".github/workflows/ci-any-ref.yml",
+        }
+        self.assertTrue(statuses._current_run_is_supported(run, "owner/repo"))
+        self.assertTrue(statuses._current_run_is_supported(
+            {**run, "path": ".github/workflows/ci-any-ref.yml@refs/heads/main"}, "owner/repo"))
+        for changed in (
+            {"path": ".github/workflows/ci.yml"},
+            {"path": ".github/workflows/ci-any-ref.yml@refs/heads/feature"},
+            {"path": ".github/workflows/ci-any-ref.yml.bak"},
+            {"head_branch": "feature"},
+            {"event": "push"},
+            {"head_repository": {"full_name": "fork/repo"}},
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(statuses._current_run_is_supported({**run, **changed}, "owner/repo"))
+
     def test_cancelled_is_red(self) -> None:
         self.assertEqual(self.verdict([job("verify", "cancelled")]), "failure")
 
@@ -102,7 +126,7 @@ class VerdictTests(unittest.TestCase):
             "head_branch": "main",
             "head_repository": {"full_name": "owner/repo"},
             "repository": {"full_name": "owner/repo"},
-            "path": ".github/workflows/ci-any-ref.yml@refs/heads/main",
+            "path": ".github/workflows/ci-any-ref.yml",
         }
         with patch.object(statuses, "_run_details", return_value=run_details), patch.object(
             statuses, "_is_ancestor", return_value=True
@@ -340,7 +364,7 @@ class VerdictTests(unittest.TestCase):
             "head_branch": "main",
             "head_repository": {"full_name": "owner/repo"},
             "repository": {"full_name": "owner/repo"},
-            "path": ".github/workflows/ci-any-ref.yml@refs/heads/main",
+            "path": ".github/workflows/ci-any-ref.yml",
             "html_url": "https://example.invalid/run/11",
         }
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
