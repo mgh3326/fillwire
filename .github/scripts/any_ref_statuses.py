@@ -347,6 +347,11 @@ def _newer_run_details(
     )
 
 
+# The runs API answers the plain file path (".github/workflows/ci-any-ref.yml");
+# the "@refs/heads/<branch>" form is accepted only for the default branch.
+_ACCEPTED_WORKFLOW_PATHS = frozenset({WORKFLOW_FILE, f"{WORKFLOW_FILE}@refs/heads/{TARGET_BRANCH}"})
+
+
 def _current_run_is_supported(run: dict[str, Any], repo: str) -> bool:
     head_repo = run.get("head_repository") or {}
     repository = run.get("repository") or {}
@@ -355,7 +360,7 @@ def _current_run_is_supported(run: dict[str, Any], repo: str) -> bool:
         and run.get("head_branch") == TARGET_BRANCH
         and head_repo.get("full_name") == repo
         and repository.get("full_name") == repo
-        and str(run.get("path", "")).startswith(WORKFLOW_FILE + "@")
+        and str(run.get("path", "")) in _ACCEPTED_WORKFLOW_PATHS
     )
 
 
