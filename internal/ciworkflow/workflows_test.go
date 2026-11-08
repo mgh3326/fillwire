@@ -211,7 +211,7 @@ func TestParserSeesWorkflows(t *testing.T) {
 	want := map[string][]string{
 		"ci.yml":                     {"verify", "secrets", "publish", "auto-tag-test", "ci-ok-status", "deploy-dispatch"},
 		"ci-any-ref.yml":             {"validate", "verify", "secrets", "record"},
-		"post-ci-any-ref-status.yml": {"resolve", "post"},
+		"post-ci-any-ref-status.yml": {"post"},
 		"deploy.yml":                 {"candidate", "race", "macos", "release", "deploy-ok"},
 		"release.yml":                {"build", "test", "publish"},
 	}
@@ -271,6 +271,9 @@ func TestAnyRefWorkflowContract(t *testing.T) {
 	}
 	if anyRef.name == "" || poster.name == "" {
 		t.Fatal("any-ref workflow and default-branch poster must both exist")
+	}
+	if len(poster.jobs) != 1 {
+		t.Errorf("poster workflow must use one job so its failure recovery runs even if target resolution fails; found %d jobs", len(poster.jobs))
 	}
 	for _, line := range anyRef.lines {
 		trimmed := strings.TrimSpace(line)
@@ -416,7 +419,7 @@ func TestAnyRefWorkflowContract(t *testing.T) {
 			t.Errorf("non-poster job %q has statuses: write", job.name)
 		}
 	}
-	if !strings.Contains(strings.Join(post.lines, "\n"), "if: ${{ failure() }}") {
+	if !strings.Contains(strings.Join(post.lines, "\n"), "if: ${{ failure() }}") || !strings.Contains(strings.Join(post.lines, "\n"), "--mode fallback") {
 		t.Error("poster must attempt failure statuses for contexts it did not write before failing")
 	}
 
