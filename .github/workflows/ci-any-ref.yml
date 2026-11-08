@@ -1,0 +1,132 @@
+name: CI (any ref)
+run-name: any-ref ${{ inputs.ref }}
+
+# This workflow tests a historical main commit whose push run was cancelled.
+# It defines only the watched checks; it cannot publish an image, post ci-ok,
+# or invoke Deploy. Statuses are written by post-ci-any-ref-status.yml from the
+# default branch after this run completes.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact 40-hex commit SHA on main's history
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Each dispatch and rerun has its own group so same-commit verdicts can finish;
+# the poster serializes publication by the recorded commit.
+concurrency:
+  group: ci-any-ref-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require an exact 40-hex commit SHA
+        env:
+          TARGET_SHA: ${{ inputs.ref }}
+        run: |
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ref must be an exact lowercase 40-hex commit SHA"
+            exit 1
+          fi
+
+      - name: Require the commit to be on main's history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.ref }}
+        run: |
+          status="$(gh api "repos/${REPO}/compare/main...${TARGET_SHA}" --jq .status)"
+          case "$status" in
+            behind|identical) echo "${TARGET_SHA} is on main's history" ;;
+            *)
+              echo "${TARGET_SHA} is not on main's history (compare status: ${status})"
+              exit 1
+              ;;
+          esac
+
+  verify:
+    name: verify
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Load the toolchain action from the default-branch workflow revision,
+      # since older candidate commits may not contain this composite action.
+      - name: Load the CI composite action from this workflow's revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/actions
+          path: .ci-actions
+          persist-credentials: false
+      - name: Set up Go
+        uses: ./.ci-actions/.github/actions/setup-go-cached
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: go vet
+        run: GOMAXPROCS=4 go vet -p=4 ./...
+      - name: go test
+        run: GOMAXPROCS=4 go test -count=1 -p=4 ./...
+      - name: go build
+        run: GOMAXPROCS=4 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p=4 -trimpath -ldflags='-s -w' -o /tmp/fillwire ./cmd/fillwire
+
+  secrets:
+    name: secrets
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  record:
+    name: record any-ref target
+    needs: validate
+    if: ${{ always() && needs.validate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Write the commit and watched check names
+        env:
+          TARGET_SHA: ${{ inputs.ref }}
+        run: |
+          mkdir -p any-ref-target
+          printf '%s\n' "$TARGET_SHA" > any-ref-target/sha.txt
+          printf '%s\n' verify secrets > any-ref-target/expected-checks.txt
+      - name: Upload the target record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: any-ref-target-${{ github.run_attempt }}
+          path: any-ref-target/
+          if-no-files-found: error
+          retention-days: 7

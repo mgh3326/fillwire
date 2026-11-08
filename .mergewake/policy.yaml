@@ -4,6 +4,7 @@ enabled: true
 required_checks:
   - verify
   - secrets
+any_ref_workflow: ci-any-ref.yml
 blocking:
   - paths: ['internal/exec/**']
     reason: The order execution state machine decides what is sent to a broker once it is wired to E1.

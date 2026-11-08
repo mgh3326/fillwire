@@ -1,0 +1,73 @@
+name: Post CI any-ref statuses
+
+# workflow_run loads this file from the default branch. The one job owns status
+# publication and its fallback, so an upstream resolution failure cannot skip it.
+on:
+  workflow_run:
+    workflows: ["CI (any ref)"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    name: post any-ref statuses
+    if: >-
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      # Serialize posters for the same candidate SHA so a stale poster cannot
+      # append a status after the newest run has reconciled.
+      group: ci-any-ref-status-${{ github.event.workflow_run.display_title }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Post verify and secrets statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          POSTED_FILE: ${{ runner.temp }}/any-ref-posted.txt
+        run: |
+          python3 .github/scripts/any_ref_statuses.py \
+            --mode post \
+            --repo "$REPO" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --run-url "$RUN_URL" \
+            --posted-file "$POSTED_FILE" \
+            --watch verify \
+            --watch secrets
+      - name: Recover statuses if posting failed
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          POSTED_FILE: ${{ runner.temp }}/any-ref-posted.txt
+        run: |
+          python3 .github/scripts/any_ref_statuses.py \
+            --mode fallback \
+            --repo "$REPO" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --run-url "$RUN_URL" \
+            --posted-file "$POSTED_FILE" \
+            --watch verify \
+            --watch secrets

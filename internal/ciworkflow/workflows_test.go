@@ -209,9 +209,11 @@ func goCommandIn(lines []string) bool {
 // other tests rely on must actually be found.
 func TestParserSeesWorkflows(t *testing.T) {
 	want := map[string][]string{
-		"ci.yml":      {"verify", "secrets", "publish", "auto-tag-test", "ci-ok-status", "deploy-dispatch"},
-		"deploy.yml":  {"candidate", "race", "macos", "release", "deploy-ok"},
-		"release.yml": {"build", "test", "publish"},
+		"ci.yml":                     {"verify", "secrets", "publish", "auto-tag-test", "ci-ok-status", "deploy-dispatch"},
+		"ci-any-ref.yml":             {"validate", "verify", "secrets", "record"},
+		"post-ci-any-ref-status.yml": {"post"},
+		"deploy.yml":                 {"candidate", "race", "macos", "release", "deploy-ok"},
+		"release.yml":                {"build", "test", "publish"},
 	}
 	found := map[string]map[string]bool{}
 	for _, wf := range loadWorkflows(t) {
@@ -236,6 +238,216 @@ func TestParserSeesWorkflows(t *testing.T) {
 				t.Errorf("deploy.yml race: parser found %d steps, want at least 4", len(j.steps))
 			}
 		}
+	}
+}
+
+func jobNamed(wf workflowFile, name string) (jobInfo, bool) {
+	for _, j := range wf.jobs {
+		if j.name == name {
+			return j, true
+		}
+	}
+	return jobInfo{}, false
+}
+
+func hasLine(lines []string, want string) bool {
+	for _, line := range lines {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAnyRefWorkflowContract(t *testing.T) {
+	var anyRef, poster workflowFile
+	for _, wf := range loadWorkflows(t) {
+		switch wf.name {
+		case "ci-any-ref.yml":
+			anyRef = wf
+		case "post-ci-any-ref-status.yml":
+			poster = wf
+		}
+	}
+	if anyRef.name == "" || poster.name == "" {
+		t.Fatal("any-ref workflow and default-branch poster must both exist")
+	}
+	if len(poster.jobs) != 1 {
+		t.Errorf("poster workflow must use one job so its failure recovery runs even if target resolution fails; found %d jobs", len(poster.jobs))
+	}
+	for _, line := range anyRef.lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "statuses: write") || strings.Contains(trimmed, "packages: write") {
+			t.Errorf("any-ref workflow has forbidden permission %q", trimmed)
+		}
+	}
+
+	// Dispatch accepts only the target ref. The validator is the first job, and
+	// every job that checks out source depends on its successful completion.
+	if !hasLine(anyRef.lines, "workflow_dispatch:") || !hasLine(anyRef.lines, "ref:") {
+		t.Error("any-ref workflow must be dispatch-only with a ref input")
+	}
+	inOn := false
+	var triggers, dispatchInputs []string
+	for _, line := range anyRef.lines {
+		if line == "on:" {
+			inOn = true
+			continue
+		}
+		if inOn && indentOf(line) == 0 && !isBlank(line) && !isComment(line) {
+			break
+		}
+		if !inOn || isBlank(line) || isComment(line) {
+			continue
+		}
+		if indentOf(line) == 2 && strings.HasSuffix(strings.TrimSpace(line), ":") {
+			triggers = append(triggers, strings.TrimSuffix(strings.TrimSpace(line), ":"))
+		}
+		if indentOf(line) == 6 && strings.HasSuffix(strings.TrimSpace(line), ":") {
+			dispatchInputs = append(dispatchInputs, strings.TrimSuffix(strings.TrimSpace(line), ":"))
+		}
+	}
+	if strings.Join(triggers, ",") != "workflow_dispatch" || strings.Join(dispatchInputs, ",") != "ref" {
+		t.Errorf("any-ref workflow must have only workflow_dispatch with only input ref; got triggers=%v inputs=%v", triggers, dispatchInputs)
+	}
+	if len(anyRef.jobs) == 0 || anyRef.jobs[0].name != "validate" {
+		t.Error("validate must be the first any-ref job")
+	}
+	validate, ok := jobNamed(anyRef, "validate")
+	if !ok || len(validate.steps) == 0 || !strings.Contains(strings.Join(validate.steps[0].lines, "\n"), "40-hex") {
+		t.Error("the validator's first step must validate the exact 40-hex ref")
+	}
+	if ok && len(validate.steps) > 0 {
+		first := strings.Join(validate.steps[0].lines, "\n")
+		if !strings.Contains(first, "[0-9a-f]{40}") || strings.Contains(first, "[0-9a-fA-F]") {
+			t.Error("the validator must require a canonical lowercase SHA")
+		}
+	}
+	for _, step := range validate.steps {
+		if hasAction(step.uses(), "actions/checkout") {
+			t.Error("ref validation must precede every checkout")
+		}
+	}
+	allowedJobs := map[string]bool{"validate": true, "verify": true, "secrets": true, "record": true}
+	for _, job := range anyRef.jobs {
+		if !allowedJobs[job.name] {
+			t.Errorf("any-ref workflow has unexpected job %q; its call graph must remain limited to validation, watched checks and recording", job.name)
+		}
+		for _, step := range job.steps {
+			if hasAction(step.uses(), "actions/checkout") && job.name != "validate" && !hasLine(job.lines, "needs: validate") {
+				t.Errorf("any-ref job %q checks out before requiring validation", job.name)
+			}
+		}
+		for _, line := range job.lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.Contains(trimmed, "statuses: write") || strings.Contains(trimmed, "packages: write") {
+				t.Errorf("any-ref job %q has forbidden permission %q", job.name, trimmed)
+			}
+		}
+		for _, line := range job.lines {
+			if strings.Contains(line, "uses: ./.github/workflows/") {
+				t.Errorf("any-ref job %q calls another workflow; its permission graph is not closed", job.name)
+			}
+		}
+	}
+	if _, ok := jobNamed(anyRef, "publish"); ok {
+		t.Error("any-ref graph must not contain image publishing")
+	}
+	if _, ok := jobNamed(anyRef, "ci-ok-status"); ok {
+		t.Error("any-ref graph must not contain ci-ok status posting")
+	}
+	if _, ok := jobNamed(anyRef, "deploy-dispatch"); ok {
+		t.Error("any-ref graph must not dispatch deploy")
+	}
+	if strings.Contains(strings.Join(anyRef.lines, "\n"), "./.github/workflows/deploy.yml") {
+		t.Error("any-ref workflow must not invoke deploy.yml")
+	}
+	if !strings.Contains(strings.Join(anyRef.lines, "\n"), "name: any-ref-target-${{ github.run_attempt }}") {
+		t.Error("target record artifact name must identify its workflow run attempt")
+	}
+	for _, name := range []string{"verify", "secrets"} {
+		job, ok := jobNamed(anyRef, name)
+		if !ok {
+			t.Errorf("any-ref workflow is missing watched job %q", name)
+			continue
+		}
+		foundRefCheckout := false
+		for _, step := range job.steps {
+			if hasAction(step.uses(), "actions/checkout") {
+				ref, exists := step.value("ref")
+				if exists && ref == "${{ inputs.ref }}" {
+					foundRefCheckout = true
+				}
+			}
+		}
+		if !foundRefCheckout {
+			t.Errorf("any-ref job %q must check out inputs.ref", name)
+		}
+	}
+
+	// The workflow_run poster is loaded from the default branch and is the only
+	// workflow on this path that can write statuses. Its job names cannot collide
+	// with either watched context.
+	if !hasLine(poster.lines, "workflow_run:") || !hasLine(poster.lines, `workflows: ["CI (any ref)"]`) {
+		t.Error("poster must run from workflow_run for CI (any ref)")
+	}
+	post, ok := jobNamed(poster, "post")
+	if !ok || !hasLine(post.lines, "statuses: write") {
+		t.Error("only poster job must hold statuses: write")
+	}
+	statusPermissionLines := 0
+	for _, line := range poster.lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "statuses: write" {
+			statusPermissionLines++
+		}
+		if trimmed == "packages: write" {
+			t.Error("any-ref poster path must not hold packages: write")
+		}
+	}
+	if statusPermissionLines != 1 {
+		t.Errorf("poster workflow must have exactly one statuses: write permission, got %d", statusPermissionLines)
+	}
+	if !hasLine(post.lines, "group: ci-any-ref-status-${{ github.event.workflow_run.display_title }}") {
+		t.Error("poster concurrency group must serialize runs for the same candidate SHA")
+	}
+	if !hasLine(post.lines, "cancel-in-progress: false") {
+		t.Error("same-SHA posters must serialize without cancelling the active poster")
+	}
+	if !ok || len(post.steps) == 0 || !strings.Contains(strings.Join(post.steps[0].lines, "\n"), "github.event.repository.default_branch") {
+		t.Error("poster must check out the default branch")
+	}
+	for _, job := range poster.jobs {
+		if job.name == "verify" || job.name == "secrets" || hasLine(job.lines, "name: verify") || hasLine(job.lines, "name: secrets") {
+			t.Errorf("poster job %q collides with a watched name", job.name)
+		}
+		if job.name != "post" && hasLine(job.lines, "statuses: write") {
+			t.Errorf("non-poster job %q has statuses: write", job.name)
+		}
+	}
+	if !strings.Contains(strings.Join(post.lines, "\n"), "if: ${{ failure() }}") || !strings.Contains(strings.Join(post.lines, "\n"), "--mode fallback") {
+		t.Error("poster must attempt failure statuses for contexts it did not write before failing")
+	}
+
+	ci, foundCI := workflowFile{}, false
+	for _, wf := range loadWorkflows(t) {
+		if wf.name == "ci.yml" {
+			ci, foundCI = wf, true
+		}
+	}
+	if foundCI {
+		autoTag, foundJob := jobNamed(ci, "auto-tag-test")
+		foundTest := false
+		for _, step := range autoTag.steps {
+			if strings.Contains(strings.Join(step.lines, "\n"), "scripts/test-any-ref-statuses.py") {
+				foundTest = true
+			}
+		}
+		if !foundJob || !foundTest {
+			t.Error("CI must run the any-ref verdict tests in its existing Python test job")
+		}
+	} else {
+		t.Error("ci.yml was not loaded while checking the any-ref test gate")
 	}
 }
 
