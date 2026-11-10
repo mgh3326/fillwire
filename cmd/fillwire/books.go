@@ -50,6 +50,8 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 	var archiveEvents chan kisArchiveEvent
 	var archiveDone chan struct{}
 	var archiveDrops atomic.Uint64
+	var archivePending atomic.Uint64
+	var archiveLastWarning atomic.Int64
 	var archiveErrors atomic.Uint64
 	var archiveLastError atomic.Value
 	if cfg.recording.enabled {
@@ -72,6 +74,42 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 			}
 		}()
 	}
+	enqueueArchive := func(event kisArchiveEvent) {
+		if archiveEvents == nil {
+			return
+		}
+		if pending := archivePending.Swap(0); pending > 0 {
+			marker, _ := json.Marshal(struct {
+				Kind       string    `json:"kind"`
+				Market     string    `json:"market"`
+				ReceivedAt time.Time `json:"received_at"`
+				Dropped    uint64    `json:"dropped"`
+			}{"archive_gap", cfg.Books.Symbol, event.at, pending})
+			select {
+			case archiveEvents <- kisArchiveEvent{event.at, marker}:
+			default:
+				archivePending.Add(pending + 1)
+				archiveDrops.Add(1)
+				now := time.Now().UnixNano()
+				last := archiveLastWarning.Load()
+				if now-last >= int64(30*time.Second) && archiveLastWarning.CompareAndSwap(last, now) {
+					logger.Warn("KIS 호가 보존 큐 초과, 누락 구간을 기록합니다", "dropped", archiveDrops.Load())
+				}
+				return
+			}
+		}
+		select {
+		case archiveEvents <- event:
+		default:
+			archivePending.Add(1)
+			archiveDrops.Add(1)
+			now := time.Now().UnixNano()
+			last := archiveLastWarning.Load()
+			if now-last >= int64(30*time.Second) && archiveLastWarning.CompareAndSwap(last, now) {
+				logger.Warn("KIS 호가 보존 큐 초과, 누락 구간을 기록합니다", "dropped", archiveDrops.Load())
+			}
+		}
+	}
 	return func(e ws.Event) {
 			if archiveEvents != nil {
 				at := e.ReceivedAt
@@ -86,11 +124,7 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 					Fields     []string  `json:"fields,omitempty"`
 				}{"book", cfg.Books.Symbol, at, e.Raw, e.Fields})
 				if marshalErr == nil {
-					select {
-					case archiveEvents <- kisArchiveEvent{at, json.RawMessage(line)}:
-					default:
-						archiveDrops.Add(1)
-					}
+					enqueueArchive(kisArchiveEvent{at, json.RawMessage(line)})
 				}
 			}
 			select {
@@ -102,11 +136,18 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 			<-done
 			r.Close()
 			if archiveEvents != nil {
+				if dropped := archivePending.Swap(0); dropped > 0 {
+					at := time.Now().UTC()
+					marker, _ := json.Marshal(struct {
+						Kind       string    `json:"kind"`
+						Market     string    `json:"market"`
+						ReceivedAt time.Time `json:"received_at"`
+						Dropped    uint64    `json:"dropped"`
+					}{"archive_gap", cfg.Books.Symbol, at, dropped})
+					archiveEvents <- kisArchiveEvent{at, marker}
+				}
 				close(archiveEvents)
 				<-archiveDone
-				if dropped := archiveDrops.Load(); dropped > 0 {
-					logger.Warn("KIS 호가 보존 큐 초과", "dropped", dropped)
-				}
 				if failed := archiveErrors.Load(); failed > 0 {
 					logger.Error("KIS 호가 파일 기록 실패", "failed", failed, "reason", archiveLastError.Load())
 				}

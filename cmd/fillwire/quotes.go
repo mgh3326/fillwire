@@ -195,8 +195,13 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	var archive *recording.Sink
 	var archiveQueue chan quoteArchiveEvent
 	var archiveDrops atomic.Uint64
+	var archiveLastWarning atomic.Int64
 	var archiveErrors atomic.Uint64
 	var archiveLastError atomic.Value
+	pendingDrops := make(map[string]*atomic.Uint64, len(settings.symbols))
+	for _, symbol := range settings.symbols {
+		pendingDrops[quoteArchiveName(symbol)] = &atomic.Uint64{}
+	}
 	if cfg.recording.enabled {
 		archive, err = recording.NewSink(cfg.recording.directory, "toss")
 		if err != nil {
@@ -213,6 +218,38 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 			}
 		}
 		archiveQueue = make(chan quoteArchiveEvent, max(settings.buffer, defaultQuoteBuffer))
+	}
+	enqueueArchive := func(event quoteArchiveEvent) {
+		if archiveQueue == nil {
+			return
+		}
+		pending := pendingDrops[event.name]
+		if dropped := pending.Swap(0); dropped > 0 {
+			marker := tossArchiveRecord{Kind: "archive_gap", Market: event.value.Market, ReceivedAt: event.at.UTC(), Dropped: dropped}
+			select {
+			case archiveQueue <- quoteArchiveEvent{name: event.name, at: event.at, value: marker}:
+			default:
+				pending.Add(dropped + 1)
+				archiveDrops.Add(1)
+				now := time.Now().UnixNano()
+				last := archiveLastWarning.Load()
+				if now-last >= int64(30*time.Second) && archiveLastWarning.CompareAndSwap(last, now) {
+					logger.Warn("Toss 호가 보존 큐 초과, 누락 구간을 기록합니다", "dropped", archiveDrops.Load())
+				}
+				return
+			}
+		}
+		select {
+		case archiveQueue <- event:
+		default:
+			pending.Add(1)
+			archiveDrops.Add(1)
+			now := time.Now().UnixNano()
+			last := archiveLastWarning.Load()
+			if now-last >= int64(30*time.Second) && archiveLastWarning.CompareAndSwap(last, now) {
+				logger.Warn("Toss 호가 보존 큐 초과, 누락 구간을 기록합니다", "dropped", archiveDrops.Load())
+			}
+		}
 	}
 	runner, err := quote.NewRunner(quote.Config{
 		Symbols:      settings.symbols,
@@ -231,12 +268,8 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 			if archiveQueue == nil {
 				return
 			}
-			value := tossArchiveRecord{Kind: "quote", Market: symbol.Market, ReceivedAt: received.UTC(), Tick: tick}
-			select {
-			case archiveQueue <- quoteArchiveEvent{name: quoteArchiveName(symbol), at: received, value: value}:
-			default:
-				archiveDrops.Add(1)
-			}
+			value := tossArchiveRecord{Kind: "quote", Market: symbol.Market, ReceivedAt: received.UTC(), Tick: &tick}
+			enqueueArchive(quoteArchiveEvent{name: quoteArchiveName(symbol), at: received, value: value})
 		},
 	})
 	if err != nil {
@@ -264,10 +297,17 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 				}
 			}()
 			runner.Run(ctx)
+			for _, symbol := range settings.symbols {
+				name := quoteArchiveName(symbol)
+				if dropped := pendingDrops[name].Swap(0); dropped > 0 {
+					at := time.Now().UTC()
+					archiveQueue <- quoteArchiveEvent{name: name, at: at, value: tossArchiveRecord{Kind: "archive_gap", Market: symbol.Market, ReceivedAt: at, Dropped: dropped}}
+				}
+			}
 			close(archiveQueue)
 			<-archiveDone
 			if dropped := archiveDrops.Load(); dropped > 0 {
-				logger.Warn("Toss 호가 보존 큐 초과", "dropped", dropped)
+				logger.Warn("Toss 호가 보존에서 누락 구간을 기록했습니다", "dropped", dropped)
 			}
 			if failed := archiveErrors.Load(); failed > 0 {
 				logger.Error("Toss 호가 파일 기록 실패", "failed", failed, "reason", archiveLastError.Load())
@@ -290,10 +330,11 @@ type quoteArchiveEvent struct {
 }
 
 type tossArchiveRecord struct {
-	Kind       string     `json:"kind"`
-	Market     string     `json:"market"`
-	ReceivedAt time.Time  `json:"received_at"`
-	Tick       quote.Tick `json:"tick"`
+	Kind       string      `json:"kind"`
+	Market     string      `json:"market"`
+	ReceivedAt time.Time   `json:"received_at"`
+	Tick       *quote.Tick `json:"tick,omitempty"`
+	Dropped    uint64      `json:"dropped,omitempty"`
 }
 
 func quoteArchiveName(symbol quote.Symbol) string {

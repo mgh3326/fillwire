@@ -118,6 +118,9 @@ func (w *DailyWriter) rotate(day string) error {
 	if err := restoreCompressed(path); err != nil {
 		return err
 	}
+	if err := repairTrailingLine(path); err != nil {
+		return fmt.Errorf("recording: 마지막 불완전 레코드 정리 실패: %w", err)
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
 	if err != nil {
 		return fmt.Errorf("recording: 파일 열기 실패: %w", err)
@@ -157,7 +160,7 @@ func restoreCompressed(path string) error {
 		return err
 	}
 	existingHash := sha256.New()
-	_, copyErr := io.Copy(io.MultiWriter(tmp, existingHash), gz)
+	existingSize, copyErr := io.Copy(io.MultiWriter(tmp, existingHash), gz)
 	closeGZErr := gz.Close()
 	closeInErr := f.Close()
 	if copyErr != nil || closeGZErr != nil || closeInErr != nil {
@@ -166,9 +169,24 @@ func restoreCompressed(path string) error {
 	}
 	if raw, err := os.Open(path); err == nil {
 		rawHash := sha256.New()
-		_, copyErr = io.Copy(rawHash, raw)
-		if copyErr == nil && !bytes.Equal(existingHash.Sum(nil), rawHash.Sum(nil)) {
-			_, copyErr = raw.Seek(0, io.SeekStart)
+		var rawSize int64
+		rawSize, copyErr = io.Copy(rawHash, raw)
+		if copyErr == nil {
+			prefixMatches := false
+			if rawSize >= existingSize {
+				prefixHash := sha256.New()
+				_, copyErr = io.CopyN(prefixHash, io.NewSectionReader(raw, 0, existingSize), existingSize)
+				prefixMatches = copyErr == nil && bytes.Equal(existingHash.Sum(nil), prefixHash.Sum(nil))
+			}
+			if copyErr == nil {
+				if prefixMatches {
+					_, copyErr = raw.Seek(existingSize, io.SeekStart)
+				} else if bytes.Equal(existingHash.Sum(nil), rawHash.Sum(nil)) {
+					_, copyErr = raw.Seek(0, io.SeekEnd)
+				} else {
+					_, copyErr = raw.Seek(0, io.SeekStart)
+				}
+			}
 			if copyErr == nil {
 				_, copyErr = io.Copy(tmp, raw)
 			}
@@ -198,6 +216,49 @@ func restoreCompressed(path string) error {
 		return err
 	}
 	return nil
+}
+
+// repairTrailingLine discards only an incomplete final JSONL record. A process
+// killed mid-write can leave bytes without a newline; appending must not join
+// the next record to that fragment.
+func repairTrailingLine(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0640)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return err
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], info.Size()-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	const blockSize = 4096
+	end := info.Size()
+	buffer := make([]byte, blockSize)
+	for end > 0 {
+		start := end - blockSize
+		if start < 0 {
+			start = 0
+		}
+		n, err := f.ReadAt(buffer[:end-start], start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if i := bytes.LastIndexByte(buffer[:n], '\n'); i >= 0 {
+			return f.Truncate(start + int64(i) + 1)
+		}
+		end = start
+	}
+	return f.Truncate(0)
 }
 
 func (w *DailyWriter) closeDay() error {

@@ -368,9 +368,21 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 
 	controls := make(chan control, 8)
 	readerDone := make(chan error, 1)
-	go r.guard("reader", stopLane, func() {
-		readerDone <- r.readLoop(windowCtx, transport, controls)
-	})
+	readerExited := make(chan struct{})
+	go func() {
+		defer close(readerExited)
+		r.guard("reader", stopLane, func() {
+			readerDone <- r.readLoop(windowCtx, transport, controls)
+		})
+	}()
+	defer func() {
+		// A frame already read may still be inside OnTick when the window ends.
+		// Stop its context, close the socket to unblock Read, and join it before
+		// runWindow returns so archive owners can safely drain their queues.
+		closeWindow()
+		_ = transport.Close()
+		<-readerExited
+	}()
 
 	if err := r.declare(windowCtx, transport); err != nil {
 		if windowCtx.Err() != nil {

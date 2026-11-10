@@ -67,7 +67,7 @@ func TestQuoteArchiveUsesMarketQualifiedSafeNames(t *testing.T) {
 	if got := quoteArchiveName(us); got != "US-BRK_B" || !recording.SafeName(got) {
 		t.Fatalf("US archive name=%q is not a safe market-qualified name", got)
 	}
-	line, err := json.Marshal(tossArchiveRecord{Kind: "quote", Market: us.Market, Tick: quote.Tick{Symbol: us.Code}})
+	line, err := json.Marshal(tossArchiveRecord{Kind: "quote", Market: us.Market, Tick: &quote.Tick{Symbol: us.Code}})
 	if err != nil {
 		t.Fatal(err)
 	}
