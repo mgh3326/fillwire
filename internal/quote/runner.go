@@ -63,6 +63,7 @@ type Config struct {
 	Buffer    int
 	Clock     Clock
 	Logger    *slog.Logger
+	OnTick    func(Tick, time.Time)
 
 	// RetryMin and RetryMax pace redials after a window run fails, doubling
 	// with jitter (AsyncAPI: 1s, 2s, 4s, ...). Zero values take 1s and 5m.
@@ -472,6 +473,9 @@ func (r *Runner) readLoop(ctx context.Context, transport Transport, controls cha
 			if frame.Drop != "" {
 				r.counters.drop(frame.Drop)
 				continue
+			}
+			if r.cfg.OnTick != nil {
+				r.cfg.OnTick(frame.Tick, received)
 			}
 			select {
 			case r.ticks <- frame.Tick:

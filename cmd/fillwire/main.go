@@ -24,6 +24,20 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "upbit" {
+		if err := runUpbitCommand(os.Args[2:]); err != nil && !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "coverage" {
+		if err := runCoverageCommand(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		return
+	}
 	configPath := flag.String("config", "fillwire.toml", "path to fillwire TOML configuration")
 	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -224,6 +238,8 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	// The quote lane starts after the fills pipeline and never feeds the
 	// select below: its failures cannot stop fillwire.
 	quotes := startQuoteLane(cfg, logger, dependencies)
+	upbitRecorder := startUpbitLane(cfg.upbit, logger)
+	defer upbitRecorder.halt()
 	defer quotes.halt()
 
 	var (

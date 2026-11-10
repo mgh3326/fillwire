@@ -67,3 +67,16 @@ buffer = 1024 # at most 65536
 enabled = false
 symbol = "005930"
 access_token_env = "KIS_MOCK_ACCESS_TOKEN"
+
+# Toss/KIS 시세 레인의 장기 JSONL 기록. 기본 비활성화.
+[recording]
+enabled = false
+directory = "/var/lib/fillwire/recordings"
+
+# Upbit 공개 호가 및 체결 기록기. API 키와 비공개 웹소켓을 사용하지 않습니다.
+[upbit]
+enabled = false
+markets_file = "/etc/fillwire/upbit-markets.txt" # 한 줄에 KRW 마켓 코드 하나, 최대 20개
+directory = "/var/lib/fillwire/recordings"
+retry_min = "1s"
+retry_max = "30s"

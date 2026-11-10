@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/quote"
+	"github.com/mgh3326/fillwire/internal/recording"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -190,6 +191,15 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	if dialer == nil {
 		dialer = quote.NewDialer()
 	}
+	var archive *recording.Sink
+	if cfg.recording.enabled {
+		archive, err = recording.NewSink(cfg.recording.directory)
+		if err != nil {
+			_ = redisClient.Close()
+			logger.Error("Toss 호가 파일 기록기를 시작하지 못했습니다", "reason", err.Error())
+			return quoteLane{}
+		}
+	}
 	runner, err := quote.NewRunner(quote.Config{
 		Symbols:      settings.symbols,
 		Token:        token,
@@ -203,9 +213,26 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 		RetryMin:     dependencies.quoteRetryMin,
 		RetryMax:     dependencies.quoteRetryMax,
 		PingInterval: dependencies.quotePing,
+		OnTick: func(tick quote.Tick, received time.Time) {
+			if archive == nil {
+				return
+			}
+			name := strings.ReplaceAll(tick.Symbol, ":", "-")
+			value := struct {
+				Kind       string     `json:"kind"`
+				ReceivedAt time.Time  `json:"received_at"`
+				Tick       quote.Tick `json:"tick"`
+			}{"quote", received.UTC(), tick}
+			if err := archive.Append("toss", name, received, value); err != nil {
+				logger.Error("Toss 호가 파일 기록에 실패했습니다", "reason", err.Error())
+			}
+		},
 	})
 	if err != nil {
 		_ = redisClient.Close()
+		if archive != nil {
+			_ = archive.Close()
+		}
 		logger.Error("quote reader disabled", "reason", err.Error())
 		return quoteLane{}
 	}
@@ -214,6 +241,13 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	go func() {
 		defer close(done)
 		defer redisClient.Close()
+		if archive != nil {
+			defer func() {
+				if err := archive.Close(); err != nil {
+					logger.Error("Toss 호가 파일 닫기에 실패했습니다", "reason", err.Error())
+				}
+			}()
+		}
 		runner.Run(ctx)
 	}()
 	logger.Info("quote reader started", "provider", "toss", "symbols", len(settings.symbols), "stream", settings.streamKey)

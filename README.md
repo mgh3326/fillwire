@@ -589,3 +589,22 @@ go test ./cmd/execmock ./internal/book -update
 ## Internal observations
 
 PR1 exposes a named in-process counter snapshot for validation drops, duplicate suspects, successful XADDs, successful XACKs, and failed ingest attempts. It deliberately has no Prometheus dependency or endpoint.
+
+## 시세 기록기 (기본 비활성화)
+
+Upbit 공개 웹소켓 기록기는 API 키 없이 최대 20개 KRW 마켓의 `orderbook`(15개 호가 단위, 상위 10개 활용 가능) 및 `trade` 프레임을 수신합니다. `[upbit] enabled = true`를 설정하고 `markets_file`에 한 줄마다 `KRW-BTC`와 같은 마켓 코드를 적은 뒤 서비스를 재시작하세요. 기록은 `<directory>/upbit/<UTC 날짜>/<마켓>.jsonl`에 추가되며 UTC 날짜가 바뀌면 이전 파일을 동기화하고 gzip으로 닫습니다. 연결 단절 및 재연결은 `gap`과 `connected` 레코드로 남습니다.
+
+Toss `[quotes]` 또는 KIS `[books]`를 켤 때도 Redis 보존 한도를 넘는 기록이 필요하면 `[recording] enabled = true`와 `directory`를 설정하세요. Toss 데이터는 `toss/`, KIS 호가 이벤트는 `kis/` 아래 같은 UTC 날짜 구조로 저장됩니다. 기존 Redis 스트림 출력은 계속 동작합니다. KIS 다중 마켓 호가 기록은 후속 작업입니다.
+
+하루별 연결 커버리지를 확인하려면 다음 명령을 사용하세요. 요약은 마켓별 커버된 초, 하루 86,400초, 비율을 JSON으로 출력합니다.
+
+```sh
+fillwire coverage --dir /var/lib/fillwire/recordings --day 2026-11-10
+fillwire coverage --dir /tmp/fillwire-recordings --day 2026-11-10 --from 2026-11-10T01:00:00Z --to 2026-11-10T01:05:00Z
+```
+
+Upbit 기록기를 단독으로 실행해 확인하려면 다음 명령을 사용하세요.
+
+```sh
+fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fillwire/recordings
+```
