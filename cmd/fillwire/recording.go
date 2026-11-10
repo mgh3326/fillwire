@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,6 +24,22 @@ type recordingFileConfig struct {
 	Enabled   bool   `toml:"enabled"`
 	Directory string `toml:"directory"`
 }
+
+type archiveGapRecord struct {
+	Kind       string    `json:"kind"`
+	Market     string    `json:"market"`
+	ReceivedAt time.Time `json:"received_at"`
+	Dropped    uint64    `json:"dropped"`
+}
+
+func warnArchiveAppendFailure(logger *slog.Logger, lane string, lastWarning *atomic.Int64, failures uint64, err error) {
+	now := time.Now().UnixNano()
+	last := lastWarning.Load()
+	if now-last >= int64(30*time.Second) && lastWarning.CompareAndSwap(last, now) {
+		logger.Warn("시세 파일 보존 기록에 실패했습니다; 복구 후 누락 표시를 기록합니다", "lane", lane, "failures", failures, "reason", err.Error())
+	}
+}
+
 type upbitFileConfig struct {
 	Enabled     bool   `toml:"enabled"`
 	MarketsFile string `toml:"markets_file"`

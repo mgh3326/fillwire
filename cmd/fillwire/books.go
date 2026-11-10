@@ -52,39 +52,48 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 	var archiveDrops atomic.Uint64
 	var archivePending atomic.Uint64
 	var archiveLastWarning atomic.Int64
+	var archiveLastWriteWarning atomic.Int64
 	var archiveErrors atomic.Uint64
 	var archiveLastError atomic.Value
 	if cfg.recording.enabled {
 		archive, err = recording.NewSink(cfg.recording.directory, "kis")
 		if err != nil {
-			cancel()
-			<-done
-			r.Close()
-			return nil, nil, err
-		}
-		archiveEvents = make(chan kisArchiveEvent, 256)
-		archiveDone = make(chan struct{})
-		go func() {
-			defer close(archiveDone)
-			for event := range archiveEvents {
-				if err := archive.Append("kis", cfg.Books.Symbol, event.at, event.record); err != nil {
-					archiveErrors.Add(1)
-					archiveLastError.Store(err.Error())
+			logger.Error("KIS 호가 기록 저장소를 열지 못해 파일 보존을 비활성화합니다", "reason", err.Error())
+		} else {
+			archiveEvents = make(chan kisArchiveEvent, 256)
+			archiveDone = make(chan struct{})
+			go func() {
+				defer close(archiveDone)
+				var writeFailures uint64
+				for event := range archiveEvents {
+					if err := archive.Append("kis", cfg.Books.Symbol, event.at, event.record); err != nil {
+						writeFailures++
+						archiveErrors.Add(1)
+						archiveLastError.Store(err.Error())
+						warnArchiveAppendFailure(logger, "kis", &archiveLastWriteWarning, writeFailures, err)
+						continue
+					}
+					if writeFailures > 0 {
+						marker, _ := json.Marshal(archiveGapRecord{Kind: "archive_gap", Market: cfg.Books.Symbol, ReceivedAt: event.at.UTC(), Dropped: writeFailures})
+						if err := archive.Append("kis", cfg.Books.Symbol, event.at, json.RawMessage(marker)); err != nil {
+							writeFailures++
+							archiveErrors.Add(1)
+							archiveLastError.Store(err.Error())
+							warnArchiveAppendFailure(logger, "kis", &archiveLastWriteWarning, writeFailures, err)
+						} else {
+							writeFailures = 0
+						}
+					}
 				}
-			}
-		}()
+			}()
+		}
 	}
 	enqueueArchive := func(event kisArchiveEvent) {
 		if archiveEvents == nil {
 			return
 		}
 		if pending := archivePending.Swap(0); pending > 0 {
-			marker, _ := json.Marshal(struct {
-				Kind       string    `json:"kind"`
-				Market     string    `json:"market"`
-				ReceivedAt time.Time `json:"received_at"`
-				Dropped    uint64    `json:"dropped"`
-			}{"archive_gap", cfg.Books.Symbol, event.at, pending})
+			marker, _ := json.Marshal(archiveGapRecord{Kind: "archive_gap", Market: cfg.Books.Symbol, ReceivedAt: event.at.UTC(), Dropped: pending})
 			select {
 			case archiveEvents <- kisArchiveEvent{event.at, marker}:
 			default:
@@ -138,12 +147,7 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 			if archiveEvents != nil {
 				if dropped := archivePending.Swap(0); dropped > 0 {
 					at := time.Now().UTC()
-					marker, _ := json.Marshal(struct {
-						Kind       string    `json:"kind"`
-						Market     string    `json:"market"`
-						ReceivedAt time.Time `json:"received_at"`
-						Dropped    uint64    `json:"dropped"`
-					}{"archive_gap", cfg.Books.Symbol, at, dropped})
+					marker, _ := json.Marshal(archiveGapRecord{Kind: "archive_gap", Market: cfg.Books.Symbol, ReceivedAt: at, Dropped: dropped})
 					archiveEvents <- kisArchiveEvent{at, marker}
 				}
 				close(archiveEvents)

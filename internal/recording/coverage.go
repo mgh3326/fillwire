@@ -113,6 +113,9 @@ func readCoverageEvents(root string, now time.Time) (map[string][]coverageEvent,
 		if strings.HasSuffix(name, ".gz") {
 			f, err := os.Open(path)
 			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil
+				}
 				return err
 			}
 			gz, err := gzip.NewReader(f)
@@ -127,6 +130,9 @@ func readCoverageEvents(root string, now time.Time) (map[string][]coverageEvent,
 		} else {
 			in, err = os.Open(path)
 			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil
+				}
 				return err
 			}
 		}

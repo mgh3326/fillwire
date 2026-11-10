@@ -411,3 +411,98 @@ func TestRestoreCompressedDoesNotDuplicateAlreadyRestoredPrefix(t *testing.T) {
 		t.Fatalf("restored records duplicated: %s", data)
 	}
 }
+
+type shortWriteFile struct {
+	*os.File
+	short        bool
+	failTruncate bool
+}
+
+func (f *shortWriteFile) Write(data []byte) (int, error) {
+	if f.short {
+		f.short = false
+		return f.File.Write(data[:len(data)/2])
+	}
+	return f.File.Write(data)
+}
+
+func (f *shortWriteFile) Truncate(size int64) error {
+	if f.failTruncate {
+		f.failTruncate = false
+		return errors.New("simulated truncate error")
+	}
+	return f.File.Truncate(size)
+}
+
+type closeErrorFile struct {
+	*os.File
+}
+
+func (f *closeErrorFile) Close() error {
+	_ = f.File.Close()
+	return errors.New("simulated close I/O error")
+}
+
+func TestDailyWriterTruncatesFailedShortAppend(t *testing.T) {
+	root := t.TempDir()
+	w, err := NewDailyWriter(root, "toss", "KR-005930")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	if err := w.Append(at, map[string]string{"value": "before"}); err != nil {
+		t.Fatal(err)
+	}
+	w.file = &shortWriteFile{File: w.file.(*os.File), short: true, failTruncate: true}
+	if err := w.Append(at, map[string]string{"value": "torn"}); err == nil {
+		t.Fatal("short append unexpectedly succeeded")
+	}
+	if err := w.Append(at, map[string]string{"value": "after"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "toss", "2026-09-01", "KR-005930.jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), "\n") != 2 || strings.Contains(string(data), "torn") {
+		t.Fatalf("failed write tail remained: %s", data)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var row map[string]string
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("invalid JSONL after short write: %v; data=%s", err, data)
+		}
+	}
+}
+
+func TestDailyWriterDetachesFileWhenCloseReturnsError(t *testing.T) {
+	root := t.TempDir()
+	w, err := NewDailyWriter(root, "toss", "KR-005930")
+	if err != nil {
+		t.Fatal(err)
+	}
+	day1 := time.Date(2026, 10, 1, 23, 59, 0, 0, time.UTC)
+	if err := w.Append(day1, map[string]string{"value": "first"}); err != nil {
+		t.Fatal(err)
+	}
+	w.file = &closeErrorFile{File: w.file.(*os.File)}
+	if err := w.Append(day1.Add(2*time.Minute), map[string]string{"value": "second"}); err == nil {
+		t.Fatal("simulated close failure was hidden")
+	}
+	if w.file != nil {
+		t.Fatalf("closed file handle retained: %T", w.file)
+	}
+	if err := w.Append(day1.Add(3*time.Minute), map[string]string{"value": "third"}); err != nil {
+		t.Fatalf("writer did not reopen after close error: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "toss", "2026-10-02", "KR-005930.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+}

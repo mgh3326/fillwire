@@ -196,6 +196,7 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	var archiveQueue chan quoteArchiveEvent
 	var archiveDrops atomic.Uint64
 	var archiveLastWarning atomic.Int64
+	var archiveLastWriteWarning atomic.Int64
 	var archiveErrors atomic.Uint64
 	var archiveLastError atomic.Value
 	pendingDrops := make(map[string]*atomic.Uint64, len(settings.symbols))
@@ -289,10 +290,25 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 			archiveDone := make(chan struct{})
 			go func() {
 				defer close(archiveDone)
+				writeFailures := make(map[string]uint64, len(settings.symbols))
 				for event := range archiveQueue {
 					if err := archive.Append("toss", event.name, event.at, event.value); err != nil {
+						writeFailures[event.name]++
 						archiveErrors.Add(1)
 						archiveLastError.Store(err.Error())
+						warnArchiveAppendFailure(logger, "toss", &archiveLastWriteWarning, archiveErrors.Load(), err)
+						continue
+					}
+					if failures := writeFailures[event.name]; failures > 0 {
+						marker := tossArchiveRecord{Kind: "archive_gap", Market: event.value.Market, ReceivedAt: event.at.UTC(), Dropped: failures}
+						if err := archive.Append("toss", event.name, event.at, marker); err != nil {
+							writeFailures[event.name]++
+							archiveErrors.Add(1)
+							archiveLastError.Store(err.Error())
+							warnArchiveAppendFailure(logger, "toss", &archiveLastWriteWarning, archiveErrors.Load(), err)
+						} else {
+							delete(writeFailures, event.name)
+						}
 					}
 				}
 			}()

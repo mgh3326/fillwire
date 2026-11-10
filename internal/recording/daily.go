@@ -66,8 +66,18 @@ type DailyWriter struct {
 	stream string
 	name   string
 	day    string
-	file   *os.File
+	file   dailyFile
 	closed bool
+	dirty  bool
+}
+
+type dailyFile interface {
+	io.Writer
+	Sync() error
+	Close() error
+	Name() string
+	Seek(int64, int) (int64, error)
+	Truncate(int64) error
 }
 
 func NewDailyWriter(root, stream, name string) (*DailyWriter, error) {
@@ -83,13 +93,18 @@ func (w *DailyWriter) Append(at time.Time, value any) error {
 	if w.closed {
 		return errors.New("recording: 기록기가 닫혔습니다")
 	}
+	if w.dirty {
+		if err := w.repairActiveTail(); err != nil {
+			return err
+		}
+	}
 	day := at.UTC().Format("2006-01-02")
 	if w.day != "" && day < w.day {
 		// A clock correction must not reopen an older partition while a newer
 		// one is active. Preserve the original timestamp in the record.
 		day = w.day
 	}
-	if day != w.day {
+	if w.file == nil || day != w.day {
 		if err := w.rotate(day); err != nil {
 			return err
 		}
@@ -98,10 +113,43 @@ func (w *DailyWriter) Append(at time.Time, value any) error {
 	if err != nil {
 		return fmt.Errorf("recording: 인코딩 실패: %w", err)
 	}
-	if _, err := w.file.Write(append(encoded, '\n')); err != nil {
-		return fmt.Errorf("recording: 추가 기록 실패: %w", err)
+	data := append(encoded, '\n')
+	start, err := w.file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("recording: 추가 위치 확인 실패: %w", err)
+	}
+	n, writeErr := w.file.Write(data)
+	if writeErr != nil || n != len(data) {
+		truncateErr := w.file.Truncate(start)
+		_, seekErr := w.file.Seek(0, io.SeekEnd)
+		if truncateErr != nil {
+			w.dirty = true
+		}
+		return fmt.Errorf("recording: 추가 기록 실패: %w", errors.Join(writeErr, io.ErrShortWrite, truncateErr, seekErr))
 	}
 	return nil
+}
+
+func (w *DailyWriter) repairActiveTail() error {
+	old := w.file
+	if old == nil {
+		w.dirty = false
+		return nil
+	}
+	path := old.Name()
+	w.file = nil
+	closeErr := old.Close()
+	repairErr := repairTrailingLine(path)
+	var f *os.File
+	var openErr error
+	if repairErr == nil {
+		f, openErr = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
+	}
+	if f != nil {
+		w.file = f
+		w.dirty = false
+	}
+	return errors.Join(wrapError("recording: 불완전한 레코드 복구 중 닫기 실패", closeErr), wrapError("recording: 불완전한 레코드 복구 실패", repairErr), wrapError("recording: 파일 다시 열기 실패", openErr))
 }
 
 func (w *DailyWriter) rotate(day string) error {
@@ -262,18 +310,22 @@ func repairTrailingLine(path string) error {
 }
 
 func (w *DailyWriter) closeDay() error {
-	if err := w.file.Sync(); err != nil {
-		return fmt.Errorf("recording: sync: %w", err)
-	}
-	if err := w.file.Close(); err != nil {
-		return fmt.Errorf("recording: close: %w", err)
-	}
 	old := w.file
 	w.file = nil
-	if err := gzipFile(old.Name()); err != nil {
-		return err
+	if old == nil {
+		return nil
 	}
-	return nil
+	syncErr := old.Sync()
+	closeErr := old.Close()
+	gzipErr := gzipFile(old.Name())
+	return errors.Join(wrapError("recording: sync", syncErr), wrapError("recording: close", closeErr), gzipErr)
+}
+
+func wrapError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 func gzipFile(path string) error {
@@ -320,14 +372,9 @@ func (w *DailyWriter) Close() error {
 	if w.file == nil {
 		return nil
 	}
-	if err := w.file.Sync(); err != nil {
-		return err
-	}
-	if err := w.file.Close(); err != nil {
-		return err
-	}
+	old := w.file
 	w.file = nil
-	return nil
+	return errors.Join(old.Sync(), old.Close())
 }
 
 // Sink manages independent per-stream and per-name day writers.
