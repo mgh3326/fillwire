@@ -597,6 +597,12 @@ type fillsRun struct {
 // Redis as the fills stream.
 func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 	t.Helper()
+	return runFillsWith(t, scenario, nil)
+}
+
+// runFillsWith is runFills with a hook to adjust the runtime config.
+func runFillsWith(t *testing.T, scenario *quoteScenario, adjust func(*runtimeConfig)) fillsRun {
+	t.Helper()
 	mainRedis := miniredis.RunT(t)
 	approvalRedis := miniredis.RunT(t)
 	approvalRedis.Set("kis_mock:websocket:approval_key", "fills-cached-key")
@@ -617,6 +623,9 @@ func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 	cfg.Channel.Buffer = 16
 	cfg.KIS.EventBuffer = 16
 	cfg.KIS.DupTrackMax = 100
+	if adjust != nil {
+		adjust(&cfg)
+	}
 	fills := fillsDialer()
 	deps := runDependencies{approvalRedis: approvalClient, approvalFallback: &runApprovalFallback{}, dialer: fills}
 	var quotes *tossDialer

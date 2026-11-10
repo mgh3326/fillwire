@@ -218,17 +218,32 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		dialer = ws.NewDialer()
 	}
 
+	// The reconcile trigger runs off the fills path: Fire only spawns a
+	// goroutine, and nothing it does can reach the select below.
+	reconcileCtx, stopReconcile := context.WithCancel(context.Background())
+	defer stopReconcile()
+	reconciler, err := startReconcile(reconcileCtx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	var onSubscribed, onReconnected func()
+	if reconciler != nil {
+		onSubscribed = func() { reconciler.Fire("startup") }
+		onReconnected = func() { reconciler.Fire("reconnect") }
+	}
 	go func() {
 		defer close(events)
 		readerDone <- reader.New(reader.Config{
-			BookSymbols: bookSymbols,
-			OnBook:      bookEvent,
-			Endpoint:    cfg.KIS.Endpoint,
-			HTSID:       cfg.KIS.HTSID,
-			Approval:    approval,
-			Dialer:      dialer,
-			EventBuffer: cfg.KIS.EventBuffer,
-			Logger:      logger,
+			OnSubscribed:  onSubscribed,
+			OnReconnected: onReconnected,
+			BookSymbols:   bookSymbols,
+			OnBook:        bookEvent,
+			Endpoint:      cfg.KIS.Endpoint,
+			HTSID:         cfg.KIS.HTSID,
+			Approval:      approval,
+			Dialer:        dialer,
+			EventBuffer:   cfg.KIS.EventBuffer,
+			Logger:        logger,
 		}).Run(readerCtx, events)
 	}()
 	ingressDone := pipeline.start()
@@ -308,6 +323,8 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			logger.Error("ingest runner did not stop before shutdown timeout")
 		}
 	}
+	stopReconcile()
+	reconciler.Wait()
 	quotes.wait(quotesDeadline, logger)
 	return stopErr
 }

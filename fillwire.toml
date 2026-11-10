@@ -47,6 +47,21 @@ factor = 2
 [alerts]
 rate_limit = "10m" # per failure class, per process
 
+# Reconcile trigger client. Off unless enabled = true. After the initial KIS
+# subscription and after every reconnect (and every interval, when set) it
+# asks auto_trader to backfill the gap. It reuses [ingest] token_env and
+# token_header; the token value is never logged. dry_run = true only reports
+# what a backfill would do; switching it to false is a separate, approved
+# change. Unknown keys in this table reject the config. See README
+# "Reconcile trigger".
+[reconcile]
+enabled = false
+url = "https://auto-trader.example.invalid/trading/api/execution-ledger/reconcile/trigger"
+markets = ["kr"]  # fillwire subscribes only to domestic fills
+dry_run = true
+interval = "0s"   # 0 = no periodic trigger; otherwise at least 1m
+timeout = "10s"
+
 # Quote reader (Toss Securities realtime websocket: trade + orderbook ->
 # quotes:toss). Off unless enabled = true. It reads the Toss access token that
 # auto_trader keeps in Redis at [redis] url, read-only; it holds no Toss client
