@@ -78,6 +78,7 @@ type runtimeConfig struct {
 	quotes         quoteSettings
 	recording      recordingSettings
 	upbit          upbitSettings
+	reconcile      reconcileSettings
 }
 
 func loadConfig(path string) (runtimeConfig, error) {
@@ -150,6 +151,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 		return runtimeConfig{}, err
 	}
 	if cfg.upbit, err = resolveUpbitSettings(contents); err != nil {
+		return runtimeConfig{}, err
+	}
+	if cfg.reconcile, err = resolveReconcileSettings(contents); err != nil {
 		return runtimeConfig{}, err
 	}
 	return cfg, nil

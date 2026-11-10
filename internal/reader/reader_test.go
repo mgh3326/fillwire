@@ -352,8 +352,11 @@ func TestT25WebsocketLifecycleObservations(t *testing.T) {
 	approval := &fakeApproval{}
 	logger, logs := readerJSONLogger()
 	var dials atomic.Int32
+	var subscribedCalls, reconnectedCalls atomic.Int32
 	cfg := readerConfig(first, approval)
 	cfg.Logger = logger
+	cfg.OnSubscribed = func() { subscribedCalls.Add(1) }
+	cfg.OnReconnected = func() { reconnectedCalls.Add(1) }
 	cfg.Dialer = ws.DialerFunc(func(context.Context, string) (ws.Transport, error) {
 		switch dials.Add(1) {
 		case 1:
@@ -375,6 +378,9 @@ func TestT25WebsocketLifecycleObservations(t *testing.T) {
 		t.Fatal("initial KIS subscription did not complete")
 	}
 	waitReaderLogMessage(t, logs, "KIS websocket initial subscription active", 1)
+	if got, re := subscribedCalls.Load(), reconnectedCalls.Load(); got != 1 || re != 0 {
+		t.Fatalf("after initial subscription OnSubscribed=%d OnReconnected=%d, want 1 and 0", got, re)
+	}
 	first.drop()
 	select {
 	case <-second.subscribed:
@@ -385,6 +391,9 @@ func TestT25WebsocketLifecycleObservations(t *testing.T) {
 	if got := readerLogMessageCount(t, logs.String(), "KIS websocket reconnect callback observed"); got != 0 {
 		t.Fatalf("reconnect success events before resubscribe = %d, want 0", got)
 	}
+	if got := reconnectedCalls.Load(); got != 0 {
+		t.Fatalf("OnReconnected before resubscribe = %d, want 0", got)
+	}
 	release()
 	select {
 	case <-second.subscribed:
@@ -392,6 +401,9 @@ func TestT25WebsocketLifecycleObservations(t *testing.T) {
 		t.Fatal("reconnect KIS subscription did not complete")
 	}
 	waitReaderLogMessage(t, logs, "KIS websocket reconnect callback observed", 1)
+	if got, re := subscribedCalls.Load(), reconnectedCalls.Load(); got != 1 || re != 1 {
+		t.Fatalf("after reconnect OnSubscribed=%d OnReconnected=%d, want 1 and 1", got, re)
+	}
 
 	if got := readerLogMessageCount(t, logs.String(), "KIS websocket initial subscription active"); got != 1 {
 		t.Fatalf("initial subscription events = %d, want 1", got)

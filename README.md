@@ -29,7 +29,7 @@ startup: XAUTOCLAIM pending entries before ordinary XREADGROUP
 
 On shutdown, fillwire stops the socket reader first, then gives already received events a bounded `drain_timeout` window to pass through decode and `XADD`. The drain uses a separate background-rooted context rather than the canceled signal context. If the window expires, the remaining in-memory entries are logged and counted before exit.
 
-Fillwire does not implement restart handoff, a reconcile-trigger client, a local checkpoint database, an HTTP metrics endpoint, heartbeat reporting, parallel consumers, broker orders, amendments, or cancellations. Those are outside this PR.
+Fillwire does not implement restart handoff, a local checkpoint database, an HTTP metrics endpoint, heartbeat reporting, parallel consumers, broker orders, amendments, or cancellations. Those are outside this PR.
 
 ## Configuration
 
@@ -132,6 +132,26 @@ and reset on process restart.
 Ingest URLs must use HTTPS, except HTTP is allowed only for `localhost`, `127.0.0.1`, or `::1`. Redis URLs must use `rediss`, except loopback `redis` and `unix` socket URLs. These checks run before startup so neither the ingest token nor the cached approval key can be sent over a remote plaintext connection.
 
 If KIS returns `OPSP8996` (`ws.ErrSessionOccupied`) while subscribing, fillwire does not retry and exits with the named `ExitCodeSessionOccupied` code, `42`. This lets a future supervisor distinguish the session-holder condition from generic failure.
+
+## Reconcile trigger (off by default)
+
+A fillwire restart or reconnect leaves a gap of a few seconds in which KIS fill notices are not received. auto_trader's own reconcile cron fills it later. The optional `[reconcile]` table makes fillwire ask auto_trader to reconcile right away, through the existing `POST /trading/api/execution-ledger/reconcile/trigger` endpoint. Fillwire only calls that endpoint: it makes no KIS REST call and writes no ledger rows.
+
+```toml
+[reconcile]
+enabled = false          # default
+url = "https://auto-trader.example.invalid/trading/api/execution-ledger/reconcile/trigger"
+markets = ["kr"]         # default; fillwire subscribes only to domestic fills
+dry_run = true           # default
+interval = "0s"          # default: no periodic trigger; otherwise at least 1m
+timeout = "10s"          # default
+```
+
+- **When it fires:** once after the initial KIS subscription is active, once after every successful reconnect, and every `interval` when that is set.
+- **Request:** `{"market":"kr","dry_run":true,"reason":"reconnect"}` per market, with the token from `[ingest] token_env` in the `[ingest] token_header` header. The token value is never logged. `url` follows the ingest URL policy (HTTPS, or HTTP on loopback only) and must be an exact path with no credentials, query or fragment.
+- **Off the fills path:** a trigger runs on its own goroutine. A slow, failing or 4xx/5xx trigger never delays decode, XADD or ingest, and never stops the process. Per market at most one request is in flight; triggers that arrive meanwhile coalesce into one follow-up request.
+- **Responses:** redirects are not followed. The body must carry `status` of `executed`, `deduped` or `failed`; anything else is logged as a contract error. `deduped` (auto_trader allows one trigger per market per 60 seconds) is a normal outcome. Failures are counted and logged once per `[alerts] rate_limit` window per failure class, with the number of suppressed repeats. They do not send a Telegram alert.
+- **Commit stays off until approved.** `dry_run = true` only reports what a backfill would do (`backfilled` is always 0). Setting `dry_run = false`, enabling the table on a host, and turning off auto_trader's 30-minute reconcile cron are separate, approved changes.
 
 ## Quote reader (off by default)
 
@@ -608,3 +628,7 @@ Upbit 기록기를 단독으로 실행해 확인하려면 다음 명령을 사�
 ```sh
 fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fillwire/recordings
 ```
+
+## 재연결 reconcile 트리거 (기본 비활성화)
+
+`[reconcile] enabled = true`로 켜면 KIS 최초 구독 직후, 재연결 성공 직후, 그리고 `interval`(설정 시)마다 auto_trader의 `reconcile/trigger` 엔드포인트를 호출해 수 초의 체결 통지 공백을 바로 메웁니다. 토큰은 `[ingest]`와 같은 것을 쓰며 로그에 남지 않습니다. 호출은 체결 처리 경로와 분리되어 있어 느리거나 실패해도 처리·종료에 영향이 없습니다. 기본값 `dry_run = true`는 보고만 하며, `dry_run = false`(커밋) 전환과 auto_trader의 30분 TaskIQ 크론 해제는 별도 승인 후의 환경 변경입니다.

@@ -34,14 +34,19 @@ var ErrEventsClosed = errors.New("reader: KIS event stream closed unexpectedly")
 type Config struct {
 	BookSymbols []string       // optional read-only subscriptions on this same session
 	OnBook      func(ws.Event) // must not block the fills reader
-	Endpoint    string         // live or mock
-	HTSID       string
-	Approval    ws.ApprovalKeyProvider
-	Dialer      ws.Dialer
-	EventBuffer int
-	Backoff     ws.BackoffConfig
-	Clock       kis.Clock
-	Logger      *slog.Logger
+	// OnSubscribed runs once after the initial fills subscription is active.
+	// OnReconnected runs after each successful reconnect. Both run on the
+	// reader's own goroutines and must not block.
+	OnSubscribed  func()
+	OnReconnected func()
+	Endpoint      string // live or mock
+	HTSID         string
+	Approval      ws.ApprovalKeyProvider
+	Dialer        ws.Dialer
+	EventBuffer   int
+	Backoff       ws.BackoffConfig
+	Clock         kis.Clock
+	Logger        *slog.Logger
 
 	// dial is an internal test seam. Production always uses ws.Dial, while the
 	// public Dialer/Transport interfaces remain the integration seam for KIS.
@@ -155,8 +160,13 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		// The KIS callback runs on its internal reader goroutine. Recording the
 		// latest value under a mutex is deliberately short and non-blocking.
 		OnReconnect: func(info ws.ReconnectInfo) {
-			if reconnect.record(info) && !info.Stopped && info.Err == nil && r.cfg.Logger != nil {
-				r.cfg.Logger.Info("KIS websocket reconnect callback observed")
+			if reconnect.record(info) && !info.Stopped && info.Err == nil {
+				if r.cfg.OnReconnected != nil {
+					r.cfg.OnReconnected()
+				}
+				if r.cfg.Logger != nil {
+					r.cfg.Logger.Info("KIS websocket reconnect callback observed")
+				}
 			}
 		},
 	})
@@ -191,6 +201,9 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 	}
 	if r.cfg.Logger != nil {
 		r.cfg.Logger.Info("KIS websocket initial subscription active")
+	}
+	if r.cfg.OnSubscribed != nil {
+		r.cfg.OnSubscribed()
 	}
 	for {
 		// Prefer the caller's shutdown over a simultaneously closed Events
