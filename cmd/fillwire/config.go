@@ -89,12 +89,6 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if err := toml.Unmarshal(contents, &cfg.fileConfig); err != nil {
 		return runtimeConfig{}, errors.New("config: invalid TOML")
 	}
-	var books bookSettings
-	if present, bookErr := strictTable(contents, "books", &books); bookErr != nil {
-		return runtimeConfig{}, bookErr
-	} else if present {
-		cfg.Books = books
-	}
 	if strings.TrimSpace(cfg.KIS.Venue) == "" {
 		cfg.KIS.Venue = "krx"
 	}

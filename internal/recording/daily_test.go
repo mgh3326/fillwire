@@ -88,6 +88,92 @@ func TestCoverageUnionsIntervalsAndClipsDay(t *testing.T) {
 	}
 }
 
+func TestDailyWriterKeepsBackwardTimestampsInOpenPartition(t *testing.T) {
+	root := t.TempDir()
+	start := time.Date(2026, 1, 1, 23, 59, 59, 0, time.UTC)
+	w, err := NewDailyWriter(root, "toss", "KR-005930")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, at := range []time.Time{start.Add(2 * time.Second), start.Add(500 * time.Millisecond), start.Add(3 * time.Second)} {
+		if err := w.Append(at, map[string]time.Time{"at": at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(filepath.Join(root, "toss", "2026-01-02", "KR-005930.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(contents), "\n") != 3 {
+		t.Fatalf("backward append lines=%d data=%s", strings.Count(string(contents), "\n"), contents)
+	}
+}
+
+func TestDailyWriterRestoresAndRecompressesExistingDay(t *testing.T) {
+	root := t.TempDir()
+	first := time.Date(2026, 1, 1, 23, 59, 59, 0, time.UTC)
+	w, _ := NewDailyWriter(root, "toss", "KR-005930")
+	if err := w.Append(first, map[string]string{"value": "before"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Append(first.Add(time.Second), map[string]string{"value": "next-day"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	w, _ = NewDailyWriter(root, "toss", "KR-005930")
+	if err := w.Append(first, map[string]string{"value": "late"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Append(first.Add(24*time.Hour), map[string]string{"value": "next-day-again"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	f, err := os.Open(filepath.Join(root, "toss", "2026-01-01", "KR-005930.jsonl.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(gz)
+	_ = gz.Close()
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), "\n") != 2 || !strings.Contains(string(data), "before") || !strings.Contains(string(data), "late") {
+		t.Fatalf("restored gzip=%s", data)
+	}
+}
+
+func TestStreamLockRejectsSecondWriter(t *testing.T) {
+	root := t.TempDir()
+	first, err := AcquireStreamLock(root, "upbit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireStreamLock(root, "upbit"); err == nil {
+		t.Fatal("second Upbit writer acquired the same stream lock")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := AcquireStreamLock(root, "upbit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = second.Close()
+}
+
 func TestQuoteAndBookFilesAppendAcrossRestart(t *testing.T) {
 	root := t.TempDir()
 	at := time.Date(2026, 2, 3, 10, 0, 0, 0, time.UTC)
@@ -134,6 +220,41 @@ func TestSummarizeDayCarriesSessionAcrossUTCPartition(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].CoveredSeconds != 2 {
 		t.Fatalf("day coverage=%+v", rows)
+	}
+}
+
+func TestCoverageDoesNotExtendUnclosedSessionsAndKeepsPriorRestartSpan(t *testing.T) {
+	root := t.TempDir()
+	w, err := NewDailyWriter(root, "upbit", "KRW-BTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 5, 1, 23, 59, 0, 0, time.UTC)
+	for _, event := range []struct {
+		kind string
+		at   time.Time
+	}{
+		{"connected", start}, {"trade", start.Add(30 * time.Second)},
+		{"connected", start.Add(2 * time.Minute)}, {"orderbook", start.Add(2*time.Minute + 20*time.Second)},
+	} {
+		if err := w.Append(event.at, map[string]any{"kind": event.kind, "market": "KRW-BTC", "received_at": event.at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = w.Close()
+	day1, err := SummarizeDay(root, "2026-05-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	day2, err := SummarizeDay(root, "2026-05-02")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(day1) != 1 || day1[0].CoveredSeconds != 30 {
+		t.Fatalf("first unclosed span=%+v", day1)
+	}
+	if len(day2) != 1 || day2[0].CoveredSeconds != 20 {
+		t.Fatalf("restart span=%+v", day2)
 	}
 }
 func TestSummarizeWindowCalculatesExpectedRatio(t *testing.T) {

@@ -128,7 +128,7 @@ func resolveUpbitSettings(contents []byte) (upbitSettings, error) {
 			return upbitSettings{}, errors.New("upbit: retry_max 설정이 잘못되었습니다")
 		}
 	}
-	if _, err := upbit.New(upbit.Config{Markets: markets, Root: f.Directory, Endpoint: f.Endpoint, RetryMin: retryMin, RetryMax: retryMax}); err != nil {
+	if err := upbit.ValidateMarkets(markets); err != nil {
 		return upbitSettings{}, err
 	}
 	return upbitSettings{enabled: true, markets: markets, directory: f.Directory, endpoint: f.Endpoint, retryMin: retryMin, retryMax: retryMax}, nil

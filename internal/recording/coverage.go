@@ -45,24 +45,29 @@ func SummarizeCoverage(market, day string, intervals []Interval) (Coverage, erro
 			clipped = append(clipped, Interval{a, b})
 		}
 	}
-	sort.Slice(clipped, func(i, j int) bool { return clipped[i].Start.Before(clipped[j].Start) })
-	var covered time.Duration
-	if len(clipped) > 0 {
-		a, b := clipped[0].Start, clipped[0].End
-		for _, in := range clipped[1:] {
-			if !in.Start.After(b) {
-				if in.End.After(b) {
-					b = in.End
-				}
-				continue
-			}
-			covered += b.Sub(a)
-			a, b = in.Start, in.End
-		}
-		covered += b.Sub(a)
-	}
+	covered := unionDuration(clipped)
 	seconds := covered.Seconds()
 	return Coverage{Market: market, Day: day, CoveredSeconds: seconds, DaySeconds: 86400, Ratio: seconds / 86400}, nil
+}
+
+func unionDuration(intervals []Interval) time.Duration {
+	sort.Slice(intervals, func(i, j int) bool { return intervals[i].Start.Before(intervals[j].Start) })
+	var covered time.Duration
+	if len(intervals) == 0 {
+		return 0
+	}
+	a, b := intervals[0].Start, intervals[0].End
+	for _, in := range intervals[1:] {
+		if !in.Start.After(b) {
+			if in.End.After(b) {
+				b = in.End
+			}
+			continue
+		}
+		covered += b.Sub(a)
+		a, b = in.Start, in.End
+	}
+	return covered + b.Sub(a)
 }
 
 // WriteCoverage writes a stable JSON summary suitable for a later health check.
@@ -77,22 +82,20 @@ func WriteCoverage(path string, rows []Coverage) error {
 	return os.WriteFile(path, append(b, '\n'), 0640)
 }
 
-// SummarizeDay reads an Upbit daily partition and computes coverage from connected/gap records.
-func SummarizeDay(root, day string) ([]Coverage, error) {
-	target, err := time.Parse("2006-01-02", day)
-	if err != nil {
-		return nil, err
-	}
-	cutoff := target.Add(24 * time.Hour)
+type coverageEvent struct {
+	kind string
+	at   time.Time
+}
+
+// readCoverageEvents retains all event timestamps: frames and heartbeat records
+// bound an open connection after a crash or while a summary is being read.
+func readCoverageEvents(root string, now time.Time) (map[string][]coverageEvent, error) {
 	base := filepath.Join(root, "upbit")
-	events := map[string][]struct {
-		kind string
-		at   time.Time
-	}{}
+	events := map[string][]coverageEvent{}
 	found := false
-	err = filepath.WalkDir(base, func(path string, d os.DirEntry, e error) error {
-		if e != nil {
-			return e
+	err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
 		if d.IsDir() {
 			return nil
@@ -104,23 +107,23 @@ func SummarizeDay(root, day string) ([]Coverage, error) {
 		found = true
 		var in io.ReadCloser
 		if strings.HasSuffix(name, ".gz") {
-			f, e := os.Open(path)
-			if e != nil {
-				return e
+			f, err := os.Open(path)
+			if err != nil {
+				return err
 			}
-			gz, e := gzip.NewReader(f)
-			if e != nil {
-				f.Close()
-				return e
+			gz, err := gzip.NewReader(f)
+			if err != nil {
+				_ = f.Close()
+				return err
 			}
 			in = struct {
 				io.Reader
 				io.Closer
 			}{gz, closeBoth{gz, f}}
 		} else {
-			in, e = os.Open(path)
-			if e != nil {
-				return e
+			in, err = os.Open(path)
+			if err != nil {
+				return err
 			}
 		}
 		dec := json.NewDecoder(in)
@@ -130,21 +133,17 @@ func SummarizeDay(root, day string) ([]Coverage, error) {
 				Market     string    `json:"market"`
 				ReceivedAt time.Time `json:"received_at"`
 			}
-			e := dec.Decode(&rec)
-			if e == io.EOF {
+			if err := dec.Decode(&rec); err == io.EOF {
 				break
-			}
-			if e != nil {
-				in.Close()
-				return e
+			} else if err != nil {
+				_ = in.Close()
+				return err
 			}
 			at := rec.ReceivedAt.UTC()
-			if at.Before(cutoff) && (rec.Kind == "connected" || rec.Kind == "gap") {
-				events[rec.Market] = append(events[rec.Market], struct {
-					kind string
-					at   time.Time
-				}{rec.Kind, at})
+			if rec.Market == "" || at.IsZero() || at.After(now) {
+				continue
 			}
+			events[rec.Market] = append(events[rec.Market], coverageEvent{rec.Kind, at})
 		}
 		return in.Close()
 	})
@@ -154,28 +153,61 @@ func SummarizeDay(root, day string) ([]Coverage, error) {
 	if !found {
 		return nil, os.ErrNotExist
 	}
-	rows := make([]Coverage, 0, len(events))
-	for market, items := range events {
-		sort.Slice(items, func(i, j int) bool { return items[i].at.Before(items[j].at) })
-		var start *time.Time
-		intervals := []Interval{}
-		for _, item := range items {
-			if item.kind == "connected" {
-				copy := item.at
-				start = &copy
-			} else if start != nil {
-				if item.at.After(*start) {
-					intervals = append(intervals, Interval{*start, item.at})
+	for market := range events {
+		sort.SliceStable(events[market], func(i, j int) bool {
+			return events[market][i].at.Before(events[market][j].at)
+		})
+	}
+	return events, nil
+}
+
+// connectedIntervals closes prior open sessions at their last observed activity.
+// A second connection without a gap closes the preceding session rather than
+// replacing its start and losing its coverage.
+func connectedIntervals(events []coverageEvent) []Interval {
+	var start, lastAlive time.Time
+	var intervals []Interval
+	for _, event := range events {
+		switch event.kind {
+		case "connected":
+			if !start.IsZero() && lastAlive.After(start) {
+				intervals = append(intervals, Interval{start, lastAlive})
+			}
+			start, lastAlive = event.at, event.at
+		case "gap":
+			if !start.IsZero() {
+				if event.at.After(start) {
+					intervals = append(intervals, Interval{start, event.at})
 				}
-				start = nil
+				start, lastAlive = time.Time{}, time.Time{}
+			}
+		default:
+			if !start.IsZero() && event.at.After(lastAlive) {
+				lastAlive = event.at
 			}
 		}
-		if start != nil {
-			intervals = append(intervals, Interval{*start, cutoff})
-		}
-		row, e := SummarizeCoverage(market, day, intervals)
-		if e != nil {
-			return nil, e
+	}
+	if !start.IsZero() && lastAlive.After(start) {
+		intervals = append(intervals, Interval{start, lastAlive})
+	}
+	return intervals
+}
+
+// SummarizeDay reads Upbit partitions and reports only intervals bounded by
+// recorded activity. An unterminated run never implies coverage after its last record.
+func SummarizeDay(root, day string) ([]Coverage, error) {
+	if _, err := time.Parse("2006-01-02", day); err != nil {
+		return nil, fmt.Errorf("coverage: UTC 날짜 형식이 잘못되었습니다: %w", err)
+	}
+	events, err := readCoverageEvents(root, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]Coverage, 0, len(events))
+	for market, items := range events {
+		row, err := SummarizeCoverage(market, day, connectedIntervals(items))
+		if err != nil {
+			return nil, err
 		}
 		rows = append(rows, row)
 	}
@@ -196,114 +228,34 @@ type WindowCoverage struct {
 	Ratio          float64   `json:"ratio"`
 }
 
-// SummarizeWindow measures connected seconds within a requested interval.
+// SummarizeWindow measures connected seconds within a requested interval,
+// bounded by the last recorded activity and the current time.
 func SummarizeWindow(root string, from, to time.Time) ([]WindowCoverage, error) {
 	from, to = from.UTC(), to.UTC()
 	if !to.After(from) {
 		return nil, errors.New("coverage: 종료 시각은 시작 시각보다 뒤여야 합니다")
 	}
-	base := filepath.Join(root, "upbit")
-	events := map[string][]struct {
-		kind string
-		at   time.Time
-	}{}
-	found := false
-	err := filepath.WalkDir(base, func(path string, d os.DirEntry, e error) error {
-		if e != nil {
-			return e
-		}
-		if d.IsDir() {
-			return nil
-		}
-		name := d.Name()
-		if !strings.HasSuffix(name, ".jsonl") && !strings.HasSuffix(name, ".jsonl.gz") {
-			return nil
-		}
-		found = true
-		var in io.ReadCloser
-		if strings.HasSuffix(name, ".gz") {
-			f, e := os.Open(path)
-			if e != nil {
-				return e
-			}
-			gz, e := gzip.NewReader(f)
-			if e != nil {
-				f.Close()
-				return e
-			}
-			in = struct {
-				io.Reader
-				io.Closer
-			}{gz, closeBoth{gz, f}}
-		} else {
-			in, e = os.Open(path)
-			if e != nil {
-				return e
-			}
-		}
-		dec := json.NewDecoder(in)
-		for {
-			var rec struct {
-				Kind, Market string
-				ReceivedAt   time.Time `json:"received_at"`
-			}
-			e := dec.Decode(&rec)
-			if e == io.EOF {
-				break
-			}
-			if e != nil {
-				in.Close()
-				return e
-			}
-			if rec.Kind == "connected" || rec.Kind == "gap" {
-				events[rec.Market] = append(events[rec.Market], struct {
-					kind string
-					at   time.Time
-				}{rec.Kind, rec.ReceivedAt.UTC()})
-			}
-		}
-		return in.Close()
-	})
+	events, err := readCoverageEvents(root, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, os.ErrNotExist
-	}
 	window := to.Sub(from).Seconds()
-	rows := []WindowCoverage{}
+	rows := make([]WindowCoverage, 0, len(events))
 	for market, items := range events {
-		sort.Slice(items, func(i, j int) bool { return items[i].at.Before(items[j].at) })
-		var start *time.Time
-		sum := time.Duration(0)
-		for _, item := range items {
-			if item.kind == "connected" {
-				v := item.at
-				start = &v
-			} else if start != nil {
-				a, b := *start, item.at
-				if a.Before(from) {
-					a = from
-				}
-				if b.After(to) {
-					b = to
-				}
-				if b.After(a) {
-					sum += b.Sub(a)
-				}
-				start = nil
-			}
-		}
-		if start != nil {
-			a := *start
+		clipped := make([]Interval, 0)
+		for _, interval := range connectedIntervals(items) {
+			a, b := interval.Start, interval.End
 			if a.Before(from) {
 				a = from
 			}
-			if to.After(a) {
-				sum += to.Sub(a)
+			if b.After(to) {
+				b = to
+			}
+			if b.After(a) {
+				clipped = append(clipped, Interval{a, b})
 			}
 		}
-		seconds := sum.Seconds()
+		seconds := unionDuration(clipped).Seconds()
 		rows = append(rows, WindowCoverage{market, from, to, seconds, window, seconds / window})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Market < rows[j].Market })

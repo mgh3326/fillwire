@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/bookfeed"
@@ -46,17 +47,33 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 		_ = bookfeed.Run(runCtx, r, rest, cfg.Books.Symbol, cfg.KIS.Endpoint == "mock", events, func(error) { logger.Warn("book producer could not publish a fresh snapshot") })
 	}()
 	var archive *recording.Sink
+	var archiveEvents chan kisArchiveEvent
+	var archiveDone chan struct{}
+	var archiveDrops atomic.Uint64
+	var archiveErrors atomic.Uint64
+	var archiveLastError atomic.Value
 	if cfg.recording.enabled {
-		archive, err = recording.NewSink(cfg.recording.directory)
+		archive, err = recording.NewSink(cfg.recording.directory, "kis")
 		if err != nil {
 			cancel()
 			<-done
 			r.Close()
 			return nil, nil, err
 		}
+		archiveEvents = make(chan kisArchiveEvent, 256)
+		archiveDone = make(chan struct{})
+		go func() {
+			defer close(archiveDone)
+			for event := range archiveEvents {
+				if err := archive.Append("kis", cfg.Books.Symbol, event.at, event.record); err != nil {
+					archiveErrors.Add(1)
+					archiveLastError.Store(err.Error())
+				}
+			}
+		}()
 	}
 	return func(e ws.Event) {
-			if archive != nil {
+			if archiveEvents != nil {
 				at := e.ReceivedAt
 				if at.IsZero() {
 					at = time.Now().UTC()
@@ -69,8 +86,10 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 					Fields     []string  `json:"fields,omitempty"`
 				}{"book", cfg.Books.Symbol, at, e.Raw, e.Fields})
 				if marshalErr == nil {
-					if err := archive.Append("kis", cfg.Books.Symbol, at, json.RawMessage(line)); err != nil {
-						logger.Error("KIS 호가 파일 기록에 실패했습니다", "reason", err.Error())
+					select {
+					case archiveEvents <- kisArchiveEvent{at, json.RawMessage(line)}:
+					default:
+						archiveDrops.Add(1)
 					}
 				}
 			}
@@ -82,10 +101,25 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 			cancel()
 			<-done
 			r.Close()
+			if archiveEvents != nil {
+				close(archiveEvents)
+				<-archiveDone
+				if dropped := archiveDrops.Load(); dropped > 0 {
+					logger.Warn("KIS 호가 보존 큐 초과", "dropped", dropped)
+				}
+				if failed := archiveErrors.Load(); failed > 0 {
+					logger.Error("KIS 호가 파일 기록 실패", "failed", failed, "reason", archiveLastError.Load())
+				}
+			}
 			if archive != nil {
 				if err := archive.Close(); err != nil {
 					logger.Error("KIS 호가 파일 닫기에 실패했습니다", "reason", err.Error())
 				}
 			}
 		}, nil
+}
+
+type kisArchiveEvent struct {
+	at     time.Time
+	record json.RawMessage
 }

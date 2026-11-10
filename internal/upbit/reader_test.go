@@ -36,6 +36,7 @@ func TestReaderWritesFramesGapAndRotatesUTC(t *testing.T) {
 	day2 := day1.Add(2 * time.Second)
 	clock := &fakeClock{now: day1}
 	accepted := make(chan int, 2)
+	recordedOrderbook := make(chan struct{}, 1)
 	var connections atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
@@ -58,6 +59,12 @@ func TestReaderWritesFramesGapAndRotatesUTC(t *testing.T) {
 		}
 		if n == 1 {
 			_ = c.Write(r.Context(), websocket.MessageText, []byte(`{"type":"orderbook","code":"KRW-BTC","timestamp":1000,"orderbook_units":[]}`))
+			select {
+			case <-recordedOrderbook:
+			case <-time.After(time.Second):
+				t.Error("orderbook frame was not appended before the clock moved")
+				return
+			}
 			clock.set(day2)
 			_ = c.Write(r.Context(), websocket.MessageText, []byte(`{"type":"trade","code":"KRW-BTC","timestamp":2000,"sequential_id":42}`))
 			_ = c.Close(websocket.StatusNormalClosure, "forced disconnect")
@@ -68,7 +75,11 @@ func TestReaderWritesFramesGapAndRotatesUTC(t *testing.T) {
 	defer server.Close()
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
 	root := t.TempDir()
-	reader, err := New(Config{Markets: []string{"KRW-BTC"}, Root: root, Endpoint: endpoint, Clock: clock, RetryMin: time.Millisecond, RetryMax: time.Millisecond})
+	reader, err := New(Config{Markets: []string{"KRW-BTC"}, Root: root, Endpoint: endpoint, Clock: clock, RetryMin: time.Millisecond, RetryMax: time.Millisecond, OnRecord: func(record Record) {
+		if record.Kind == "orderbook" {
+			recordedOrderbook <- struct{}{}
+		}
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,19 +124,74 @@ func TestReaderWritesFramesGapAndRotatesUTC(t *testing.T) {
 	}
 	_ = gz.Close()
 	_ = file.Close()
-	if len(records) != 1 || records[0].Kind != "connected" {
+	if len(records) != 2 || records[0].Kind != "connected" || records[1].Kind != "orderbook" {
 		t.Fatalf("rotated records=%+v", records)
 	}
 	b, err := os.ReadFile(root + "/upbit/2026-01-02/KRW-BTC.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, kind := range []string{`"kind":"orderbook"`, `"kind":"trade"`, `"kind":"gap"`} {
+	for _, kind := range []string{`"kind":"trade"`, `"kind":"gap"`} {
 		if !strings.Contains(string(b), kind) {
 			t.Fatalf("missing %s: %s", kind, b)
 		}
 	}
 	if !strings.Contains(string(b), `"sequential_id":42`) {
 		t.Fatalf("trade sequence missing: %s", b)
+	}
+}
+
+func TestReaderDisconnectsOnUnansweredHeartbeat(t *testing.T) {
+	accepted := make(chan struct{}, 2)
+	var connections atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close(websocket.StatusNormalClosure, "")
+		if _, _, err := c.Read(r.Context()); err != nil {
+			return
+		}
+		connections.Add(1)
+		accepted <- struct{}{}
+		// Keep the TCP socket open but stop reading, so the client receives no pong.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http")
+	root := t.TempDir()
+	clock := &fakeClock{now: time.Now().UTC()}
+	reader, err := New(Config{Markets: []string{"KRW-BTC"}, Root: root, Endpoint: endpoint, Clock: clock, RetryMin: time.Millisecond, RetryMax: 2 * time.Millisecond, PingInterval: 10 * time.Millisecond, PongTimeout: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- reader.Run(ctx) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-accepted:
+		case <-time.After(3 * time.Second):
+			cancel()
+			<-done
+			t.Fatalf("reader did not reconnect after unanswered pong; connections=%d", connections.Load())
+		}
+	}
+	cancel()
+	<-done
+	files, err := os.ReadDir(root + "/upbit/" + clock.Now().Format("2006-01-02"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundGap bool
+	for _, file := range files {
+		data, err := os.ReadFile(root + "/upbit/" + clock.Now().Format("2006-01-02") + "/" + file.Name())
+		if err == nil && strings.Contains(string(data), `"kind":"gap"`) {
+			foundGap = true
+		}
+	}
+	if !foundGap {
+		t.Fatal("unanswered heartbeat did not produce a gap record")
 	}
 }

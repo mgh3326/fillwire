@@ -1,9 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/mgh3326/fillwire/internal/quote"
+	"github.com/mgh3326/fillwire/internal/recording"
 )
 
 func TestRecordingTablesDefaultOffAndRejectUnknownKeys(t *testing.T) {
@@ -36,5 +41,41 @@ func TestUpbitSettingsLoadsAtMostTwentyKRWMarkets(t *testing.T) {
 	}
 	if len(got.markets) != 2 || got.markets[1] != "KRW-ETH" {
 		t.Fatalf("settings=%+v", got)
+	}
+}
+
+func TestExistingBooksTableRemainsLenient(t *testing.T) {
+	contents := shippedConfig(t)
+	marker := "\n[recording]\n"
+	index := strings.Index(contents, marker)
+	if index < 0 {
+		t.Fatal("recording table is missing from shipped config")
+	}
+	contents = contents[:index] + "\nlegacy_retired_key = true\n" + contents[index:]
+	path := writeTemp(t, "legacy-books.toml", contents)
+	setFillsEnv(t)
+	if _, err := loadConfig(path); err != nil {
+		t.Fatalf("legacy unknown [books] key rejected: %v", err)
+	}
+}
+
+func TestQuoteArchiveUsesMarketQualifiedSafeNames(t *testing.T) {
+	if got := quoteArchiveName(quote.Symbol{Market: quote.MarketKR, Code: "005930"}); got != "KR-005930" {
+		t.Fatalf("KR archive name=%q", got)
+	}
+	us := quote.Symbol{Market: quote.MarketUS, Code: "BRK.B"}
+	if got := quoteArchiveName(us); got != "US-BRK_B" || !recording.SafeName(got) {
+		t.Fatalf("US archive name=%q is not a safe market-qualified name", got)
+	}
+	line, err := json.Marshal(tossArchiveRecord{Kind: "quote", Market: us.Market, Tick: quote.Tick{Symbol: us.Code}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded tossArchiveRecord
+	if err := json.Unmarshal(line, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Market != quote.MarketUS || decoded.Tick.Symbol != us.Code {
+		t.Fatalf("market identity missing from archived quote: %+v", decoded)
 	}
 }

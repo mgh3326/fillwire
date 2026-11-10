@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/quote"
@@ -192,13 +193,26 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 		dialer = quote.NewDialer()
 	}
 	var archive *recording.Sink
+	var archiveQueue chan quoteArchiveEvent
+	var archiveDrops atomic.Uint64
+	var archiveErrors atomic.Uint64
+	var archiveLastError atomic.Value
 	if cfg.recording.enabled {
-		archive, err = recording.NewSink(cfg.recording.directory)
+		archive, err = recording.NewSink(cfg.recording.directory, "toss")
 		if err != nil {
 			_ = redisClient.Close()
 			logger.Error("Toss 호가 파일 기록기를 시작하지 못했습니다", "reason", err.Error())
 			return quoteLane{}
 		}
+		for _, symbol := range settings.symbols {
+			if !recording.SafeName(quoteArchiveName(symbol)) {
+				_ = archive.Close()
+				_ = redisClient.Close()
+				logger.Error("Toss 파일 이름이 잘못되었습니다", "symbol", symbol.Code)
+				return quoteLane{}
+			}
+		}
+		archiveQueue = make(chan quoteArchiveEvent, max(settings.buffer, defaultQuoteBuffer))
 	}
 	runner, err := quote.NewRunner(quote.Config{
 		Symbols:      settings.symbols,
@@ -213,18 +227,15 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 		RetryMin:     dependencies.quoteRetryMin,
 		RetryMax:     dependencies.quoteRetryMax,
 		PingInterval: dependencies.quotePing,
-		OnTick: func(tick quote.Tick, received time.Time) {
-			if archive == nil {
+		OnTick: func(symbol quote.Symbol, tick quote.Tick, received time.Time) {
+			if archiveQueue == nil {
 				return
 			}
-			name := strings.ReplaceAll(tick.Symbol, ":", "-")
-			value := struct {
-				Kind       string     `json:"kind"`
-				ReceivedAt time.Time  `json:"received_at"`
-				Tick       quote.Tick `json:"tick"`
-			}{"quote", received.UTC(), tick}
-			if err := archive.Append("toss", name, received, value); err != nil {
-				logger.Error("Toss 호가 파일 기록에 실패했습니다", "reason", err.Error())
+			value := tossArchiveRecord{Kind: "quote", Market: symbol.Market, ReceivedAt: received.UTC(), Tick: tick}
+			select {
+			case archiveQueue <- quoteArchiveEvent{name: quoteArchiveName(symbol), at: received, value: value}:
+			default:
+				archiveDrops.Add(1)
 			}
 		},
 	})
@@ -242,16 +253,52 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 		defer close(done)
 		defer redisClient.Close()
 		if archive != nil {
-			defer func() {
-				if err := archive.Close(); err != nil {
-					logger.Error("Toss 호가 파일 닫기에 실패했습니다", "reason", err.Error())
+			archiveDone := make(chan struct{})
+			go func() {
+				defer close(archiveDone)
+				for event := range archiveQueue {
+					if err := archive.Append("toss", event.name, event.at, event.value); err != nil {
+						archiveErrors.Add(1)
+						archiveLastError.Store(err.Error())
+					}
 				}
 			}()
+			runner.Run(ctx)
+			close(archiveQueue)
+			<-archiveDone
+			if dropped := archiveDrops.Load(); dropped > 0 {
+				logger.Warn("Toss 호가 보존 큐 초과", "dropped", dropped)
+			}
+			if failed := archiveErrors.Load(); failed > 0 {
+				logger.Error("Toss 호가 파일 기록 실패", "failed", failed, "reason", archiveLastError.Load())
+			}
+			if err := archive.Close(); err != nil {
+				logger.Error("Toss 호가 파일 닫기에 실패했습니다", "reason", err.Error())
+			}
+			return
 		}
 		runner.Run(ctx)
 	}()
 	logger.Info("quote reader started", "provider", "toss", "symbols", len(settings.symbols), "stream", settings.streamKey)
 	return quoteLane{stop: stop, done: done}
+}
+
+type quoteArchiveEvent struct {
+	name  string
+	at    time.Time
+	value tossArchiveRecord
+}
+
+type tossArchiveRecord struct {
+	Kind       string     `json:"kind"`
+	Market     string     `json:"market"`
+	ReceivedAt time.Time  `json:"received_at"`
+	Tick       quote.Tick `json:"tick"`
+}
+
+func quoteArchiveName(symbol quote.Symbol) string {
+	code := strings.ReplaceAll(symbol.Code, ".", "_")
+	return strings.ToUpper(symbol.Market) + "-" + code
 }
 
 // halt asks the lane to stop without waiting.
