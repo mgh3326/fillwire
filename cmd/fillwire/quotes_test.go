@@ -597,11 +597,13 @@ type fillsRun struct {
 // Redis as the fills stream.
 func runFills(t *testing.T, scenario *quoteScenario) fillsRun {
 	t.Helper()
-	return runFillsWith(t, scenario, nil)
+	return runFillsWith(t, scenario, nil, nil)
 }
 
-// runFillsWith is runFills with a hook to adjust the runtime config.
-func runFillsWith(t *testing.T, scenario *quoteScenario, adjust func(*runtimeConfig)) fillsRun {
+// runFillsWith is runFills with a hook to adjust the runtime config and an
+// optional extra readiness condition the run must also meet before it is
+// stopped.
+func runFillsWith(t *testing.T, scenario *quoteScenario, adjust func(*runtimeConfig), extraReady func() bool) fillsRun {
 	t.Helper()
 	mainRedis := miniredis.RunT(t)
 	approvalRedis := miniredis.RunT(t)
@@ -651,7 +653,7 @@ func runFillsWith(t *testing.T, scenario *quoteScenario, adjust func(*runtimeCon
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		entries, _ := mainRedis.Stream("fills:test")
-		ready := len(entries) == isoFills
+		ready := len(entries) == isoFills && (extraReady == nil || extraReady())
 		if scenario != nil {
 			ready = ready && scenario.settled(quotes, mainRedis)
 		}

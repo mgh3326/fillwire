@@ -166,6 +166,14 @@ func (p *reconcileProbe) snapshot() (bodies []string, maxIn int) {
 	return append([]string(nil), p.bodies...), p.maxIn
 }
 
+// received reports whether the fake server has seen at least one request.
+// The run is stopped only after that: shutdown cancels an in-flight trigger,
+// and the fills can all land before the request leaves the process.
+func (p *reconcileProbe) received() bool {
+	bodies, _ := p.snapshot()
+	return len(bodies) > 0
+}
+
 func enableReconcile(url string) func(*runtimeConfig) {
 	return func(cfg *runtimeConfig) {
 		cfg.alertRateLimit = time.Minute
@@ -179,7 +187,7 @@ func TestRunSendsStartupTrigger(t *testing.T) {
 	probe := &reconcileProbe{}
 	srv := httptest.NewServer(probe)
 	defer srv.Close()
-	result := runFillsWith(t, nil, enableReconcile(srv.URL+"/trigger"))
+	result := runFillsWith(t, nil, enableReconcile(srv.URL+"/trigger"), probe.received)
 	if result.err != nil || len(result.entries) != isoFills {
 		t.Fatalf("err=%v fills=%d", result.err, len(result.entries))
 	}
@@ -201,7 +209,7 @@ func TestHungReconcileServerDoesNotBlockFills(t *testing.T) {
 	defer srv.CloseClientConnections()
 	defer srv.Close()
 	start := time.Now()
-	result := runFillsWith(t, nil, enableReconcile(srv.URL+"/trigger"))
+	result := runFillsWith(t, nil, enableReconcile(srv.URL+"/trigger"), probe.received)
 	elapsed := time.Since(start)
 	if result.err != nil || len(result.entries) != isoFills {
 		t.Fatalf("err=%v fills=%d, want %d fills and a clean stop", result.err, len(result.entries), isoFills)
@@ -223,7 +231,7 @@ func TestRunDisabledReconcileMakesNoCalls(t *testing.T) {
 	defer srv.Close()
 	result := runFillsWith(t, nil, func(cfg *runtimeConfig) {
 		cfg.reconcile = reconcileSettings{url: srv.URL + "/trigger", markets: []string{"kr"}, dryRun: true, timeout: time.Second} // enabled left false
-	})
+	}, nil)
 	if result.err != nil || len(result.entries) != isoFills {
 		t.Fatalf("err=%v fills=%d", result.err, len(result.entries))
 	}
