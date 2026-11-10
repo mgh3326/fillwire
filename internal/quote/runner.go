@@ -63,6 +63,7 @@ type Config struct {
 	Buffer    int
 	Clock     Clock
 	Logger    *slog.Logger
+	OnTick    func(Symbol, Tick, time.Time)
 
 	// RetryMin and RetryMax pace redials after a window run fails, doubling
 	// with jitter (AsyncAPI: 1s, 2s, 4s, ...). Zero values take 1s and 5m.
@@ -367,9 +368,21 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 
 	controls := make(chan control, 8)
 	readerDone := make(chan error, 1)
-	go r.guard("reader", stopLane, func() {
-		readerDone <- r.readLoop(windowCtx, transport, controls)
-	})
+	readerExited := make(chan struct{})
+	go func() {
+		defer close(readerExited)
+		r.guard("reader", stopLane, func() {
+			readerDone <- r.readLoop(windowCtx, transport, controls)
+		})
+	}()
+	defer func() {
+		// A frame already read may still be inside OnTick when the window ends.
+		// Stop its context, close the socket to unblock Read, and join it before
+		// runWindow returns so archive owners can safely drain their queues.
+		closeWindow()
+		_ = transport.Close()
+		<-readerExited
+	}()
 
 	if err := r.declare(windowCtx, transport); err != nil {
 		if windowCtx.Err() != nil {
@@ -472,6 +485,9 @@ func (r *Runner) readLoop(ctx context.Context, transport Transport, controls cha
 			if frame.Drop != "" {
 				r.counters.drop(frame.Drop)
 				continue
+			}
+			if r.cfg.OnTick != nil {
+				r.cfg.OnTick(frame.Symbol, frame.Tick, received)
 			}
 			select {
 			case r.ticks <- frame.Tick:

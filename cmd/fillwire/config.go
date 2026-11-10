@@ -76,6 +76,8 @@ type runtimeConfig struct {
 	refreshMargin  time.Duration
 	alertRateLimit time.Duration
 	quotes         quoteSettings
+	recording      recordingSettings
+	upbit          upbitSettings
 }
 
 func loadConfig(path string) (runtimeConfig, error) {
@@ -144,6 +146,12 @@ func loadConfig(path string) (runtimeConfig, error) {
 	}
 	// The quote lane resolves last and cannot fail this function.
 	cfg.quotes = resolveQuoteSettings(contents, cfg)
+	if cfg.recording, err = resolveRecordingSettings(contents); err != nil {
+		return runtimeConfig{}, err
+	}
+	if cfg.upbit, err = resolveUpbitSettings(contents); err != nil {
+		return runtimeConfig{}, err
+	}
 	return cfg, nil
 }
 

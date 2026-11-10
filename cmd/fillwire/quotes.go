@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/quote"
+	"github.com/mgh3326/fillwire/internal/recording"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -190,6 +192,66 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	if dialer == nil {
 		dialer = quote.NewDialer()
 	}
+	var archive *recording.Sink
+	var archiveQueue chan quoteArchiveEvent
+	var archiveDrops atomic.Uint64
+	var archiveLastWarning atomic.Int64
+	var archiveLastWriteWarning atomic.Int64
+	var archiveErrors atomic.Uint64
+	var archiveLastError atomic.Value
+	pendingDrops := make(map[string]*atomic.Uint64, len(settings.symbols))
+	for _, symbol := range settings.symbols {
+		pendingDrops[quoteArchiveName(symbol)] = &atomic.Uint64{}
+	}
+	if cfg.recording.enabled {
+		archive, err = recording.NewSink(cfg.recording.directory, "toss")
+		if err != nil {
+			_ = redisClient.Close()
+			logger.Error("Toss 호가 파일 기록기를 시작하지 못했습니다", "reason", err.Error())
+			return quoteLane{}
+		}
+		for _, symbol := range settings.symbols {
+			if !recording.SafeName(quoteArchiveName(symbol)) {
+				_ = archive.Close()
+				_ = redisClient.Close()
+				logger.Error("Toss 파일 이름이 잘못되었습니다", "symbol", symbol.Code)
+				return quoteLane{}
+			}
+		}
+		archiveQueue = make(chan quoteArchiveEvent, max(settings.buffer, defaultQuoteBuffer))
+	}
+	enqueueArchive := func(event quoteArchiveEvent) {
+		if archiveQueue == nil {
+			return
+		}
+		pending := pendingDrops[event.name]
+		if dropped := pending.Swap(0); dropped > 0 {
+			marker := tossArchiveRecord{Kind: "archive_gap", Market: event.value.Market, ReceivedAt: event.at.UTC(), Dropped: dropped}
+			select {
+			case archiveQueue <- quoteArchiveEvent{name: event.name, at: event.at, value: marker}:
+			default:
+				pending.Add(dropped + 1)
+				archiveDrops.Add(1)
+				now := time.Now().UnixNano()
+				last := archiveLastWarning.Load()
+				if now-last >= int64(30*time.Second) && archiveLastWarning.CompareAndSwap(last, now) {
+					logger.Warn("Toss 호가 보존 큐 초과, 누락 구간을 기록합니다", "dropped", archiveDrops.Load())
+				}
+				return
+			}
+		}
+		select {
+		case archiveQueue <- event:
+		default:
+			pending.Add(1)
+			archiveDrops.Add(1)
+			now := time.Now().UnixNano()
+			last := archiveLastWarning.Load()
+			if now-last >= int64(30*time.Second) && archiveLastWarning.CompareAndSwap(last, now) {
+				logger.Warn("Toss 호가 보존 큐 초과, 누락 구간을 기록합니다", "dropped", archiveDrops.Load())
+			}
+		}
+	}
 	runner, err := quote.NewRunner(quote.Config{
 		Symbols:      settings.symbols,
 		Token:        token,
@@ -203,9 +265,19 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 		RetryMin:     dependencies.quoteRetryMin,
 		RetryMax:     dependencies.quoteRetryMax,
 		PingInterval: dependencies.quotePing,
+		OnTick: func(symbol quote.Symbol, tick quote.Tick, received time.Time) {
+			if archiveQueue == nil {
+				return
+			}
+			value := tossArchiveRecord{Kind: "quote", Market: symbol.Market, ReceivedAt: received.UTC(), Tick: &tick}
+			enqueueArchive(quoteArchiveEvent{name: quoteArchiveName(symbol), at: received, value: value})
+		},
 	})
 	if err != nil {
 		_ = redisClient.Close()
+		if archive != nil {
+			_ = archive.Close()
+		}
 		logger.Error("quote reader disabled", "reason", err.Error())
 		return quoteLane{}
 	}
@@ -214,10 +286,76 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	go func() {
 		defer close(done)
 		defer redisClient.Close()
+		if archive != nil {
+			archiveDone := make(chan struct{})
+			go func() {
+				defer close(archiveDone)
+				writeFailures := make(map[string]uint64, len(settings.symbols))
+				for event := range archiveQueue {
+					if err := archive.Append("toss", event.name, event.at, event.value); err != nil {
+						writeFailures[event.name]++
+						archiveErrors.Add(1)
+						archiveLastError.Store(err.Error())
+						warnArchiveAppendFailure(logger, "toss", &archiveLastWriteWarning, archiveErrors.Load(), err)
+						continue
+					}
+					if failures := writeFailures[event.name]; failures > 0 {
+						marker := tossArchiveRecord{Kind: "archive_gap", Market: event.value.Market, ReceivedAt: event.at.UTC(), Dropped: failures}
+						if err := archive.Append("toss", event.name, event.at, marker); err != nil {
+							writeFailures[event.name]++
+							archiveErrors.Add(1)
+							archiveLastError.Store(err.Error())
+							warnArchiveAppendFailure(logger, "toss", &archiveLastWriteWarning, archiveErrors.Load(), err)
+						} else {
+							delete(writeFailures, event.name)
+						}
+					}
+				}
+			}()
+			runner.Run(ctx)
+			for _, symbol := range settings.symbols {
+				name := quoteArchiveName(symbol)
+				if dropped := pendingDrops[name].Swap(0); dropped > 0 {
+					at := time.Now().UTC()
+					archiveQueue <- quoteArchiveEvent{name: name, at: at, value: tossArchiveRecord{Kind: "archive_gap", Market: symbol.Market, ReceivedAt: at, Dropped: dropped}}
+				}
+			}
+			close(archiveQueue)
+			<-archiveDone
+			if dropped := archiveDrops.Load(); dropped > 0 {
+				logger.Warn("Toss 호가 보존에서 누락 구간을 기록했습니다", "dropped", dropped)
+			}
+			if failed := archiveErrors.Load(); failed > 0 {
+				logger.Error("Toss 호가 파일 기록 실패", "failed", failed, "reason", archiveLastError.Load())
+			}
+			if err := archive.Close(); err != nil {
+				logger.Error("Toss 호가 파일 닫기에 실패했습니다", "reason", err.Error())
+			}
+			return
+		}
 		runner.Run(ctx)
 	}()
 	logger.Info("quote reader started", "provider", "toss", "symbols", len(settings.symbols), "stream", settings.streamKey)
 	return quoteLane{stop: stop, done: done}
+}
+
+type quoteArchiveEvent struct {
+	name  string
+	at    time.Time
+	value tossArchiveRecord
+}
+
+type tossArchiveRecord struct {
+	Kind       string      `json:"kind"`
+	Market     string      `json:"market"`
+	ReceivedAt time.Time   `json:"received_at"`
+	Tick       *quote.Tick `json:"tick,omitempty"`
+	Dropped    uint64      `json:"dropped,omitempty"`
+}
+
+func quoteArchiveName(symbol quote.Symbol) string {
+	code := strings.ReplaceAll(symbol.Code, ".", "_")
+	return strings.ToUpper(symbol.Market) + "-" + code
 }
 
 // halt asks the lane to stop without waiting.

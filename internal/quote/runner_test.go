@@ -423,11 +423,55 @@ func TestRunnerClosesSocketWhenWindowCloses(t *testing.T) {
 	l := startLane(t, time.Date(2026, time.September, 30, 20, 0, 50, 0, KST), ackAll, krOnly)
 	conn := <-l.dialer.dialed
 	waitFor(t, "declaration", func() bool { return conn.count("[") == 1 })
-	l.clock.set(time.Date(2026, time.September, 30, 20, 1, 0, 0, KST))
+	closes, open := l.runner.schedule.At(l.clock.Now())
+	if !open {
+		t.Fatal("fixture clock did not start in a quote window")
+	}
+	l.clock.set(closes)
 	waitFor(t, "socket close at window end", conn.isClosed)
 	time.Sleep(30 * time.Millisecond)
 	if l.dialer.dials() != 1 {
 		t.Fatalf("dials after window close = %d, want 1", l.dialer.dials())
+	}
+}
+
+func TestRunnerWaitsForInFlightTickBeforeWindowShutdown(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	l := startLane(t, wednesdayMidday, ackAll, func(cfg *Config, _ *lane) {
+		cfg.OnTick = func(Symbol, Tick, time.Time) {
+			close(entered)
+			<-release
+		}
+	})
+	conn := <-l.dialer.dialed
+	waitFor(t, "declaration", func() bool { return conn.count("[") == 1 })
+	conn.push(fixture(t, "trade_kr.json"))
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tick callback did not start")
+	}
+	closes, open := l.runner.schedule.At(l.clock.Now())
+	if !open {
+		t.Fatal("fixture clock did not start in a quote window")
+	}
+	l.clock.set(closes)
+	waitFor(t, "socket close at window end", conn.isClosed)
+	l.cancel()
+	select {
+	case <-l.done:
+		t.Fatal("runner returned while OnTick was still in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-l.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not return after the tick callback finished")
 	}
 }
 

@@ -30,6 +30,13 @@ func TestDecodeTradeFrames(t *testing.T) {
 		if frame.Kind != FrameMessage || frame.Drop != "" || !reflect.DeepEqual(frame.Tick, want) {
 			t.Fatalf("%s: frame = %+v, want tick %+v", name, frame, want)
 		}
+		market := MarketKR
+		if strings.Contains(name, "_us") {
+			market = MarketUS
+		}
+		if frame.Symbol != (Symbol{Market: market, Code: want.Symbol}) {
+			t.Fatalf("%s: symbol = %+v", name, frame.Symbol)
+		}
 	}
 }
 
@@ -41,6 +48,13 @@ func TestDecodeOrderbookFrames(t *testing.T) {
 		frame := testDecoder().Decode(fixture(t, name))
 		if frame.Kind != FrameMessage || frame.Drop != "" || !reflect.DeepEqual(frame.Tick, want) {
 			t.Fatalf("%s: frame = %+v, want tick %+v", name, frame, want)
+		}
+		market := MarketKR
+		if strings.Contains(name, "_us") {
+			market = MarketUS
+		}
+		if frame.Symbol != (Symbol{Market: market, Code: want.Symbol}) {
+			t.Fatalf("%s: symbol = %+v", name, frame.Symbol)
 		}
 	}
 	// The asyncapi KR orderbook example is stamped 23:30 KST: no KR session.

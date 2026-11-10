@@ -80,8 +80,9 @@ const (
 type Frame struct {
 	Kind FrameKind
 	// FrameMessage
-	Tick Tick
-	Drop DropReason // non-empty when a message frame produced no tick
+	Tick   Tick
+	Symbol Symbol
+	Drop   DropReason // non-empty when a message frame produced no tick
 	// FrameSubscriptions
 	Subscribed []string
 	Rejected   []Rejection
@@ -144,8 +145,8 @@ func (d *Decoder) Decode(raw []byte) Frame {
 	}
 	switch wire.Type {
 	case "message":
-		tick, drop := d.decodeMessage(wire)
-		return Frame{Kind: FrameMessage, Tick: tick, Drop: drop}
+		tick, symbol, drop := d.decodeMessage(wire)
+		return Frame{Kind: FrameMessage, Tick: tick, Symbol: symbol, Drop: drop}
 	case "subscriptions":
 		return Frame{Kind: FrameSubscriptions, Subscribed: wire.Subscribed, Rejected: wire.Rejected}
 	case "error":
@@ -161,20 +162,20 @@ func (d *Decoder) Decode(raw []byte) Frame {
 	}
 }
 
-func (d *Decoder) decodeMessage(wire wireFrame) (Tick, DropReason) {
+func (d *Decoder) decodeMessage(wire wireFrame) (Tick, Symbol, DropReason) {
 	parts := strings.Split(wire.Topic, ":")
 	if len(parts) != 3 || (parts[0] != "trade" && parts[0] != "orderbook") {
-		return Tick{}, DropUnknownTopic
+		return Tick{}, Symbol{}, DropUnknownTopic
 	}
 	symbol := Symbol{Market: parts[1], Code: parts[2]}
 	if !ValidSymbol(symbol) {
-		return Tick{}, DropUnknownTopic
+		return Tick{}, Symbol{}, DropUnknownTopic
 	}
 	if _, ok := d.symbols[symbol]; !ok {
-		return Tick{}, DropUnknownSym
+		return Tick{}, Symbol{}, DropUnknownSym
 	}
 	if len(wire.Data) == 0 || bytes.Equal(wire.Data, []byte("null")) {
-		return Tick{}, DropMalformed
+		return Tick{}, Symbol{}, DropMalformed
 	}
 	tick := Tick{Symbol: symbol.Code}
 	var stamp *string
@@ -182,48 +183,48 @@ func (d *Decoder) decodeMessage(wire wireFrame) (Tick, DropReason) {
 	case "trade":
 		var data tradeData
 		if json.Unmarshal(wire.Data, &data) != nil || data.Price == nil || !decimal(*data.Price) || isZero(*data.Price) {
-			return Tick{}, DropMalformed
+			return Tick{}, Symbol{}, DropMalformed
 		}
 		tick.Price = *data.Price
 		stamp = data.Timestamp
 		if stamp == nil {
-			return Tick{}, DropMalformed
+			return Tick{}, Symbol{}, DropMalformed
 		}
 	case "orderbook":
 		var data orderbookData
 		if json.Unmarshal(wire.Data, &data) != nil {
-			return Tick{}, DropMalformed
+			return Tick{}, Symbol{}, DropMalformed
 		}
 		var ok bool
 		if tick.Ask1, tick.AskQty, ok = best(data.Asks); !ok {
-			return Tick{}, DropMalformed
+			return Tick{}, Symbol{}, DropMalformed
 		}
 		if tick.Bid1, tick.BidQty, ok = best(data.Bids); !ok {
-			return Tick{}, DropMalformed
+			return Tick{}, Symbol{}, DropMalformed
 		}
 		if len(data.Asks) == 0 && len(data.Bids) == 0 {
 			// Nothing to quote: an entry with only symbol, ts, and session
 			// would read as a quote with no usable value.
-			return Tick{}, DropEmptyBook
+			return Tick{}, Symbol{}, DropEmptyBook
 		}
 		if data.Timestamp == nil {
 			// AsyncAPI: the orderbook timestamp is null when no data is
 			// provided. A tick without its own time is not written.
-			return Tick{}, DropNoTimestamp
+			return Tick{}, Symbol{}, DropNoTimestamp
 		}
 		stamp = data.Timestamp
 	}
 	at, err := time.Parse(time.RFC3339Nano, *stamp)
 	if err != nil {
-		return Tick{}, DropMalformed
+		return Tick{}, Symbol{}, DropMalformed
 	}
 	tick.TS = at.Format(tsLayout)
 	session, ok := SessionLabel(symbol.Market, at)
 	if !ok {
-		return Tick{}, DropOutOfSession
+		return Tick{}, Symbol{}, DropOutOfSession
 	}
 	tick.Session = session
-	return tick, ""
+	return tick, symbol, ""
 }
 
 // best returns the first level of one side. An empty side is valid and
