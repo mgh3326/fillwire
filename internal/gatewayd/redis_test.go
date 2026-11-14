@@ -18,12 +18,12 @@ func TestRedisClientUsesGETSetNXEXAndOwnedRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	commands := make(chan []string, 4)
+	commands := make(chan []string, 5)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		defer close(commands)
-		for range 4 {
+		for range 5 {
 			connection, acceptErr := listener.Accept()
 			if acceptErr != nil {
 				return
@@ -38,6 +38,8 @@ func TestRedisClientUsesGETSetNXEXAndOwnedRelease(t *testing.T) {
 					_, _ = writer.WriteString("$-1\r\n")
 				case "SET":
 					_, _ = writer.WriteString("+OK\r\n")
+				case "PTTL":
+					_, _ = writer.WriteString(":61000\r\n")
 				case "EVAL":
 					_, _ = writer.WriteString(":1\r\n")
 				default:
@@ -63,6 +65,10 @@ func TestRedisClientUsesGETSetNXEXAndOwnedRelease(t *testing.T) {
 	if err != nil || !locked {
 		t.Fatalf("SET NX = %t, %v", locked, err)
 	}
+	ttl, err := client.TTL(context.Background(), "cache-key")
+	if err != nil || ttl != 61*time.Second {
+		t.Fatalf("PTTL = %v, %v", ttl, err)
+	}
 	if err := client.CompareAndDelete(context.Background(), "lock-key", "opaque-lock-value"); err != nil {
 		t.Fatalf("owned release: %v", err)
 	}
@@ -72,12 +78,12 @@ func TestRedisClientUsesGETSetNXEXAndOwnedRelease(t *testing.T) {
 		t.Fatal("fake Redis did not finish")
 	}
 
-	got := make([][]string, 0, 4)
+	got := make([][]string, 0, 5)
 	for command := range commands {
 		got = append(got, command)
 	}
-	if len(got) != 4 {
-		t.Fatalf("Redis commands = %d, want 4", len(got))
+	if len(got) != 5 {
+		t.Fatalf("Redis commands = %d, want 5", len(got))
 	}
 	if !sameStrings(got[0], []string{"GET", "cache-key"}) {
 		t.Fatalf("GET command = %q", got[0])
@@ -88,8 +94,56 @@ func TestRedisClientUsesGETSetNXEXAndOwnedRelease(t *testing.T) {
 	if !sameStrings(got[2], []string{"SET", "lock-key", "opaque-lock-value", "NX", "EX", "30"}) {
 		t.Fatalf("lock SET command = %q", got[2])
 	}
-	if len(got[3]) != 5 || got[3][0] != "EVAL" || got[3][2] != "1" || got[3][3] != "lock-key" || got[3][4] != "opaque-lock-value" {
-		t.Fatalf("release command = %q", got[3])
+	if !sameStrings(got[3], []string{"PTTL", "cache-key"}) {
+		t.Fatalf("PTTL command = %q", got[3])
+	}
+	if len(got[4]) != 5 || got[4][0] != "EVAL" || got[4][2] != "1" || got[4][3] != "lock-key" || got[4][4] != "opaque-lock-value" {
+		t.Fatalf("release command = %q", got[4])
+	}
+}
+
+func TestRedisClientHeldUsesEXISTS(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	commands := make(chan []string, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(commands)
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		reader := bufio.NewReader(connection)
+		writer := bufio.NewWriter(connection)
+		arguments, readErr := readTestRESPArray(reader)
+		if readErr == nil {
+			commands <- arguments
+			_, _ = writer.WriteString(":1\r\n")
+			_ = writer.Flush()
+		}
+		_ = connection.Close()
+	}()
+
+	client, err := NewRedisClient("redis://" + listener.Addr().String() + "/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := client.Held(context.Background(), "lock-key")
+	if err != nil || !held {
+		t.Fatalf("Held = %t, %v", held, err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fake Redis did not finish")
+	}
+	command := <-commands
+	if !sameStrings(command, []string{"EXISTS", "lock-key"}) {
+		t.Fatalf("held command = %q", command)
 	}
 }
 

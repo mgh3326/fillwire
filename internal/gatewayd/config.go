@@ -90,9 +90,9 @@ func providerConfigFromEnv(lookup func(string) string, provider TokenProvider) (
 	}
 	var appKeyName, appSecretName string
 	switch provider {
-	case ProviderKISMock:
+	case ProviderKISMock, ProviderKISMockApproval:
 		appKeyName, appSecretName = "KIS_MOCK_APP_KEY", "KIS_MOCK_APP_SECRET"
-	case ProviderKISLive:
+	case ProviderKISLive, ProviderKISLiveApproval:
 		appKeyName, appSecretName = "KIS_APP_KEY", "KIS_APP_SECRET"
 	case ProviderToss:
 		appKeyName, appSecretName = "TOSS_API_CLIENT_ID", "TOSS_API_CLIENT_SECRET"

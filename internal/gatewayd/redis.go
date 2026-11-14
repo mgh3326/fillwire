@@ -155,6 +155,16 @@ func (client *RedisClient) CompareAndDelete(ctx context.Context, key, value stri
 	return nil
 }
 
+// Held reports whether key exists; the approval lock-wait loop uses it to
+// detect that the lock holder finished, regardless of the value it stored.
+func (client *RedisClient) Held(ctx context.Context, key string) (bool, error) {
+	reply, err := client.execute(ctx, "EXISTS", key)
+	if err != nil || reply.kind != ':' {
+		return false, errRedisUnavailable
+	}
+	return reply.text == "1", nil
+}
+
 func redisTTLSeconds(ttl time.Duration) (string, bool) {
 	if ttl <= 0 || ttl%time.Second != 0 {
 		return "", false
@@ -320,4 +330,18 @@ func readRESPLine(reader *bufio.Reader) (string, error) {
 		return "", errors.New("invalid redis line")
 	}
 	return strings.TrimSuffix(line, "\r\n"), nil
+}
+
+// TTL returns the remaining lifetime; Redis reports missing or persistent keys
+// as negative values, neither of which is a fresh approval record.
+func (client *RedisClient) TTL(ctx context.Context, key string) (time.Duration, error) {
+	reply, err := client.execute(ctx, "PTTL", key)
+	if err != nil || reply.kind != ':' {
+		return 0, errRedisUnavailable
+	}
+	ms, err := strconv.ParseInt(reply.text, 10, 64)
+	if err != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) {
+		return 0, errRedisUnavailable
+	}
+	return time.Duration(ms) * time.Millisecond, nil
 }

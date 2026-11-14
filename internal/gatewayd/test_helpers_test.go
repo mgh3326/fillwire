@@ -35,6 +35,7 @@ type fakeRedisStore struct {
 	setWhileLockHeld []bool
 	setNXCalls       int
 	setNXHit         chan struct{}
+	setNXHook        func()
 }
 
 func newFakeRedisStore(now func() time.Time) *fakeRedisStore {
@@ -81,6 +82,9 @@ func (store *fakeRedisStore) hasActiveLockLocked() bool {
 }
 
 func (store *fakeRedisStore) SetNX(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if hook := store.setNXHook; hook != nil {
+		hook()
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.setNXErr != nil {
@@ -225,4 +229,30 @@ func newTestEnsureServiceForProvider(t *testing.T, store RedisStore, issuer OAut
 
 func testGatewayNow() time.Time {
 	return time.Unix(2_000_000_000, 0)
+}
+
+func (store *fakeRedisStore) TTL(_ context.Context, key string) (time.Duration, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.getErr != nil {
+		return 0, store.getErr
+	}
+	v, ok := store.values[key]
+	if !ok || v.expiresAt.IsZero() {
+		return -1, nil
+	}
+	return v.expiresAt.Sub(store.now()), nil
+}
+
+func (store *fakeRedisStore) Held(_ context.Context, key string) (bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.getErr != nil {
+		return false, store.getErr
+	}
+	if lock, ok := store.locks[key]; ok && (lock.expiresAt.IsZero() || store.now().Before(lock.expiresAt)) {
+		return true, nil
+	}
+	v, ok := store.values[key]
+	return ok && (v.expiresAt.IsZero() || store.now().Before(v.expiresAt)), nil
 }

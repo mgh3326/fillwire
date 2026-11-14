@@ -69,7 +69,7 @@ go run ./cmd/kis-mock-read overseas-order-history --from 20260901 --to 20260901 
 
 `gatewayd` is a separate, loopback-only OAuth token issuer. It exposes
 `GET /healthz` and `POST /v1/tokens/{provider}/ensure`, where `provider` is the
-closed set `kis-mock`, `kis-live`, or `toss`. The ensure response is only
+closed set `kis-mock`, `kis-live`, `toss`, `kis-live-approval`, or `kis-mock-approval`. The ensure response is only
 `{"state":"fresh"}` or `{"state":"issued"}`; it never includes a token.
 
 The daemon defaults to `--providers=kis-mock`. A deployment must explicitly
@@ -82,7 +82,7 @@ go run ./cmd/gatewayd --ensure-interval=5m
 go run ./cmd/gatewayd --providers=kis-mock,toss --ensure-interval=5m
 ```
 
-All providers use Redis `SET NX EX 30`, recheck the cache under the lock, and
+Token providers use Redis `SET NX EX 30`, recheck the cache under the lock, and
 return a fixed error rather than bypass a contended lock. Their authority and
 cache contracts are separately pinned:
 
@@ -97,6 +97,14 @@ cache contracts are separately pinned:
   key `toss:oauth:{sha256(client_id)[:16]}:access_token` plus its **two-field**
   JSON payload. Toss permits one valid token per client, so a replacement is
   written to Redis before the shared lock is released.
+
+The opt-in `kis-live-approval` and `kis-mock-approval` providers use the
+corresponding KIS credentials and `/oauth2/Approval` endpoint. They share the
+Python WebSocket approval-key cache and its 15-second issuance lock. The Redis
+value is the raw approval key with a 23-hour TTL; it is refreshed when at most
+60 seconds remain. `POST /v1/tokens/{provider}/ensure?force=true` forces an
+approval-key replacement, publishing the new value atomically without first
+deleting the old value. Concurrent contenders wait for the lock holder.
 
 `gatewayd` has no order, command, intent, or execution endpoint. It exposes
 loopback `GET /metrics` with standard Go/process collectors and a bounded

@@ -1,6 +1,7 @@
 package gatewayd
 
 import (
+	"context"
 	"io"
 	"net/http"
 )
@@ -47,7 +48,19 @@ func newHandler(ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics)
 			writeJSON(writer, http.StatusNotFound, `{"error":"not_found"}`)
 			return
 		}
-		state, err := ensurer.Ensure(request.Context())
+		var state EnsureState
+		var err error
+		if isApprovalProvider(provider) && request.URL.Query().Get("force") == "true" {
+			if forceEnsurer, ok := ensurer.(interface {
+				EnsureForce(context.Context) (EnsureState, error)
+			}); ok {
+				state, err = forceEnsurer.EnsureForce(request.Context())
+			} else {
+				err = errEnsureUnavailable
+			}
+		} else {
+			state, err = ensurer.Ensure(request.Context())
+		}
 		if err != nil {
 			logEvent(logger, "gatewayd: token ensure failed")
 			metrics.recordEnsure(provider, "", true)

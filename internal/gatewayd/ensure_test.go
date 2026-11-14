@@ -13,7 +13,7 @@ import (
 )
 
 func TestEnsureReturnsFreshWithoutOAuthForEveryProvider(t *testing.T) {
-	for _, provider := range orderedProviders() {
+	for _, provider := range []TokenProvider{ProviderKISMock, ProviderKISLive, ProviderToss} {
 		t.Run(string(provider), func(t *testing.T) {
 			now := testGatewayNow()
 			store := newFakeRedisStore(func() time.Time { return now })
@@ -40,7 +40,7 @@ func TestEnsureReturnsFreshWithoutOAuthForEveryProvider(t *testing.T) {
 }
 
 func TestEnsureIssuesProviderCompatiblePayloadForEveryProvider(t *testing.T) {
-	for _, provider := range orderedProviders() {
+	for _, provider := range []TokenProvider{ProviderKISMock, ProviderKISLive, ProviderToss} {
 		t.Run(string(provider), func(t *testing.T) {
 			now := testGatewayNow()
 			store := newFakeRedisStore(func() time.Time { return now })
@@ -105,7 +105,7 @@ func TestEnsureIssuesProviderCompatiblePayloadForEveryProvider(t *testing.T) {
 }
 
 func TestEnsureConcurrentCallsCooperateThroughRedisLockForEveryProvider(t *testing.T) {
-	for _, provider := range orderedProviders() {
+	for _, provider := range []TokenProvider{ProviderKISMock, ProviderKISLive, ProviderToss} {
 		t.Run(string(provider), func(t *testing.T) {
 			now := testGatewayNow()
 			store := newFakeRedisStore(func() time.Time { return now })
@@ -170,7 +170,7 @@ func TestEnsureConcurrentCallsCooperateThroughRedisLockForEveryProvider(t *testi
 }
 
 func TestEnsureServiceDerivesProviderNamespaces(t *testing.T) {
-	for _, provider := range orderedProviders() {
+	for _, provider := range []TokenProvider{ProviderKISMock, ProviderKISLive, ProviderToss} {
 		t.Run(string(provider), func(t *testing.T) {
 			service := newTestEnsureServiceForProvider(t, newFakeRedisStore(testGatewayNow), &fakeOAuthIssuer{}, testGatewayNow(), provider)
 			switch provider {

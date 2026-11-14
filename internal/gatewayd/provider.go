@@ -13,9 +13,11 @@ import (
 type TokenProvider string
 
 const (
-	ProviderKISMock TokenProvider = "kis-mock"
-	ProviderKISLive TokenProvider = "kis-live"
-	ProviderToss    TokenProvider = "toss"
+	ProviderKISMock         TokenProvider = "kis-mock"
+	ProviderKISLive         TokenProvider = "kis-live"
+	ProviderToss            TokenProvider = "toss"
+	ProviderKISLiveApproval TokenProvider = "kis-live-approval"
+	ProviderKISMockApproval TokenProvider = "kis-mock-approval"
 )
 
 const (
@@ -31,7 +33,7 @@ const (
 
 func knownProvider(provider TokenProvider) bool {
 	switch provider {
-	case ProviderKISMock, ProviderKISLive, ProviderToss:
+	case ProviderKISMock, ProviderKISLive, ProviderToss, ProviderKISMockApproval, ProviderKISLiveApproval:
 		return true
 	default:
 		return false
@@ -40,9 +42,9 @@ func knownProvider(provider TokenProvider) bool {
 
 func providerBaseURL(provider TokenProvider) (string, bool) {
 	switch provider {
-	case ProviderKISMock:
+	case ProviderKISMock, ProviderKISMockApproval:
 		return kismockread.MockBaseURL, true
-	case ProviderKISLive:
+	case ProviderKISLive, ProviderKISLiveApproval:
 		return KISLiveBaseURL, true
 	case ProviderToss:
 		return TossBaseURL, true
@@ -55,6 +57,8 @@ func providerOAuthPath(provider TokenProvider) (string, bool) {
 	switch provider {
 	case ProviderKISMock, ProviderKISLive:
 		return oauthTokenPath, true
+	case ProviderKISMockApproval, ProviderKISLiveApproval:
+		return "/oauth2/Approval", true
 	case ProviderToss:
 		return tossOAuthTokenPath, true
 	default:
@@ -150,5 +154,5 @@ func normalizedProviders(providers []TokenProvider) ([]TokenProvider, error) {
 }
 
 func orderedProviders() []TokenProvider {
-	return []TokenProvider{ProviderKISMock, ProviderKISLive, ProviderToss}
+	return []TokenProvider{ProviderKISMock, ProviderKISLive, ProviderToss, ProviderKISLiveApproval, ProviderKISMockApproval}
 }

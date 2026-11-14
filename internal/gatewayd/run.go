@@ -80,7 +80,13 @@ func Run(ctx context.Context, args []string, lookup func(string) string, stderr 
 			writeStartupError(stderr)
 			return 1
 		}
-		ensurer, ensureErr := NewEnsureServiceForProvider(store, oauthIssuerFor(providerConfig, config.Timeout), providerConfig)
+		var ensurer Ensurer
+		var ensureErr error
+		if isApprovalProvider(provider) {
+			ensurer, ensureErr = newApprovalService(store, providerConfig, config.Timeout)
+		} else {
+			ensurer, ensureErr = NewEnsureServiceForProvider(store, oauthIssuerFor(providerConfig, config.Timeout), providerConfig)
+		}
 		if ensureErr != nil {
 			writeStartupError(stderr)
 			return 1
