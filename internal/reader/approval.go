@@ -21,6 +21,7 @@ import (
 // be0839808b35b7fcd4bbeb326ac0a84daf7ad96a.
 const (
 	ApprovalModeCacheOnly = "cache-only"
+	ApprovalModeGatewayd  = "gatewayd"
 	ApprovalCacheTTL      = 23 * time.Hour
 	ApprovalLockTTL       = 15 * time.Second
 	ApprovalWait          = 12 * time.Second
@@ -31,6 +32,10 @@ const (
 	publishDeadline       = 14 * time.Second
 	refreshRetryMin       = time.Second
 	refreshRetryMax       = 30 * time.Second
+	// Gatewayd mode polls the shared cache after an ensure acknowledgement
+	// with the same bounded window auto_trader redis_token_manager.py uses.
+	GatewaydPollTimeout  = 3 * time.Second
+	GatewaydPollInterval = 50 * time.Millisecond
 )
 
 const approvalCacheKey = "kis:websocket:approval_key"
@@ -41,6 +46,11 @@ var (
 	ErrApprovalUnavailable          = errors.New("reader: approval issuance temporarily unavailable")
 	ErrApprovalLockLost             = errors.New("reader: approval issuance lock ownership lost")
 	ErrApprovalConfig               = errors.New("reader: approval configuration invalid")
+	// ErrGatewaydApprovalUnavailable reports that gatewayd acknowledged an
+	// ensure request but no usable approval key appeared in Redis within the
+	// bounded poll. Like every approval failure it never carries a key, URL,
+	// or response body.
+	ErrGatewaydApprovalUnavailable = errors.New("reader: gatewayd approval key not published")
 )
 
 // ApprovalIssuer must make exactly one REST request and honor ctx. It is called
@@ -54,6 +64,7 @@ func (f issuerFunc) Issue(ctx context.Context) (string, error) { return f(ctx) }
 
 type ApprovalMetrics struct {
 	IssueCalls      atomic.Uint64
+	EnsureCalls     atomic.Uint64
 	LockAcquired    atomic.Uint64
 	LockContended   atomic.Uint64
 	LockWaitSuccess atomic.Uint64
@@ -63,6 +74,7 @@ type ApprovalMetrics struct {
 type ApprovalProvider struct {
 	redis       redis.UniversalClient
 	issuer      ApprovalIssuer
+	ensurer     GatewaydEnsurer
 	logger      *slog.Logger
 	mode        string
 	accountMode string
@@ -99,10 +111,35 @@ func NewApprovalProviderWithMode(client redis.UniversalClient, fallback ws.Appro
 }
 
 func NewApprovalProviderConfig(client redis.UniversalClient, issuer ApprovalIssuer, mode, accountMode string, margin time.Duration, logger *slog.Logger) (*ApprovalProvider, error) {
-	if client == nil || issuer == nil || (mode != "" && mode != ApprovalModeCacheOnly) || (accountMode != "live" && accountMode != "mock") || margin <= 0 || margin > MaxRefreshMargin {
+	// Gatewayd mode has no issuer by contract; it is built only through
+	// NewApprovalProviderGatewayd so an issuance path cannot be configured.
+	if mode == ApprovalModeGatewayd {
 		return nil, ErrApprovalConfig
 	}
-	return &ApprovalProvider{redis: client, issuer: issuer, logger: logger, mode: mode, accountMode: accountMode, margin: margin, metrics: &ApprovalMetrics{}, now: time.Now, wait: ctxwait.Sleep, failureCh: make(chan struct{})}, nil
+	return newApprovalProvider(client, issuer, nil, mode, accountMode, margin, logger)
+}
+
+// NewApprovalProviderGatewayd builds the gatewayd consumer: it never issues
+// an approval key and never takes the issuance lock. On a cache miss or a
+// key inside the refresh margin it asks gatewayd's ensure endpoint, then
+// proves publication by re-reading the shared Redis key.
+func NewApprovalProviderGatewayd(client redis.UniversalClient, ensurer GatewaydEnsurer, accountMode string, margin time.Duration, logger *slog.Logger) (*ApprovalProvider, error) {
+	return newApprovalProvider(client, nil, ensurer, ApprovalModeGatewayd, accountMode, margin, logger)
+}
+
+func newApprovalProvider(client redis.UniversalClient, issuer ApprovalIssuer, ensurer GatewaydEnsurer, mode, accountMode string, margin time.Duration, logger *slog.Logger) (*ApprovalProvider, error) {
+	validMode := mode == "" || mode == ApprovalModeCacheOnly || mode == ApprovalModeGatewayd
+	if client == nil || !validMode || (accountMode != "live" && accountMode != "mock") || margin <= 0 || margin > MaxRefreshMargin {
+		return nil, ErrApprovalConfig
+	}
+	if mode == ApprovalModeGatewayd {
+		if ensurer == nil || issuer != nil {
+			return nil, ErrApprovalConfig
+		}
+	} else if issuer == nil || ensurer != nil {
+		return nil, ErrApprovalConfig
+	}
+	return &ApprovalProvider{redis: client, issuer: issuer, ensurer: ensurer, logger: logger, mode: mode, accountMode: accountMode, margin: margin, metrics: &ApprovalMetrics{}, now: time.Now, wait: ctxwait.Sleep, failureCh: make(chan struct{})}, nil
 }
 
 func (p *ApprovalProvider) Metrics() *ApprovalMetrics { return p.metrics }
@@ -159,6 +196,34 @@ func (p *ApprovalProvider) ApprovalKey(ctx context.Context) (string, error) {
 		p.present(key)
 		return key, nil
 	}
+	if p.mode == ApprovalModeGatewayd {
+		if err != nil {
+			return p.terminal(err)
+		}
+		if usable(key, ttl, p.margin) {
+			p.noteLive(ttl)
+			p.present(key)
+			return key, nil
+		}
+		issued, err := p.ensureGatewayd(ctx, false, "")
+		if err == nil {
+			p.present(issued)
+			return issued, nil
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		// Same recoverable path as self mode: a failed ensure may leave a
+		// still-live cached key inside the refresh margin.
+		old, remaining, readErr := p.cached(ctx)
+		if readErr == nil && live(old, remaining) {
+			p.noteLive(remaining)
+			p.present(old)
+			p.recoverableFailure()
+			return old, nil
+		}
+		return p.terminal(err)
+	}
 	if err != nil {
 		return p.terminal(err)
 	}
@@ -195,6 +260,28 @@ func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
 		p.markFailure(ErrCacheOnlyApprovalUnavailable)
 		return "", ErrCacheOnlyApprovalUnavailable
 	}
+	if p.mode == ApprovalModeGatewayd {
+		// Exclude the key this process last presented — the one KIS rejected —
+		// matching the self-mode lastKey guard, so a valid replacement gatewayd
+		// already published is accepted instead of timing out. With nothing
+		// presented, fall back to the currently cached value.
+		p.mu.Lock()
+		rejected := p.lastKey
+		p.mu.Unlock()
+		if rejected == "" {
+			var err error
+			rejected, _, err = p.cached(ctx)
+			if err != nil {
+				return p.terminal(err)
+			}
+		}
+		key, err := p.ensureGatewayd(ctx, true, rejected)
+		if err != nil {
+			return p.terminal(err)
+		}
+		p.present(key)
+		return key, nil
+	}
 	p.mu.Lock()
 	rejected := p.lastKey
 	p.mu.Unlock()
@@ -206,6 +293,51 @@ func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
 	return key, nil
 }
 func (p *ApprovalProvider) present(key string) { p.mu.Lock(); p.lastKey = key; p.mu.Unlock() }
+
+// ensureGatewayd asks gatewayd to ensure the account mode's approval provider,
+// then polls the shared cache for proof of publication. A forced reissue needs
+// any live key different from the rejected one; a non-forced ensure must
+// observe a margin-fresh key, so an acknowledgement that leaves the
+// near-expiry record untouched cannot pass as a refresh.
+func (p *ApprovalProvider) ensureGatewayd(ctx context.Context, force bool, rejected string) (string, error) {
+	provider := "kis-live-approval"
+	if p.accountMode == "mock" {
+		provider = "kis-mock-approval"
+	}
+	p.metrics.EnsureCalls.Add(1)
+	p.observe("approval_gatewayd_ensure", "account_mode", p.accountMode, "force", force, "count", p.metrics.EnsureCalls.Load())
+	if err := p.ensurer.Ensure(ctx, provider, force); err != nil {
+		return p.fail(err)
+	}
+	deadline := p.now().Add(GatewaydPollTimeout)
+	for {
+		key, ttl, err := p.cached(ctx)
+		if err != nil {
+			return p.fail(err)
+		}
+		published := live(key, ttl) && key != rejected
+		if !force {
+			published = usable(key, ttl, p.margin)
+		}
+		if published {
+			p.noteLive(ttl)
+			return key, nil
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if !p.now().Before(deadline) {
+			break
+		}
+		if err := p.wait(ctx, GatewaydPollInterval); err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			return p.fail(err)
+		}
+	}
+	return p.fail(ErrGatewaydApprovalUnavailable)
+}
 func (p *ApprovalProvider) noteLive(ttl time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -239,6 +371,9 @@ func (p *ApprovalProvider) fail(err error) (string, error) {
 	if errors.Is(err, ErrApprovalLockLost) {
 		wrapped = ErrApprovalLockLost
 	}
+	if errors.Is(err, ErrGatewaydApprovalUnavailable) {
+		wrapped = ErrGatewaydApprovalUnavailable
+	}
 	return "", wrapped
 }
 func (p *ApprovalProvider) terminal(err error) (string, error) {
@@ -268,6 +403,10 @@ const invalidateScript = `if redis.call('GET', KEYS[1]) == ARGV[1] then redis.ca
 const releaseScript = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`
 
 func (p *ApprovalProvider) singleFlight(ctx context.Context, force bool, rejected string) (string, error) {
+	if p.issuer == nil {
+		// Unreachable: gatewayd and cache-only modes return before this path.
+		return p.fail(ErrApprovalUnavailable)
+	}
 	tokenBytes := make([]byte, 16)
 	if _, err := crand.Read(tokenBytes); err != nil {
 		return p.fail(err)
@@ -401,8 +540,11 @@ func increaseRefreshRetry(base time.Duration) time.Duration {
 
 // RefreshLoop refreshes in the background even if no subscribe occurs. Redis
 // PTTL is the expiry source, so wall-clock jumps cannot postpone renewal.
+// Only self-issuing mode ("") refreshes here: cache-only never writes, and
+// gatewayd mode leaves renewal to gatewayd's own periodic ensure plus the
+// on-demand ensure inside ApprovalKey/Reissue.
 func (p *ApprovalProvider) RefreshLoop(ctx context.Context) error {
-	if p.mode == ApprovalModeCacheOnly {
+	if p.mode != "" {
 		<-ctx.Done()
 		return nil
 	}

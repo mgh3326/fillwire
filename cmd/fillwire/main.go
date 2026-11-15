@@ -77,6 +77,7 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, alerter al
 type runDependencies struct {
 	approvalRedis    redis.UniversalClient
 	approvalFallback ws.ApprovalKeyProvider
+	gatewaydEnsurer  reader.GatewaydEnsurer
 	dialer           ws.Dialer
 	alerter          alert.Alerter
 
@@ -139,7 +140,20 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	if margin == 0 {
 		margin = reader.DefaultRefreshMargin
 	}
-	approval, err := reader.NewApprovalProviderConfig(approvalRedis, issuer, cfg.KIS.ApprovalMode, cfg.KIS.AccountMode, margin, logger)
+	var approval *reader.ApprovalProvider
+	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd {
+		ensurer := dependencies.gatewaydEnsurer
+		if ensurer == nil {
+			var err error
+			ensurer, err = reader.NewGatewaydClient(cfg.KIS.Gatewayd.URL, cfg.KIS.Gatewayd.TokenHeader, cfg.gatewaydToken)
+			if err != nil {
+				return fmt.Errorf("%w: gatewayd client", reader.ErrApprovalConfig)
+			}
+		}
+		approval, err = reader.NewApprovalProviderGatewayd(approvalRedis, ensurer, cfg.KIS.AccountMode, margin, logger)
+	} else {
+		approval, err = reader.NewApprovalProviderConfig(approvalRedis, issuer, cfg.KIS.ApprovalMode, cfg.KIS.AccountMode, margin, logger)
+	}
 	if err != nil {
 		return err
 	}
@@ -201,7 +215,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	readerCtx, stopReader := context.WithCancel(context.Background())
 	defer stopReader()
 	refreshDone := make(chan error, 1)
-	if cfg.KIS.ApprovalMode != reader.ApprovalModeCacheOnly {
+	if cfg.KIS.ApprovalMode == "" {
 		go func() {
 			if err := approval.RefreshLoop(readerCtx); err != nil {
 				refreshDone <- err
