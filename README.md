@@ -108,6 +108,22 @@ process failure, and forced reissue never reuses a KIS-rejected key. The optiona
 operator-controlled behavior: missing or empty cache exits 78 without REST.
 Redis failure remains transient, including in cache-only mode.
 
+`approval_mode = "gatewayd"` makes gatewayd the sole approval issuer for the
+configured account mode (provider `kis-live-approval` or `kis-mock-approval`).
+fillwire never issues a key locally and never touches the local issuance lock
+in this mode. On a cache miss it POSTs `/v1/tokens/{provider}/ensure` on the
+`[kis.gatewayd]` URL (`?force=true` on forced reissue), then polls Redis for a
+usable shared key for about 3 seconds. The HTTP response is only an
+acknowledgement — Redis stays authoritative — so an acknowledged ensure that
+never produces a usable key is a typed
+`ErrGatewaydApprovalUnavailable`, while a transport or ensure failure stays
+`ErrApprovalUnavailable`. Forced reissue snapshots the previous cached key and
+requires a different published key. The ensure POST has a 5s budget with a 3s
+connect bound, honors no proxy environment, and follows no redirects. An
+optional `token_env`/`token_header` pair sends a credential on that POST only;
+the value never appears in logs or errors. The `[kis.gatewayd]` table is
+required (valid `url`) only in this mode and ignored otherwise.
+
 Configuration errors, including missing KIS credentials and invalid settings,
 exit 78 and the example systemd unit prevents restart for that code. Session
 occupancy retains exit 42. Network, KIS 5xx, Redis, and lock-timeout failures

@@ -5,7 +5,7 @@
 broker = "kis"
 endpoint = "live" # live or mock; this also selects the matching KIS TR.
 account_mode = "live"
-approval_mode = "" # default: Redis single-flight issue and refresh; cache-only remains available.
+approval_mode = "" # "" (default): Redis single-flight issue and refresh; "cache-only": read the cached key only; "gatewayd": ask gatewayd to ensure the shared key, then read Redis (see [kis.gatewayd]).
 approval_refresh_margin = "1h"
 venue = "krx"
 hts_id = "EXAMPLE_HTS_ID"
@@ -13,6 +13,19 @@ app_key_env = "KIS_APP_KEY"
 app_secret_env = "KIS_APP_SECRET"
 event_buffer = 256
 dup_track_max = 10000
+
+# gatewayd approval mode (approval_mode = "gatewayd"). fillwire never issues an
+# approval key locally in this mode: on a cache miss it POSTs
+# /v1/tokens/{provider}/ensure on gatewayd (kis-live-approval or
+# kis-mock-approval, chosen by account_mode), then reads the shared key back
+# from Redis, polling briefly. The HTTP call is only an acknowledgement;
+# Redis stays authoritative. The token below is sent as the named header on
+# that POST only and is never logged. Unknown keys in this table reject the
+# config; the table is ignored when approval_mode is not "gatewayd".
+[kis.gatewayd]
+url = "http://gatewayd.example.invalid:8791"
+token_env = "GATEWAYD_TOKEN"        # optional; unset means no auth header
+token_header = "Authorization"      # header carrying the token_env value
 
 [redis]
 url = "rediss://redis.example.invalid:6380/0"
@@ -78,10 +91,17 @@ max_len = 100000 # XADD MAXLEN ~ N
 buffer = 1024 # at most 65536
 
 # Optional book snapshots on the existing KIS websocket; mock REST fallback.
+# Exactly one access-token source is required: access_token_env names an
+# environment variable, or access_token_source = "redis" reads the token that
+# auto_trader publishes in [redis] (token_keys.py key contract; live reads
+# kis:access_token, mock derives kis_mock:<netloc>:<app-key fingerprint>:
+# access_token). The reader is read-only and never issues a token; the token
+# value never appears in logs or errors.
 [books]
 enabled = false
 symbol = "005930"
 access_token_env = "KIS_MOCK_ACCESS_TOKEN"
+access_token_source = "" # "" with access_token_env, or "redis"
 
 # Toss/KIS 시세 레인의 장기 JSONL 기록. 기본 비활성화.
 [recording]

@@ -18,10 +18,20 @@ access_token_env = "KIS_MOCK_ACCESS_TOKEN"
 
 Default: disabled. One symbol per producer instance. Use the same symbol as the
 approved execution intent. The existing KIS `app_key_env` and `app_secret_env`
-settings name the credential environment variables. The access token is read
-from the named environment variable on each REST read; the producer never issues
-an OAuth token. The operator owns token freshness and process restarts when its
-environment token changes. Do not put credential values in TOML.
+settings name the credential environment variables. Exactly one access-token
+source is required:
+
+- `access_token_env` names an environment variable read on each REST read, or
+- `access_token_source = "redis"` reads the token auto_trader publishes in the
+  configured `[redis]` under the `token_keys.py` contract — `kis:access_token`
+  for live, and for mock `kis_mock:<lower host:port>:<sha256(app_key)[:16]>:access_token`
+  derived from the mock endpoint and `app_key_env` credential. The payload is
+  the shared JSON `{access_token, expires_at, created_at}`; missing, malformed,
+  expired, or within-60s-of-expiry entries read as absent.
+
+Either way the producer never issues an OAuth token and the Redis reader is
+read-only: no issuance, lock, write, or refresh. The token value never appears
+in logs or error messages. Do not put credential values in TOML.
 
 With no successfully published websocket book received during the preceding
 4 seconds, mock mode attempts a REST quotation read every 2 seconds. This

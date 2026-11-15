@@ -18,17 +18,18 @@ import (
 type fileConfig struct {
 	Books bookSettings `toml:"books"`
 	KIS   struct {
-		Broker        string `toml:"broker"`
-		Endpoint      string `toml:"endpoint"`
-		AccountMode   string `toml:"account_mode"`
-		ApprovalMode  string `toml:"approval_mode"`
-		RefreshMargin string `toml:"approval_refresh_margin"`
-		Venue         string `toml:"venue"`
-		HTSID         string `toml:"hts_id"`
-		AppKeyEnv     string `toml:"app_key_env"`
-		AppSecretEnv  string `toml:"app_secret_env"`
-		EventBuffer   int    `toml:"event_buffer"`
-		DupTrackMax   int    `toml:"dup_track_max"`
+		Broker        string           `toml:"broker"`
+		Endpoint      string           `toml:"endpoint"`
+		AccountMode   string           `toml:"account_mode"`
+		ApprovalMode  string           `toml:"approval_mode"`
+		RefreshMargin string           `toml:"approval_refresh_margin"`
+		Venue         string           `toml:"venue"`
+		HTSID         string           `toml:"hts_id"`
+		AppKeyEnv     string           `toml:"app_key_env"`
+		AppSecretEnv  string           `toml:"app_secret_env"`
+		EventBuffer   int              `toml:"event_buffer"`
+		DupTrackMax   int              `toml:"dup_track_max"`
+		Gatewayd      gatewaydSettings `toml:"gatewayd"`
 	} `toml:"kis"`
 	Redis struct {
 		URL string `toml:"url"`
@@ -62,6 +63,17 @@ type fileConfig struct {
 	} `toml:"alerts"`
 }
 
+// gatewaydSettings configures the optional approval ensure client used when
+// approval_mode = "gatewayd". token_env names an environment variable whose
+// value is sent as the auth credential; token_header names the header it
+// travels in. With token_env empty no credential header is sent, matching the
+// loopback gatewayd deployment and the Python reference.
+type gatewaydSettings struct {
+	URL         string `toml:"url"`
+	TokenEnv    string `toml:"token_env"`
+	TokenHeader string `toml:"token_header"`
+}
+
 type runtimeConfig struct {
 	fileConfig
 	claimMinIdle   time.Duration
@@ -73,6 +85,7 @@ type runtimeConfig struct {
 	ingestToken    string
 	appKey         string
 	appSecret      string
+	gatewaydToken  string
 	refreshMargin  time.Duration
 	alertRateLimit time.Duration
 	quotes         quoteSettings
@@ -104,6 +117,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 	}
 	if cfg.Ingest.TokenHeader == "" {
 		cfg.Ingest.TokenHeader = sink.DefaultIngestTokenHeader
+	}
+	if cfg.KIS.Gatewayd.TokenHeader == "" {
+		cfg.KIS.Gatewayd.TokenHeader = "Authorization"
 	}
 	if err := cfg.validateStatic(); err != nil {
 		return runtimeConfig{}, err
@@ -145,6 +161,11 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if cfg.appSecret, ok = os.LookupEnv(cfg.KIS.AppSecretEnv); !ok || cfg.appSecret == "" {
 		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
 	}
+	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd && strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) != "" {
+		if cfg.gatewaydToken, ok = os.LookupEnv(cfg.KIS.Gatewayd.TokenEnv); !ok || cfg.gatewaydToken == "" {
+			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.Gatewayd.TokenEnv)
+		}
+	}
 	// The quote lane resolves last and cannot fail this function.
 	cfg.quotes = resolveQuoteSettings(contents, cfg)
 	if cfg.recording, err = resolveRecordingSettings(contents); err != nil {
@@ -163,8 +184,18 @@ func (cfg runtimeConfig) validateStatic() error {
 	if cfg.KIS.Broker != "kis" {
 		return errors.New("config: broker must be kis")
 	}
-	if cfg.KIS.ApprovalMode != "" && cfg.KIS.ApprovalMode != "cache-only" {
+	if cfg.KIS.ApprovalMode != "" && cfg.KIS.ApprovalMode != reader.ApprovalModeCacheOnly && cfg.KIS.ApprovalMode != reader.ApprovalModeGatewayd {
 		return errors.New("config: unsupported KIS approval_mode")
+	}
+	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd {
+		if _, err := reader.NormalizeGatewaydURL(cfg.KIS.Gatewayd.URL); err != nil {
+			return errors.New("config: invalid KIS gatewayd url")
+		}
+		if strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) != "" {
+			if err := sink.ValidateIngestTokenHeader(cfg.KIS.Gatewayd.TokenHeader); err != nil {
+				return errors.New("config: invalid KIS gatewayd token_header")
+			}
+		}
 	}
 	if cfg.KIS.Endpoint != "live" && cfg.KIS.Endpoint != "mock" {
 		return errors.New("config: KIS endpoint must be live or mock")
@@ -200,9 +231,21 @@ func (cfg runtimeConfig) validateStatic() error {
 		return errors.New("config: invalid ingest token_header")
 	}
 	// The access token itself is read lazily on each REST call, since its
-	// owner refreshes it; only the name is checked here.
-	if cfg.Books.Enabled && (!bookfeed.SymbolOK(cfg.Books.Symbol) || strings.TrimSpace(cfg.Books.AccessTokenEnv) == "") {
-		return errors.New("config: books symbol and access_token_env required")
+	// owner refreshes it; only the name is checked here. Exactly one token
+	// source must be configured: access_token_env, or
+	// access_token_source = "redis" for the shared token_keys.py cache key.
+	if cfg.Books.Enabled {
+		if !bookfeed.SymbolOK(cfg.Books.Symbol) {
+			return errors.New("config: books symbol required")
+		}
+		source := strings.TrimSpace(cfg.Books.AccessTokenSource)
+		if source != "" && source != "env" && source != "redis" {
+			return errors.New("config: invalid books access_token_source")
+		}
+		envSet := strings.TrimSpace(cfg.Books.AccessTokenEnv) != ""
+		if envSet == (source == "redis") {
+			return errors.New("config: books requires exactly one of access_token_env or access_token_source = \"redis\"")
+		}
 	}
 	return nil
 }

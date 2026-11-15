@@ -6,28 +6,62 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/bookfeed"
 	"github.com/mgh3326/fillwire/internal/kisread"
 	"github.com/mgh3326/fillwire/internal/recording"
+	"github.com/mgh3326/go-kis/kis"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
 
 type bookSettings struct {
-	Enabled        bool   `toml:"enabled"`
-	Symbol         string `toml:"symbol"`
-	AccessTokenEnv string `toml:"access_token_env"`
+	Enabled           bool   `toml:"enabled"`
+	Symbol            string `toml:"symbol"`
+	AccessTokenEnv    string `toml:"access_token_env"`
+	AccessTokenSource string `toml:"access_token_source"`
+}
+
+// booksToken resolves the per-call access token source. The env source reads
+// the named variable lazily, matching the historical behavior; the redis
+// source performs one GET of the token_keys.py cache key per call and treats
+// a missing, malformed, or near-expiry entry as absent.
+func booksToken(ctx context.Context, cfg runtimeConfig, r redis.UniversalClient) (func() string, error) {
+	if strings.TrimSpace(cfg.Books.AccessTokenSource) != "redis" {
+		return func() string { return os.Getenv(cfg.Books.AccessTokenEnv) }, nil
+	}
+	host := kis.HostLive
+	if cfg.KIS.Endpoint == "mock" {
+		host = kis.HostVTS
+	}
+	key, err := kisread.AccessTokenKey(cfg.KIS.Endpoint == "mock", host, cfg.appKey)
+	if err != nil {
+		return nil, errors.New("books: invalid KIS token cache key")
+	}
+	cached, err := kisread.NewCachedToken(r, key)
+	if err != nil {
+		return nil, errors.New("books: invalid KIS token cache")
+	}
+	return func() string {
+		token, err := cached.Token(ctx)
+		if err != nil {
+			return ""
+		}
+		return token
+	}, nil
 }
 
 func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (func(ws.Event), func(), error) {
 	if !cfg.Books.Enabled {
 		return nil, func() {}, nil
 	}
-	if !bookfeed.SymbolOK(cfg.Books.Symbol) || cfg.Books.AccessTokenEnv == "" {
-		return nil, nil, errors.New("books: symbol and access_token_env required")
+	source := strings.TrimSpace(cfg.Books.AccessTokenSource)
+	envSet := strings.TrimSpace(cfg.Books.AccessTokenEnv) != ""
+	if !bookfeed.SymbolOK(cfg.Books.Symbol) || (source != "" && source != "env" && source != "redis") || envSet == (source == "redis") {
+		return nil, nil, errors.New("books: symbol and exactly one token source required")
 	}
 	options, err := redis.ParseURL(cfg.Redis.URL)
 	if err != nil {
@@ -38,8 +72,14 @@ func startBooks(ctx context.Context, cfg runtimeConfig, logger *slog.Logger) (fu
 	options.WriteTimeout = time.Second
 	options.DialTimeout = time.Second
 	r := redis.NewClient(options)
-	rest := &kisread.Client{Mock: cfg.KIS.Endpoint == "mock", AppKey: cfg.appKey, AppSecret: cfg.appSecret, Token: func() string { return os.Getenv(cfg.Books.AccessTokenEnv) }}
 	runCtx, cancel := context.WithCancel(ctx)
+	token, err := booksToken(runCtx, cfg, r)
+	if err != nil {
+		cancel()
+		_ = r.Close()
+		return nil, nil, err
+	}
+	rest := &kisread.Client{Mock: cfg.KIS.Endpoint == "mock", AppKey: cfg.appKey, AppSecret: cfg.appSecret, Token: token}
 	events := make(chan ws.Event, 32)
 	done := make(chan struct{})
 	go func() {

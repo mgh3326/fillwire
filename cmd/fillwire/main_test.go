@@ -118,6 +118,7 @@ func TestApprovalModeValidation(t *testing.T) {
 	}{
 		{name: "omitted preserves default", mode: "", want: true},
 		{name: "cache only", mode: "cache-only", want: true},
+		{name: "gatewayd", mode: "gatewayd", want: true},
 		{name: "typo", mode: "cache_only", want: false},
 		{name: "unsupported", mode: "rest-only", want: false},
 	}
@@ -125,6 +126,7 @@ func TestApprovalModeValidation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := validStaticConfig()
 			cfg.KIS.ApprovalMode = test.mode
+			cfg.KIS.Gatewayd.URL = "http://127.0.0.1:8791"
 			cfg.Redis.URL = "redis://127.0.0.1:6379/0"
 			cfg.Ingest.URL = "http://127.0.0.1:8080/ingest"
 			err := cfg.validateStatic()
@@ -554,6 +556,11 @@ func TestBooksSettingsFailAtConfigLoad(t *testing.T) {
 		{"missing symbol", bookSettings{Enabled: true, AccessTokenEnv: "KIS_ACCESS_TOKEN"}, true},
 		{"invalid symbol", bookSettings{Enabled: true, Symbol: "../x", AccessTokenEnv: "KIS_ACCESS_TOKEN"}, true},
 		{"missing token env name", bookSettings{Enabled: true, Symbol: "005930"}, true},
+		{"redis source only", bookSettings{Enabled: true, Symbol: "005930", AccessTokenSource: "redis"}, false},
+		{"explicit env source", bookSettings{Enabled: true, Symbol: "005930", AccessTokenEnv: "KIS_ACCESS_TOKEN", AccessTokenSource: "env"}, false},
+		{"both sources", bookSettings{Enabled: true, Symbol: "005930", AccessTokenEnv: "KIS_ACCESS_TOKEN", AccessTokenSource: "redis"}, true},
+		{"env source without env", bookSettings{Enabled: true, Symbol: "005930", AccessTokenSource: "env"}, true},
+		{"invalid source", bookSettings{Enabled: true, Symbol: "005930", AccessTokenEnv: "KIS_ACCESS_TOKEN", AccessTokenSource: "file"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := validStaticConfig()
