@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -102,6 +103,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 	var cfg runtimeConfig
 	if err := toml.Unmarshal(contents, &cfg.fileConfig); err != nil {
 		return runtimeConfig{}, errors.New("config: invalid TOML")
+	}
+	if err := validateGatewaydTableKeys(contents); err != nil {
+		return runtimeConfig{}, err
 	}
 	if strings.TrimSpace(cfg.KIS.Venue) == "" {
 		cfg.KIS.Venue = "krx"
@@ -246,6 +250,40 @@ func (cfg runtimeConfig) validateStatic() error {
 		if envSet == (source == "redis") {
 			return errors.New("config: books requires exactly one of access_token_env or access_token_source = \"redis\"")
 		}
+	}
+	return nil
+}
+
+// validateGatewaydTableKeys strict-decodes [kis.gatewayd] like the quotes,
+// recording and reconcile tables: the file-wide unmarshal ignores unknown
+// fields, so a misspelled key such as tokn_env would otherwise be dropped
+// silently and the ensure call would go out without its credential header.
+func validateGatewaydTableKeys(contents []byte) error {
+	var document map[string]any
+	if err := toml.Unmarshal(contents, &document); err != nil {
+		return nil // the file-wide decode above already reported the syntax error
+	}
+	kisTable, ok := document["kis"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawTable, present := kisTable["gatewayd"]
+	if !present {
+		return nil
+	}
+	table, ok := rawTable.(map[string]any)
+	if !ok {
+		return errors.New("config: invalid KIS gatewayd table")
+	}
+	encoded, err := toml.Marshal(table)
+	if err != nil {
+		return errors.New("config: invalid KIS gatewayd table")
+	}
+	var g gatewaydSettings
+	decoder := toml.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&g); err != nil {
+		return errors.New("config: invalid or unknown KIS gatewayd key")
 	}
 	return nil
 }

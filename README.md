@@ -121,8 +121,9 @@ never produces a usable key is a typed
 requires a different published key. The ensure POST has a 5s budget with a 3s
 connect bound, honors no proxy environment, and follows no redirects. An
 optional `token_env`/`token_header` pair sends a credential on that POST only;
-the value never appears in logs or errors. The `[kis.gatewayd]` table is
-required (valid `url`) only in this mode and ignored otherwise.
+the value never appears in logs or errors. The `[kis.gatewayd]` table needs a
+valid `url` only in this mode and its settings apply only in this mode, but
+unknown keys in the table always reject the config.
 
 Configuration errors, including missing KIS credentials and invalid settings,
 exit 78 and the example systemd unit prevents restart for that code. Session

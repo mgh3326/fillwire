@@ -236,6 +236,50 @@ func TestGatewaydFailedEnsureReusesStillLiveKey(t *testing.T) {
 	}
 }
 
+func TestGatewaydInMarginKeyRequiresMarginFreshPublish(t *testing.T) {
+	mini, client := testutil.Redis(t)
+	// A live key inside the refresh margin triggers a non-forced ensure; an
+	// acknowledgement that leaves this record untouched must not pass as a
+	// refresh — the poll requires a margin-fresh key.
+	mini.Set("kis:websocket:approval_key", "in-margin-key")
+	mini.SetTTL("kis:websocket:approval_key", 30*time.Minute)
+	ensurer := &fakeEnsurer{} // acknowledges but publishes nothing
+	p, err := NewApprovalProviderGatewayd(client, ensurer, "live", DefaultRefreshMargin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	p.now = func() time.Time { return now }
+	p.wait = func(_ context.Context, d time.Duration) error {
+		now = now.Add(d)
+		return nil
+	}
+	alerted := make(chan struct{}, 1)
+	p.SetTransientAlert(func() {
+		select {
+		case alerted <- struct{}{}:
+		default:
+		}
+	})
+	key, err := p.ApprovalKey(context.Background())
+	if err != nil || key != "in-margin-key" {
+		t.Fatalf("in-margin key with unpublished ensure = %q, %v, want recoverable reuse", key, err)
+	}
+	select {
+	case <-alerted:
+	default:
+		t.Fatal("recoverable ensure failure did not alert")
+	}
+	providers, forces := ensurer.calls()
+	if len(providers) != 1 || providers[0] != "kis-live-approval" || forces[0] {
+		t.Fatalf("ensure calls = %v forces=%v, want one non-forced kis-live-approval", providers, forces)
+	}
+	// The ensure itself reports the typed bounded error, not a false success.
+	if _, err := p.ensureGatewayd(context.Background(), false, ""); !errors.Is(err, ErrGatewaydApprovalUnavailable) {
+		t.Fatalf("unpublished non-forced ensure = %v, want ErrGatewaydApprovalUnavailable", err)
+	}
+}
+
 func TestGatewaydForcedReissueNeverReturnsRejectedKey(t *testing.T) {
 	mini, client := testutil.Redis(t)
 	mini.Set("kis:websocket:approval_key", "rejected-key")

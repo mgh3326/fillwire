@@ -21,7 +21,8 @@ dup_track_max = 10000
 # from Redis, polling briefly. The HTTP call is only an acknowledgement;
 # Redis stays authoritative. The token below is sent as the named header on
 # that POST only and is never logged. Unknown keys in this table reject the
-# config; the table is ignored when approval_mode is not "gatewayd".
+# config; url/token_env/token_header take effect only when approval_mode is
+# "gatewayd".
 [kis.gatewayd]
 url = "http://gatewayd.example.invalid:8791"
 token_env = "GATEWAYD_TOKEN"        # optional; unset means no auth header

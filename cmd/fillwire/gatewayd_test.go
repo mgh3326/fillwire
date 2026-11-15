@@ -83,6 +83,29 @@ func TestGatewaydConfigLoadResolvesTokenEnv(t *testing.T) {
 	}
 }
 
+func TestGatewaydConfigRejectsUnknownTableKey(t *testing.T) {
+	t.Setenv("KIS_APP_KEY", "fixture-app")
+	t.Setenv("KIS_APP_SECRET", "fixture-secret")
+	t.Setenv("EXECUTION_LEDGER_INGEST_TOKEN", "fixture-ingest")
+	t.Setenv("GATEWAYD_TOKEN", "synthetic-gatewayd-token")
+	raw, err := os.ReadFile("../../fillwire.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := strings.Replace(string(raw), `approval_mode = ""`, `approval_mode = "gatewayd"`, 1)
+	mutated = strings.Replace(mutated, `token_header = "Authorization"`, "token_header = \"Authorization\"\ntokne_env = \"TYPO\"", 1)
+	if !strings.Contains(mutated, "tokne_env") {
+		t.Fatal("fixture replacement failed")
+	}
+	path := t.TempDir() + "/fillwire.toml"
+	if err := os.WriteFile(path, []byte(mutated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "gatewayd") {
+		t.Fatalf("unknown gatewayd key error = %v", err)
+	}
+}
+
 // blockingDialer parks inside the websocket dial until shutdown so a run test
 // can observe the approval path without a real KIS connection.
 type blockingDialer struct{}

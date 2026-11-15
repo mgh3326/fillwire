@@ -287,8 +287,10 @@ func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
 func (p *ApprovalProvider) present(key string) { p.mu.Lock(); p.lastKey = key; p.mu.Unlock() }
 
 // ensureGatewayd asks gatewayd to ensure the account mode's approval provider,
-// then polls the shared cache for a live key different from rejected. It never
-// issues locally and never touches the issuance lock.
+// then polls the shared cache for proof of publication. A forced reissue needs
+// any live key different from the rejected one; a non-forced ensure must
+// observe a margin-fresh key, so an acknowledgement that leaves the
+// near-expiry record untouched cannot pass as a refresh.
 func (p *ApprovalProvider) ensureGatewayd(ctx context.Context, force bool, rejected string) (string, error) {
 	provider := "kis-live-approval"
 	if p.accountMode == "mock" {
@@ -305,7 +307,11 @@ func (p *ApprovalProvider) ensureGatewayd(ctx context.Context, force bool, rejec
 		if err != nil {
 			return p.fail(err)
 		}
-		if live(key, ttl) && key != rejected {
+		published := live(key, ttl) && key != rejected
+		if !force {
+			published = usable(key, ttl, p.margin)
+		}
+		if published {
 			p.noteLive(ttl)
 			return key, nil
 		}
