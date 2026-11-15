@@ -261,11 +261,19 @@ func (p *ApprovalProvider) Reissue(ctx context.Context) (string, error) {
 		return "", ErrCacheOnlyApprovalUnavailable
 	}
 	if p.mode == ApprovalModeGatewayd {
-		// Snapshot the pre-ensure cache value so the bounded poll cannot
-		// return the key KIS just rejected (auto_trader force parity).
-		rejected, _, err := p.cached(ctx)
-		if err != nil {
-			return p.terminal(err)
+		// Exclude the key this process last presented — the one KIS rejected —
+		// matching the self-mode lastKey guard, so a valid replacement gatewayd
+		// already published is accepted instead of timing out. With nothing
+		// presented, fall back to the currently cached value.
+		p.mu.Lock()
+		rejected := p.lastKey
+		p.mu.Unlock()
+		if rejected == "" {
+			var err error
+			rejected, _, err = p.cached(ctx)
+			if err != nil {
+				return p.terminal(err)
+			}
 		}
 		key, err := p.ensureGatewayd(ctx, true, rejected)
 		if err != nil {

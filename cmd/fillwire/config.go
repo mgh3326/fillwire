@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -192,12 +193,19 @@ func (cfg runtimeConfig) validateStatic() error {
 		return errors.New("config: unsupported KIS approval_mode")
 	}
 	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd {
-		if _, err := reader.NormalizeGatewaydURL(cfg.KIS.Gatewayd.URL); err != nil {
+		normalized, err := reader.NormalizeGatewaydURL(cfg.KIS.Gatewayd.URL)
+		if err != nil {
 			return errors.New("config: invalid KIS gatewayd url")
 		}
 		if strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) != "" {
 			if err := sink.ValidateIngestTokenHeader(cfg.KIS.Gatewayd.TokenHeader); err != nil {
 				return errors.New("config: invalid KIS gatewayd token_header")
+			}
+			// The token travels as a header on every ensure POST; over plain
+			// http to a remote host it would be sent in cleartext.
+			parsed, _ := url.Parse(normalized)
+			if parsed.Scheme != "https" && !netpolicy.IsLoopbackHost(parsed.Hostname()) {
+				return errors.New("config: KIS gatewayd credential requires https or a loopback url")
 			}
 		}
 	}

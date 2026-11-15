@@ -30,6 +30,10 @@ func TestGatewaydApprovalModeValidation(t *testing.T) {
 	}{
 		{"gatewayd with url", "gatewayd", "http://127.0.0.1:8791", "", "", false},
 		{"gatewayd with auth", "gatewayd", "http://127.0.0.1:8791", "GATEWAYD_TEST_TOKEN", "Authorization", false},
+		{"gatewayd credential http remote", "gatewayd", "http://gatewayd.example.invalid:8791", "GATEWAYD_TEST_TOKEN", "Authorization", true},
+		{"gatewayd credential http localhost", "gatewayd", "http://localhost:8791", "GATEWAYD_TEST_TOKEN", "Authorization", false},
+		{"gatewayd credential https remote", "gatewayd", "https://gatewayd.example.invalid:8791", "GATEWAYD_TEST_TOKEN", "Authorization", false},
+		{"gatewayd no credential http remote", "gatewayd", "http://gatewayd.example.invalid:8791", "", "", false},
 		{"gatewayd missing url", "gatewayd", "", "", "", true},
 		{"gatewayd bad scheme", "gatewayd", "ftp://127.0.0.1:8791", "", "", true},
 		{"gatewayd url with query", "gatewayd", "http://127.0.0.1:8791?x=1", "", "", true},

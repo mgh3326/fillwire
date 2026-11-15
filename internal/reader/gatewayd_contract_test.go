@@ -293,6 +293,8 @@ func TestGatewaydForcedReissueNeverReturnsRejectedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The rejected key is the one this process last presented, as in self mode.
+	p.present("rejected-key")
 	p.wait = func(_ context.Context, d time.Duration) error {
 		waits++
 		if waits == 3 {
@@ -314,6 +316,37 @@ func TestGatewaydForcedReissueNeverReturnsRejectedKey(t *testing.T) {
 	}
 	if mini.Exists("kis:websocket:approval_key:lock") {
 		t.Fatal("forced reissue created the issuance lock")
+	}
+}
+
+func TestGatewaydForcedReissueAcceptsAlreadyPublishedKey(t *testing.T) {
+	mini, client := testutil.Redis(t)
+	// KIS rejected the presented key, but gatewayd already replaced the cache
+	// entry with a different valid key before Reissue ran. The poll must
+	// accept it instead of waiting for a third key and timing out.
+	mini.Set("kis:websocket:approval_key", "already-valid")
+	mini.SetTTL("kis:websocket:approval_key", ApprovalCacheTTL)
+	ensurer := &fakeEnsurer{}
+	p, err := NewApprovalProviderGatewayd(client, ensurer, "live", DefaultRefreshMargin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.present("rejected-key")
+	var waits int
+	p.wait = func(_ context.Context, d time.Duration) error {
+		waits++
+		return nil
+	}
+	key, err := p.Reissue(context.Background())
+	if err != nil || key != "already-valid" {
+		t.Fatalf("forced reissue with published replacement = %q, %v", key, err)
+	}
+	if waits != 0 {
+		t.Fatalf("reissue polled %d times despite an acceptable published key", waits)
+	}
+	providers, forces := ensurer.calls()
+	if len(providers) != 1 || providers[0] != "kis-live-approval" || !forces[0] {
+		t.Fatalf("reissue ensure = %v forces=%v, want one forced kis-live-approval", providers, forces)
 	}
 }
 
