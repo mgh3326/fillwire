@@ -9,6 +9,11 @@ approval_mode = "" # "" (default): Redis single-flight issue and refresh; "cache
 approval_refresh_margin = "1h"
 venue = "krx"
 hts_id = "EXAMPLE_HTS_ID"
+# KIS app credentials are required only when approval_mode = "" (fillwire
+# issues approval keys itself) or [books] enabled = true (the book producer
+# sends them on REST reads). With "cache-only" or "gatewayd" and books off
+# the names may be omitted; a configured name whose variable is unset is not
+# an error and the value is never read.
 app_key_env = "KIS_APP_KEY"
 app_secret_env = "KIS_APP_SECRET"
 event_buffer = 256

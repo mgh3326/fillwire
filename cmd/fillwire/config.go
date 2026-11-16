@@ -160,11 +160,13 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if cfg.ingestToken, ok = os.LookupEnv(cfg.Ingest.TokenEnv); !ok || cfg.ingestToken == "" {
 		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.Ingest.TokenEnv)
 	}
-	if cfg.appKey, ok = os.LookupEnv(cfg.KIS.AppKeyEnv); !ok || cfg.appKey == "" {
-		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppKeyEnv)
-	}
-	if cfg.appSecret, ok = os.LookupEnv(cfg.KIS.AppSecretEnv); !ok || cfg.appSecret == "" {
-		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
+	if cfg.kisCredentialsRequired() {
+		if cfg.appKey, ok = os.LookupEnv(cfg.KIS.AppKeyEnv); !ok || cfg.appKey == "" {
+			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppKeyEnv)
+		}
+		if cfg.appSecret, ok = os.LookupEnv(cfg.KIS.AppSecretEnv); !ok || cfg.appSecret == "" {
+			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
+		}
 	}
 	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd && strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) != "" {
 		if cfg.gatewaydToken, ok = os.LookupEnv(cfg.KIS.Gatewayd.TokenEnv); !ok || cfg.gatewaydToken == "" {
@@ -183,6 +185,16 @@ func loadConfig(path string) (runtimeConfig, error) {
 		return runtimeConfig{}, err
 	}
 	return cfg, nil
+}
+
+// kisCredentialsRequired reports whether an enabled lane reads the KIS app
+// key and secret: approval_mode "" issues approval keys through the KIS REST
+// client, and the books lane sends both on REST reads and derives the mock
+// token-cache key from the app key. cache-only and gatewayd never issue, so
+// with books off neither credential is needed; configured names are then
+// optional and their values are never read.
+func (cfg runtimeConfig) kisCredentialsRequired() bool {
+	return cfg.KIS.ApprovalMode == "" || cfg.Books.Enabled
 }
 
 func (cfg runtimeConfig) validateStatic() error {
@@ -218,8 +230,13 @@ func (cfg runtimeConfig) validateStatic() error {
 	if strings.TrimSpace(cfg.KIS.Venue) == "" || strings.TrimSpace(cfg.KIS.HTSID) == "" {
 		return errors.New("config: venue and HTS ID are required")
 	}
-	if strings.TrimSpace(cfg.KIS.AppKeyEnv) == "" || strings.TrimSpace(cfg.KIS.AppSecretEnv) == "" {
-		return errors.New("config: KIS credential environment names are required")
+	if cfg.kisCredentialsRequired() {
+		if strings.TrimSpace(cfg.KIS.AppKeyEnv) == "" {
+			return errors.New("config: KIS app_key_env is required")
+		}
+		if strings.TrimSpace(cfg.KIS.AppSecretEnv) == "" {
+			return errors.New("config: KIS app_secret_env is required")
+		}
 	}
 	if cfg.KIS.EventBuffer <= 0 || cfg.KIS.DupTrackMax <= 0 || cfg.Channel.Buffer <= 0 {
 		return errors.New("config: buffer and duplicate tracking limits must be positive")

@@ -259,6 +259,53 @@ func TestCacheOnlyRunFailsClosedForCacheFailures(t *testing.T) {
 	}
 }
 
+// TestCacheOnlyRunWithoutKISCredentials proves cache-only never constructs
+// the KIS issuing client: with empty credentials the run reaches the
+// shared-cache check and reports the cache miss, not a client build failure.
+func TestCacheOnlyRunWithoutKISCredentials(t *testing.T) {
+	mainRedis := miniredis.RunT(t)
+	approvalRedis := miniredis.RunT(t)
+	approvalClient := redis.NewClient(&redis.Options{Addr: approvalRedis.Addr()})
+	t.Cleanup(func() { _ = approvalClient.Close() })
+	ingest := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(ingest.Close)
+
+	cfg := cacheOnlyRuntimeConfig(mainRedis.Addr(), ingest.URL)
+	cfg.appKey = ""
+	cfg.appSecret = ""
+	err := runWithDependencies(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), runDependencies{
+		approvalRedis: approvalClient,
+		dialer:        &countingDialer{},
+	})
+	if !errors.Is(err, fillreader.ErrCacheOnlyApprovalUnavailable) {
+		t.Fatalf("run error = %v, want %v", err, fillreader.ErrCacheOnlyApprovalUnavailable)
+	}
+}
+
+// TestSelfModeBuildsIssuingClient proves approval_mode "" still constructs
+// the KIS issuing client: empty credentials fail at client construction
+// before the approval provider exists.
+func TestSelfModeBuildsIssuingClient(t *testing.T) {
+	mainRedis := miniredis.RunT(t)
+	approvalRedis := miniredis.RunT(t)
+	approvalClient := redis.NewClient(&redis.Options{Addr: approvalRedis.Addr()})
+	t.Cleanup(func() { _ = approvalClient.Close() })
+	ingest := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(ingest.Close)
+
+	cfg := cacheOnlyRuntimeConfig(mainRedis.Addr(), ingest.URL)
+	cfg.KIS.ApprovalMode = ""
+	cfg.appKey = ""
+	cfg.appSecret = ""
+	err := runWithDependencies(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), runDependencies{
+		approvalRedis: approvalClient,
+		dialer:        &countingDialer{},
+	})
+	if !errors.Is(err, fillreader.ErrApprovalConfig) || !strings.Contains(err.Error(), "KIS REST client") {
+		t.Fatalf("run error = %v, want KIS REST client approval config", err)
+	}
+}
+
 func TestCacheOnlyMissMainProcessExit78(t *testing.T) {
 	if os.Getenv("FILLWIRE_CACHE_ONLY_EXIT_CHILD") == "1" {
 		flag.CommandLine = flag.NewFlagSet("fillwire", flag.ExitOnError)
@@ -569,6 +616,139 @@ func TestBooksSettingsFailAtConfigLoad(t *testing.T) {
 			cfg.Books = tc.books
 			if err := cfg.validateStatic(); (err != nil) != tc.wantFail {
 				t.Fatalf("validateStatic() error = %v, wantFail %t", err, tc.wantFail)
+			}
+		})
+	}
+}
+
+// requireUnsetEnv removes name for the rest of the test and restores its
+// prior state on cleanup, so a case can model an environment that never
+// defined the variable.
+func requireUnsetEnv(t *testing.T, name string) {
+	t.Helper()
+	old, present := os.LookupEnv(name)
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if present {
+			_ = os.Setenv(name, old)
+		} else {
+			_ = os.Unsetenv(name)
+		}
+	})
+}
+
+type credPresence int
+
+const (
+	credAbsent credPresence = iota
+	credEmpty
+	credSet
+)
+
+// TestKISAppCredentialEnvRequirement maps approval_mode x books to the KIS
+// app credential contract: the names and values are required exactly when an
+// enabled lane uses them ("" self-issue, or books), and never read otherwise.
+func TestKISAppCredentialEnvRequirement(t *testing.T) {
+	const (
+		appKeyEnv      = "FILLWIRE_CRED_APP_KEY"
+		appSecretEnv   = "FILLWIRE_CRED_APP_SECRET"
+		appKeyValue    = "synthetic-cred-app-key"
+		appSecretValue = "synthetic-cred-app-secret"
+		ingestEnv      = "FILLWIRE_CRED_INGEST_TOKEN"
+		booksEnv       = "FILLWIRE_CRED_BOOKS_TOKEN"
+	)
+	t.Setenv(ingestEnv, "fixture-ingest")
+	booksTable := "[books]\nenabled = true\nsymbol = \"005930\"\naccess_token_env = \"" + booksEnv + "\"\n"
+	configFor := func(mode string, keyName, secretName, books bool) string {
+		var text strings.Builder
+		text.WriteString("[kis]\nbroker = \"kis\"\nendpoint = \"mock\"\naccount_mode = \"mock\"\n")
+		if mode != "" {
+			fmt.Fprintf(&text, "approval_mode = %q\n", mode)
+		}
+		text.WriteString("venue = \"krx\"\nhts_id = \"EXAMPLE_HTS_ID\"\nevent_buffer = 1\ndup_track_max = 1\n")
+		if keyName {
+			fmt.Fprintf(&text, "app_key_env = %q\n", appKeyEnv)
+		}
+		if secretName {
+			fmt.Fprintf(&text, "app_secret_env = %q\n", appSecretEnv)
+		}
+		if mode == "gatewayd" {
+			text.WriteString("[kis.gatewayd]\nurl = \"http://127.0.0.1:8791\"\n")
+		}
+		text.WriteString("[redis]\nurl = \"redis://127.0.0.1:6379/0\"\n\n" +
+			"[stream]\nkey = \"fills:test\"\nmax_len = 10\nconsumer_group = \"fillwire-test\"\nconsumer_name = \"consumer\"\nclaim_min_idle = \"0s\"\nread_block = \"1ms\"\n\n" +
+			"[ingest]\nurl = \"http://127.0.0.1:8080/ingest\"\ntoken_env = \"" + ingestEnv + "\"\nbatch_size = 1\ntimeout = \"100ms\"\n\n" +
+			"[channel]\nbuffer = 1\n\n" +
+			"[retry]\nmin = \"1ms\"\nmax = \"5ms\"\nfactor = 2\n")
+		if books {
+			text.WriteString("\n" + booksTable)
+		}
+		return text.String()
+	}
+	setCred := func(t *testing.T, name string, state credPresence) {
+		t.Helper()
+		switch state {
+		case credSet:
+			t.Setenv(name, map[string]string{appKeyEnv: appKeyValue, appSecretEnv: appSecretValue}[name])
+		case credEmpty:
+			t.Setenv(name, "")
+		case credAbsent:
+			requireUnsetEnv(t, name)
+		}
+	}
+	for _, tc := range []struct {
+		name                string
+		mode                string
+		books               bool
+		keyName, secretName bool
+		key, secret         credPresence
+		wantErr             string
+		wantRead            bool
+	}{
+		{"self books off missing key", "", false, true, true, credAbsent, credAbsent, appKeyEnv, false},
+		{"self books off missing secret", "", false, true, true, credSet, credAbsent, appSecretEnv, false},
+		{"self books off empty secret", "", false, true, true, credSet, credEmpty, appSecretEnv, false},
+		{"self books off no names", "", false, false, false, credAbsent, credAbsent, "app_key_env", false},
+		{"self books off key name only", "", false, true, false, credSet, credAbsent, "app_secret_env", false},
+		{"self books off loads", "", false, true, true, credSet, credSet, "", true},
+		{"self books on missing creds", "", true, true, true, credAbsent, credAbsent, appKeyEnv, false},
+		{"self books on loads", "", true, true, true, credSet, credSet, "", true},
+		{"cache-only books off no names", "cache-only", false, false, false, credAbsent, credAbsent, "", false},
+		{"cache-only books off names no values", "cache-only", false, true, true, credAbsent, credAbsent, "", false},
+		{"cache-only books off values unread", "cache-only", false, true, true, credSet, credSet, "", false},
+		{"cache-only books on missing creds", "cache-only", true, true, true, credAbsent, credAbsent, appKeyEnv, false},
+		{"cache-only books on loads", "cache-only", true, true, true, credSet, credSet, "", true},
+		{"gatewayd books off no names", "gatewayd", false, false, false, credAbsent, credAbsent, "", false},
+		{"gatewayd books off values unread", "gatewayd", false, true, true, credSet, credSet, "", false},
+		{"gatewayd books on missing creds", "gatewayd", true, true, true, credAbsent, credAbsent, appKeyEnv, false},
+		{"gatewayd books on loads", "gatewayd", true, true, true, credSet, credSet, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setCred(t, appKeyEnv, tc.key)
+			setCred(t, appSecretEnv, tc.secret)
+			cfg, err := loadConfig(writeTemp(t, "fillwire.toml", configFor(tc.mode, tc.keyName, tc.secretName, tc.books)))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("loadConfig error = %v, want one naming %q", err, tc.wantErr)
+				}
+				for _, secret := range []string{appKeyValue, appSecretValue} {
+					if strings.Contains(err.Error(), secret) {
+						t.Fatalf("config error leaked a credential value: %v", err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig = %v", err)
+			}
+			wantKey, wantSecret := "", ""
+			if tc.wantRead {
+				wantKey, wantSecret = appKeyValue, appSecretValue
+			}
+			if cfg.appKey != wantKey || cfg.appSecret != wantSecret {
+				t.Fatalf("appKey/appSecret set = %t/%t, wantRead = %t", cfg.appKey != "", cfg.appSecret != "", tc.wantRead)
 			}
 		})
 	}
