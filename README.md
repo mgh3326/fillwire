@@ -80,6 +80,14 @@ factor = 2
 rate_limit = "10m"
 ```
 
+The KIS `app_key_env`/`app_secret_env` pair is required only when
+`approval_mode = ""` — fillwire then issues approval keys through the KIS REST
+client — or when `[books] enabled = true`, whose REST reader sends both and
+whose mock token-cache key derives from the app key. With
+`approval_mode = "cache-only"` or `"gatewayd"` and books off, the names may be
+omitted; a configured name whose variable is unset is not an error and the
+value is never read.
+
 The default approval policy shares the Python at-kis-ws Redis approval contract. The
 reference is auto_trader origin/main commit be0839808b35b7fcd4bbeb326ac0a84daf7ad96a,
 files app/services/kis_websocket_internal/approval_keys.py and constants.py.

@@ -18,7 +18,9 @@ access_token_env = "KIS_MOCK_ACCESS_TOKEN"
 
 Default: disabled. One symbol per producer instance. Use the same symbol as the
 approved execution intent. The existing KIS `app_key_env` and `app_secret_env`
-settings name the credential environment variables. Exactly one access-token
+settings name the credential environment variables; with books enabled both are
+required in every `approval_mode` — the REST reader sends them and the mock
+token-cache key derives from the app key. Exactly one access-token
 source is required:
 
 - `access_token_env` names an environment variable read on each REST read, or

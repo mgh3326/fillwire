@@ -93,6 +93,14 @@ type runDependencies struct {
 type kisApprovalIssuer struct{ client *kis.Client }
 type approvalFallbackIssuer struct{ provider ws.ApprovalKeyProvider }
 
+// cacheOnlyIssuer satisfies the ApprovalProvider contract for cache-only
+// mode, which requires a non-nil issuer it never calls.
+type cacheOnlyIssuer struct{}
+
+func (cacheOnlyIssuer) Issue(context.Context) (string, error) {
+	return "", reader.ErrApprovalUnavailable
+}
+
 func (i approvalFallbackIssuer) Issue(ctx context.Context) (string, error) {
 	return i.provider.Reissue(ctx)
 }
@@ -119,22 +127,31 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		approvalRedis = redisClient
 	}
 
-	kisHost := kis.HostLive
-	if cfg.KIS.Endpoint == "mock" {
-		kisHost = kis.HostVTS
+	// Only approval_mode "" issues approval keys, through the KIS REST
+	// client; cache-only reads the shared cache and gatewayd delegates to
+	// the ensure endpoint, so neither constructs an issuing client.
+	var issuer reader.ApprovalIssuer
+	if cfg.KIS.ApprovalMode == "" {
+		kisHost := kis.HostLive
+		if cfg.KIS.Endpoint == "mock" {
+			kisHost = kis.HostVTS
+		}
+		kisClient, err := kis.NewClient(kis.Config{
+			Host:           kisHost,
+			AppKey:         cfg.appKey,
+			AppSecret:      cfg.appSecret,
+			RequestTimeout: reader.ApprovalIssueTimeout,
+		})
+		if err != nil {
+			return fmt.Errorf("%w: KIS REST client", reader.ErrApprovalConfig)
+		}
+		issuer = kisApprovalIssuer{client: kisClient}
 	}
-	kisClient, err := kis.NewClient(kis.Config{
-		Host:           kisHost,
-		AppKey:         cfg.appKey,
-		AppSecret:      cfg.appSecret,
-		RequestTimeout: reader.ApprovalIssueTimeout,
-	})
-	if err != nil {
-		return fmt.Errorf("%w: KIS REST client", reader.ErrApprovalConfig)
-	}
-	var issuer reader.ApprovalIssuer = kisApprovalIssuer{client: kisClient}
 	if dependencies.approvalFallback != nil {
 		issuer = approvalFallbackIssuer{dependencies.approvalFallback}
+	}
+	if issuer == nil && cfg.KIS.ApprovalMode == reader.ApprovalModeCacheOnly {
+		issuer = cacheOnlyIssuer{}
 	}
 	margin := cfg.refreshMargin
 	if margin == 0 {

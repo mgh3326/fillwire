@@ -145,6 +145,9 @@ func TestGatewaydRunNeverCallsLocalIssuer(t *testing.T) {
 	cfg.KIS.Gatewayd.URL = gatewayd.URL
 	cfg.KIS.Gatewayd.TokenHeader = "Authorization"
 	cfg.gatewaydToken = "synthetic-gatewayd-token"
+	// gatewayd never builds the KIS issuing client, so no app credentials.
+	cfg.appKey = ""
+	cfg.appSecret = ""
 
 	fallback := &runApprovalFallback{}
 	ctx, cancel := context.WithCancel(context.Background())
