@@ -17,8 +17,7 @@ package upbit
 // https://docs.upbit.com/kr/docs/krw-market-info ("호가 표시 단위").
 //
 // | price range (KRW)            | tick (KRW) |
-// | 100 ~ 500                    | 1          |
-// | 500 ~ 1,000                  | 5          |
+// | 100 ~ 1,000                  | 1          |
 // | 1,000 ~ 5,000                | 1          |
 // | 5,000 ~ 10,000               | 5          |
 // | 10,000 ~ 50,000              | 10         |
@@ -35,8 +34,6 @@ package upbit
 // order value must also be at least 5,000 KRW (same guide, "최소 주문 가능
 // 금액").
 var krwBands = []struct{ below, tick int64 }{
-	{500, 1},
-	{1_000, 5},
 	{5_000, 1},
 	{10_000, 5},
 	{50_000, 10},

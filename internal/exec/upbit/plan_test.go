@@ -278,7 +278,17 @@ func TestPlanRefusesAFillThatIsNotOne(t *testing.T) {
 	for _, f := range []struct {
 		q     Qty
 		price int64
-	}{{Qty{}, 3_000}, {Qty{units: -1}, 3_000}, {Qty{units: 1}, 0}, {Qty{units: 1}, 99}} {
+	}{
+		{Qty{}, 3_000},
+		{Qty{units: -1}, 3_000},
+		{Qty{units: 1}, 0},
+		{Qty{units: 1}, 99},
+		// Outside the model's bounds: the intent never produces these, and a
+		// fill must not wrap the notional it accumulates.
+		{Qty{units: maxIntentUnits + 1}, 3_000},
+		{Qty{units: 1}, maxLimitPriceKRW + 1},
+		{Qty{units: 1 << 40}, maxLimitPriceKRW},
+	} {
 		if err := p.Fill(f.q, f.price); err == nil {
 			t.Errorf("Fill(%q, %d) accepted", f.q, f.price)
 		}

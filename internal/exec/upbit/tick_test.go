@@ -16,8 +16,8 @@ func TestTickAtMatchesUpbitKRWTable(t *testing.T) {
 		{99, 0}, // sub-won ticks; outside the whole-won grid
 		{100, 1},
 		{499, 1},
-		{500, 5},
-		{999, 5},
+		{500, 1},
+		{999, 1},
 		{1_000, 1},
 		{4_999, 1},
 		{5_000, 5},
@@ -38,6 +38,25 @@ func TestTickAtMatchesUpbitKRWTable(t *testing.T) {
 	for _, c := range cases {
 		if got := TickAt(c.price); got != c.tick {
 			t.Errorf("TickAt(%d) = %d, want %d", c.price, got, c.tick)
+		}
+	}
+}
+
+// The whole 100~1,000 KRW row of the guide carries tick 1: a price in it is
+// already on the grid, so a buy's taker price is the ask itself and an intent
+// limit such as 501 must be accepted.
+func TestLowPriceBandUsesTickOne(t *testing.T) {
+	for p := int64(100); p < 1_000; p++ {
+		if got := TickAt(p); got != 1 {
+			t.Fatalf("TickAt(%d) = %d, want 1", p, got)
+		}
+		if got := Ceil(p); got != p {
+			t.Fatalf("Ceil(%d) = %d, want the price unchanged", p, got)
+		}
+	}
+	for _, p := range []int64{100, 250, 499, 500, 501, 750, 999} {
+		if got := Floor(p); got != p {
+			t.Fatalf("Floor(%d) = %d, want the price unchanged", p, got)
 		}
 	}
 }
@@ -63,6 +82,8 @@ func TestFloorAndCeilStayOnTheVenueGrid(t *testing.T) {
 		{99, 0, 0},
 		{499, 499, 499},
 		{500, 500, 500},
+		{501, 501, 501},
+		{999, 999, 999},
 		{5_002, 5_000, 5_005},
 		{9_999, 9_995, 10_000},
 		{49_999, 49_990, 50_000},
