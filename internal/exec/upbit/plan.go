@@ -3,7 +3,6 @@ package upbit
 import (
 	"errors"
 	"fmt"
-	"math/bits"
 	"strconv"
 	"time"
 )
@@ -124,18 +123,19 @@ func (p *Plan) Fill(q Qty, price int64) error {
 	if q.IsNegative() || q.IsZero() || price < minPriceKRW || TickAt(price) == 0 {
 		return fmt.Errorf("%w: fill %q at %d", ErrPlan, q, price)
 	}
-	// notionalKRW and the sum below are overflow-free only inside the model's
-	// validated bounds. A fill is evidence from outside, so bound it here
-	// rather than trust the caller.
+	// A fill is evidence from outside, so bound it to the model's validated
+	// range rather than trust the caller. Inside that range notionalKRW's
+	// split multiply cannot overflow; price 1e10 and units 1e14 give at most
+	// 1e18 KRW, and the sums below are checked explicitly.
 	if q.units > maxIntentUnits || price > maxLimitPriceKRW {
 		return fmt.Errorf("%w: fill %q at %d is outside the model's bounds", ErrPlan, q, price)
-	}
-	if hi, _ := bits.Mul64(uint64(q.units), uint64(price)); hi != 0 {
-		return fmt.Errorf("%w: fill notional overflow", ErrPlan)
 	}
 	n := notionalKRW(q, price)
 	if p.filledNotionalKRW > (1<<63-1)-n {
 		return fmt.Errorf("%w: fill notional overflow", ErrPlan)
+	}
+	if p.filled.units > (1<<63-1)-q.units {
+		return fmt.Errorf("%w: fill quantity overflow", ErrPlan)
 	}
 	p.filled = p.filled.Add(q)
 	p.filledNotionalKRW += n

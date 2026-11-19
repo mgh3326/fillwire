@@ -188,6 +188,38 @@ func TestPlanRefusesStaleAndFutureBooks(t *testing.T) {
 	}
 }
 
+// A fill inside the model's bounds is recorded even when units*price alone
+// would exceed 2^64: the notional is units*price/1e8, and 30 units at 1e10 KRW
+// is 3e11 KRW.
+func TestFillRecordsALargeValueInsideItsBounds(t *testing.T) {
+	p, err := NewPlan(testIntent(t, nil), DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Fill(Qty{units: 3_000_000_000}, maxLimitPriceKRW); err != nil {
+		t.Fatalf("within-bounds fill refused: %v", err)
+	}
+	if p.filledNotionalKRW != 300_000_000_000 {
+		t.Fatalf("notional = %d, want 300000000000", p.filledNotionalKRW)
+	}
+}
+
+// The quantity accumulator wraps only after ~92,000 maximum-size fills, so the
+// test starts the accumulator one unit from the int64 limit.
+func TestFillGuardsTheCumulativeQuantity(t *testing.T) {
+	p, err := NewPlan(testIntent(t, nil), DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.filled = Qty{units: 1<<63 - 1}
+	if err := p.Fill(Qty{units: 10}, 3_000); err == nil {
+		t.Fatal("a fill that overflows the accumulated quantity was accepted")
+	}
+	if p.filled.units != 1<<63-1 {
+		t.Fatalf("filled changed to %d after a refused fill", p.filled.units)
+	}
+}
+
 func TestPlanExpiryCancelsThenFinishes(t *testing.T) {
 	p, err := NewPlan(testIntent(t, nil), DefaultConfig())
 	if err != nil {
@@ -287,7 +319,6 @@ func TestPlanRefusesAFillThatIsNotOne(t *testing.T) {
 		// fill must not wrap the notional it accumulates.
 		{Qty{units: maxIntentUnits + 1}, 3_000},
 		{Qty{units: 1}, maxLimitPriceKRW + 1},
-		{Qty{units: 1 << 40}, maxLimitPriceKRW},
 	} {
 		if err := p.Fill(f.q, f.price); err == nil {
 			t.Errorf("Fill(%q, %d) accepted", f.q, f.price)
