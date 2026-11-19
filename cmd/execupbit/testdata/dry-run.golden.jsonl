@@ -1,0 +1,12 @@
+{"kind":"book","market":"KRW-XRP","received_at":"2026-11-19T09:00:00Z","exchange_timestamp_ms":1795078800000,"bid_price_krw":2997,"ask_price_krw":2998,"bid_qty":"310.25","ask_qty":"250.5","decision":"submit","reason":"open"}
+{"kind":"child","action":"submit","intent_id":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d","idempotency_key":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d:1","quantity":"33","limit_price_krw":2998}
+{"kind":"book","market":"KRW-XRP","received_at":"2026-11-19T09:00:00.5Z","exchange_timestamp_ms":1795078800500,"bid_price_krw":2999,"ask_price_krw":3000,"bid_qty":"180.75","ask_qty":"410.125","decision":"amend","reason":"requote"}
+{"kind":"child","action":"amend","intent_id":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d","idempotency_key":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d:2","target_idempotency_key":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d:1","quantity":"33","limit_price_krw":3000}
+{"kind":"book","market":"KRW-XRP","received_at":"2026-11-19T09:00:01Z","exchange_timestamp_ms":1795078801000,"bid_price_krw":3039,"ask_price_krw":3040,"bid_qty":"500.5","ask_qty":"320.25","decision":"hold","reason":"band"}
+{"kind":"book","market":"KRW-XRP","received_at":"2026-11-19T09:00:01.5Z","exchange_timestamp_ms":1795078801500,"bid_price_krw":3009,"ask_price_krw":3010,"bid_qty":"275.25","ask_qty":"190.5","decision":"amend","reason":"requote"}
+{"kind":"child","action":"amend","intent_id":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d","idempotency_key":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d:3","target_idempotency_key":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d:2","quantity":"33","limit_price_krw":3010}
+{"kind":"book","market":"KRW-XRP","received_at":"2026-11-19T09:00:02Z","exchange_timestamp_ms":1795078802000,"bid_price_krw":3019,"ask_price_krw":3020,"bid_qty":"400.125","ask_qty":"260.75","decision":"hold","reason":"requote_limit"}
+{"kind":"book","market":"KRW-XRP","received_at":"2026-11-19T09:00:02.6Z","exchange_timestamp_ms":1795078802600,"bid_price_krw":3024,"ask_price_krw":3025,"bid_qty":"350.5","ask_qty":"220.5","decision":"cancel","reason":"deadline"}
+{"kind":"child","action":"cancel","intent_id":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d","idempotency_key":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d:4","target_idempotency_key":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d:3"}
+{"kind":"gap","market":"KRW-XRP","received_at":"2026-11-19T09:00:03Z","reason":"upbit: websocket disconnected"}
+{"kind":"finish","intent_id":"2d3c4b5a-6e7f-4a1b-8c2d-3e4f5a6b7c8d","done":"deadline","reason":"deadline"}
