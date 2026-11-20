@@ -143,7 +143,7 @@ type Runner struct {
 	counters    *Counters
 	ticks       chan Tick
 	dialer      Dialer
-	token       TokenSource
+	token       safeToken
 	declaration []byte
 
 	limiter *declareLimiter
@@ -358,6 +358,7 @@ func (r *Runner) runWindow(ctx context.Context, stopLane context.CancelFunc, clo
 		if errors.Is(err, ErrUnauthorized) {
 			r.refused.add(token)
 			r.counters.TokenRejected.Add(1)
+			r.token.rejected(token)
 			return errTokenRejected
 		}
 		return err

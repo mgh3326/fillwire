@@ -64,6 +64,18 @@ func (s safeToken) Token(ctx context.Context) (token string, err error) {
 	return s.source.Token(ctx)
 }
 
+// rejected tells a source that implements RejectionObserver which token Toss
+// refused. A panic in the source is contained like any other.
+func (s safeToken) rejected(token string) {
+	observer, ok := s.source.(RejectionObserver)
+	if !ok {
+		return
+	}
+	var err error
+	defer contain(s.logger, "token rejected", &err)
+	observer.TokenRejected(token)
+}
+
 func contain(logger *slog.Logger, operation string, err *error) {
 	if recovered := recover(); recovered != nil {
 		if logger != nil {
