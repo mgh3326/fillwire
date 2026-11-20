@@ -267,6 +267,7 @@ type redisReply struct {
 	kind     byte
 	text     string
 	nilValue bool
+	elements []redisReply
 }
 
 func readRESPReply(reader *bufio.Reader) (redisReply, error) {
@@ -313,6 +314,32 @@ func readRESPReply(reader *bufio.Reader) (redisReply, error) {
 			return redisReply{}, errors.New("invalid redis bulk payload")
 		}
 		return redisReply{kind: marker, text: string(payload[:length])}, nil
+	case '*':
+		// Only the flat two-element reply of ReadWithTTL is accepted; nested or
+		// larger arrays are never expected from this client's commands.
+		lengthLine, err := readRESPLine(reader)
+		if err != nil {
+			return redisReply{}, err
+		}
+		length, err := strconv.Atoi(lengthLine)
+		if err != nil {
+			return redisReply{}, err
+		}
+		if length == -1 {
+			return redisReply{kind: marker, nilValue: true}, nil
+		}
+		if length < 0 || length > 2 {
+			return redisReply{}, errors.New("invalid redis array length")
+		}
+		elements := make([]redisReply, 0, length)
+		for range length {
+			element, err := readRESPReply(reader)
+			if err != nil || element.kind == '*' {
+				return redisReply{}, errors.New("invalid redis array element")
+			}
+			elements = append(elements, element)
+		}
+		return redisReply{kind: marker, elements: elements}, nil
 	case '_':
 		line, err := readRESPLine(reader)
 		if err != nil || line != "" {
@@ -344,4 +371,28 @@ func (client *RedisClient) TTL(ctx context.Context, key string) (time.Duration, 
 		return 0, errRedisUnavailable
 	}
 	return time.Duration(ms) * time.Millisecond, nil
+}
+
+// readWithTTLScript returns the value and its remaining lifetime from one
+// script execution, so a consumer never pairs a value with another value's TTL.
+const readWithTTLScript = "local v = redis.call('GET', KEYS[1]); if not v then return false end; return {v, redis.call('PTTL', KEYS[1])}"
+
+// ReadWithTTL reads a cache value and its PTTL atomically. A missing key is
+// reported as present=false; a key without expiry reports a negative ttl.
+func (client *RedisClient) ReadWithTTL(ctx context.Context, key string) (string, time.Duration, bool, error) {
+	reply, err := client.execute(ctx, "EVAL", readWithTTLScript, "1", key)
+	if err != nil {
+		return "", 0, false, errRedisUnavailable
+	}
+	if reply.nilValue {
+		return "", 0, false, nil
+	}
+	if reply.kind != '*' || len(reply.elements) != 2 || reply.elements[0].kind != '$' || reply.elements[1].kind != ':' {
+		return "", 0, false, errRedisUnavailable
+	}
+	ms, err := strconv.ParseInt(reply.elements[1].text, 10, 64)
+	if err != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) || ms < -(1<<62) {
+		return "", 0, false, errRedisUnavailable
+	}
+	return reply.elements[0].text, time.Duration(ms) * time.Millisecond, true, nil
 }

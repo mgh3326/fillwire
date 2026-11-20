@@ -3,6 +3,7 @@
 package gatewayd
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"strconv"
@@ -36,6 +37,9 @@ type Config struct {
 	ListenAddress   string
 	Timeout         time.Duration
 	ProviderConfigs map[TokenProvider]ProviderConfig
+	// FetchConsumers authorizes POST /v1/tokens/{provider}/fetch only. Empty
+	// (the default) rejects every fetch with 401.
+	FetchConsumers []FetchConsumer
 }
 
 // ConfigFromEnv preserves the safe historical default: only kis-mock is
@@ -74,6 +78,11 @@ func ConfigFromEnvForProviders(lookup func(string) string, providers []TokenProv
 		}
 		config.ProviderConfigs[provider] = providerConfig
 	}
+	consumers, err := parseFetchConsumers(lookup("GATEWAYD_FETCH_CONSUMERS"))
+	if err != nil {
+		return Config{}, errConfiguration
+	}
+	config.FetchConsumers = consumers
 	// Keep the pre-existing constructor and its callers source compatible.
 	if mockConfig, found := config.ProviderConfigs[ProviderKISMock]; found {
 		config.BaseURL = mockConfig.BaseURL
@@ -149,4 +158,59 @@ func loopbackAddress(address string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+const minFetchCredentialLength = 32
+
+// FetchConsumer is one caller of /fetch: a bearer credential and the closed set
+// of providers it may read. The credential is never rendered anywhere.
+type FetchConsumer struct {
+	Name       string
+	Credential string
+	Providers  []TokenProvider
+}
+
+// parseFetchConsumers reads GATEWAYD_FETCH_CONSUMERS, a JSON array of
+// {"name","credential","providers"}. Blank means fetch is off. Duplicate names
+// or credentials, short credentials, empty or unknown provider lists, and
+// unknown fields are configuration errors (the error carries no value).
+func parseFetchConsumers(raw string) ([]FetchConsumer, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var entries []struct {
+		Name       string   `json:"name"`
+		Credential string   `json:"credential"`
+		Providers  []string `json:"providers"`
+	}
+	if err := decoder.Decode(&entries); err != nil || decoder.More() {
+		return nil, errConfiguration
+	}
+	consumers := make([]FetchConsumer, 0, len(entries))
+	names := make(map[string]struct{}, len(entries))
+	credentials := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.Name == "" || len(entry.Credential) < minFetchCredentialLength ||
+			!safeHeaderText(entry.Credential) || strings.ContainsAny(entry.Credential, " \t") ||
+			len(entry.Providers) == 0 {
+			return nil, errConfiguration
+		}
+		if _, duplicate := names[entry.Name]; duplicate {
+			return nil, errConfiguration
+		}
+		if _, duplicate := credentials[entry.Credential]; duplicate {
+			return nil, errConfiguration
+		}
+		names[entry.Name] = struct{}{}
+		credentials[entry.Credential] = struct{}{}
+		providers, err := ParseProviders(strings.Join(entry.Providers, ","))
+		if err != nil {
+			return nil, errConfiguration
+		}
+		consumers = append(consumers, FetchConsumer{Name: entry.Name, Credential: entry.Credential, Providers: providers})
+	}
+	return consumers, nil
 }

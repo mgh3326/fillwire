@@ -106,6 +106,46 @@ value is the raw approval key with a 23-hour TTL; it is refreshed when at most
 approval-key replacement, publishing the new value atomically without first
 deleting the old value. Concurrent contenders wait for the lock holder.
 
+### Token fetch: `POST /v1/tokens/{provider}/fetch`
+
+`/fetch` lets a local consumer receive the token in the response instead of
+reading Redis on every use. It composes the existing issuance path: a miss calls
+the same `Ensure` that `/ensure` calls (same Redis lock, leases, timeouts and
+Redis writes), then reads the Redis value **and** its remaining TTL in one
+script execution and keeps the result in gatewayd's memory. `/ensure` and
+`/healthz` are unchanged; Python keeps reading the same Redis keys.
+
+- Request: `Authorization: Bearer <consumer credential>` and a JSON body of
+  `{}` or `{"failed_token_sha256":"<64 lowercase hex>"}`; unknown fields are
+  `400`.
+- `200`: `{"provider","token","expires_at" (RFC 3339 UTC),"token_sha256","source"}`
+  with `Cache-Control: no-store`. `source` is `memory`, `redis` or `issued`.
+- Errors never carry a token: `401 unauthenticated`, `403 provider_not_allowed`,
+  `404 unknown_provider`, `400 bad_request`, `503 issue_unavailable`
+  (body `{"error":"<code>"}`).
+- Without a failed hash, a token with more than 60 s left is served from memory
+  (zero Redis calls); otherwise `Ensure` runs. A failed hash equal to the
+  current token's hash forces a reissue under the lock; a different hash means
+  the caller is stale and gets the current token (read from Redis, never from
+  memory alone) without a reissue. A token confirmed failed is not served again
+  until a different usable token replaces it; overlapping reports of the same
+  failed token share one reissue attempt. If the token
+  the caller reported as failed is still current after the reissue (contended
+  lock, or the broker returned the same token), the answer is
+  `503 issue_unavailable` — there is no retry loop.
+- Consumer auth applies to `/fetch` only and is off by default (every request is
+  `401`). Configure it with `GATEWAYD_FETCH_CONSUMERS`, a JSON array of
+  `{"name","credential","providers"}`; credentials are at least 32 characters,
+  compared in constant time, and each consumer may read only its listed
+  providers. The listener stays loopback-only.
+- The token never appears in logs, metrics labels, errors or recovered panics.
+  `gatewayd_fetch_results_total{provider,result}` counts outcomes.
+
+**Assumption:** one gatewayd is the sole issuer for each credential. A token
+rotated by another issuer is noticed only through a consumer's failed-hash
+report. There is no revocation, withdrawal, lease-extension or multi-instance
+handling.
+
 `gatewayd` has no order, command, intent, or execution endpoint. It exposes
 loopback `GET /metrics` with standard Go/process collectors and a bounded
 `gatewayd_ensure_results_total{provider,state}` counter.

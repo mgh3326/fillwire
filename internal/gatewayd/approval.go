@@ -44,6 +44,14 @@ func newApprovalService(store approvalStore, config ProviderConfig, timeout time
 	return &approvalService{store: store, config: config, issuer: approvalIssuer{config: config, timeout: timeout}, cacheKey: prefix, lockKey: prefix + ":lock"}, nil
 }
 
+func (s *approvalService) tokenKey() string { return s.cacheKey }
+
+// EnsureReplacing is EnsureForce that, while holding the lock, also yields when
+// the stored key no longer hashes to the rejected value (a peer replaced it).
+func (s *approvalService) EnsureReplacing(ctx context.Context, rejectedSHA string) (EnsureState, error) {
+	return s.ensureReplacing(ctx, true, rejectedSHA)
+}
+
 func (s *approvalService) cachedTTL(ctx context.Context) (time.Duration, error) {
 	ttl, err := s.store.TTL(ctx, s.cacheKey)
 	if err != nil {
@@ -52,12 +60,12 @@ func (s *approvalService) cachedTTL(ctx context.Context) (time.Duration, error) 
 	return ttl, nil
 }
 func (s *approvalService) Ensure(ctx context.Context) (EnsureState, error) {
-	return s.ensure(ctx, false)
+	return s.ensureReplacing(ctx, false, "")
 }
 func (s *approvalService) EnsureForce(ctx context.Context) (EnsureState, error) {
-	return s.ensure(ctx, true)
+	return s.ensureReplacing(ctx, true, "")
 }
-func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, error) {
+func (s *approvalService) ensureReplacing(ctx context.Context, force bool, rejectedSHA string) (EnsureState, error) {
 	ttl0, err := s.cachedTTL(ctx)
 	if err != nil {
 		return "", err
@@ -133,6 +141,20 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 		defer cancel()
 		_ = s.store.CompareAndDelete(c, s.lockKey, lock)
 	}()
+	if rejectedSHA != "" {
+		current, present, err := s.store.Get(ctx, s.cacheKey)
+		if err != nil {
+			return "", errEnsureUnavailable
+		}
+		if present && strings.TrimSpace(current) != "" && tokenSHA256(current) != rejectedSHA {
+			// Yield only to a replacement that is itself still usable.
+			if ttl, err := s.cachedTTL(ctx); err != nil {
+				return "", err
+			} else if ttl > tokenExpiryBuffer {
+				return EnsureStateFresh, nil
+			}
+		}
+	}
 	// A publish may have landed between the last Held() observation and our
 	// SetNX (or between the first sample and a direct acquire); skip issuance
 	// when the TTL moved up in that gap.

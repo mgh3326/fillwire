@@ -26,8 +26,17 @@ func NewHandler(ensurers ProviderEnsurers, logger EventLogger) http.Handler {
 }
 
 func newHandler(ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics) http.Handler {
+	return newHandlerWithFetch(ensurers, logger, metrics, nil)
+}
+
+// newHandlerWithFetch adds the /fetch route. A nil fetch service means no
+// consumer is configured, so every /fetch request answers 401.
+func newHandlerWithFetch(ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics, fetch *FetchService) http.Handler {
 	if metrics == nil {
 		metrics = NewMetrics()
+	}
+	if fetch == nil {
+		fetch = NewFetchService(ensurers, nil, nil)
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metrics.handler())
@@ -82,6 +91,7 @@ func newHandler(ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics)
 			writeJSON(writer, http.StatusServiceUnavailable, `{"error":"ensure_failed"}`)
 		}
 	})
+	fetch.registerFetch(mux, logger, metrics)
 	return mux
 }
 
