@@ -109,103 +109,51 @@ All commands run on the target host. `<digest>` is the full
 
 ## Roll back
 
-Rollback is restoring an earlier pin from the history **together with the host
-`fillwire.toml` that pin accepts**, and restarting. The pin is not the whole
-state: the unit bind-mounts the same host `/etc/fillwire/fillwire.toml` into
-whichever image runs. An image from before the gatewayd-fetch release rejects
-`approval_mode = "gatewayd-fetch"` (exit 78, which `RestartPreventExitStatus`
-keeps from restarting) and rejects `[quotes] token_source` in its strict
-`[quotes]` decoder (the quote reader stays disabled while fills still start).
+Rollback is restoring an earlier pin from the history and restarting. The
+history is the `/var/lib/fillwire/fillwire.service.image.<UTC>` files — one
+per replaced pin — so you can return to any recorded digest, not only the
+one in `.previous` (after deploys A→B→C, the original A is still on disk).
 
-The history is the `/var/lib/fillwire/fillwire.service.image.<UTC>` files — one
-per replaced pin — so you can return to any recorded digest, not only the one
-in `.previous` (after deploys A→B→C, the original A is still on disk). Pins
-recorded before this release have no paired TOML: before starting, identify the
-TOML that older digest accepts (for example the pre-enablement copy described
-below) and put it in the snapshot directory as `fillwire.toml.<stamp>` and give it the live
-file's owner and mode first
-(`sudo chown --reference=/etc/fillwire/fillwire.toml <file> && sudo chmod --reference=/etc/fillwire/fillwire.toml <file>`).
-
-1. Snapshot the **running pin and the running TOML under one identifier** before
-   replacing either file. This is what makes a failed rollback undoable. The
-   snapshot **directory** is root-only (the file names credential variables),
-   but the snapshot **file keeps the live file's owner and mode** (`cp -p`):
-   the container runs as the distroless `nonroot` user with the live file
-   bind-mounted, so a restored file that user cannot read makes fillwire exit
-   78, which `RestartPreventExitStatus` does not restart.
+1. Snapshot the current pin first — this is what makes a failed rollback
+   undoable:
 
    ```sh
-   stamp=$(date -u +%Y%m%dT%H%M%SZ)   # keep this value: the undo block needs it
-   sudo install -d -m 700 /var/lib/fillwire/config-snapshots
-   sudo cp /var/lib/fillwire/fillwire.service.image "/var/lib/fillwire/fillwire.service.image.$stamp"
-   sudo cp -p /etc/fillwire/fillwire.toml "/var/lib/fillwire/config-snapshots/fillwire.toml.$stamp"
-   stat -c '%U:%G %a' /etc/fillwire/fillwire.toml   # note it; GNU stat (use stat -f '%Su:%Sg %Lp' on macOS)
-   echo "$stamp"
+   sudo cp /var/lib/fillwire/fillwire.service.image "/var/lib/fillwire/fillwire.service.image.$(date -u +%Y%m%dT%H%M%SZ)"
    ```
 
-   Likewise, before enabling `approval_mode = "gatewayd-fetch"` or `[quotes]
-   token_source`, save the TOML the current image accepts as
-   `/var/lib/fillwire/config-snapshots/fillwire.toml.<stamp of the pin that
-   accepts it>`.
-
-2. List the history and pick the pin to restore, and its compatible TOML:
+2. List the history and pick the file holding the wanted digest:
 
    ```sh
-   ls -t /var/lib/fillwire /var/lib/fillwire/config-snapshots
-   cat /var/lib/fillwire/fillwire.service.image.<target-stamp>
-   # confirm the single IMAGE= line shows the digest you want, and that
-   # config-snapshots/fillwire.toml.<target-stamp> exists and is the file that
-   # digest accepts
+   ls -t /var/lib/fillwire
+   cat /var/lib/fillwire/fillwire.service.image.<stamp>
+   # confirm the single IMAGE= line shows the digest you want
    ```
 
-3. Restore **both**, pull, then restart:
+3. Restore it, pull it, restart:
 
    ```sh
-   sudo cp /var/lib/fillwire/fillwire.service.image.<target-stamp> /var/lib/fillwire/fillwire.service.image
-   sudo cp -p /var/lib/fillwire/config-snapshots/fillwire.toml.<target-stamp> /etc/fillwire/fillwire.toml
-   stat -c '%U:%G %a' /etc/fillwire/fillwire.toml   # must equal the owner and mode noted in step 1
+   sudo cp /var/lib/fillwire/fillwire.service.image.<stamp> /var/lib/fillwire/fillwire.service.image
    sudo docker pull "$(cut -d= -f2 /var/lib/fillwire/fillwire.service.image)"
    sudo systemctl restart fillwire.service
    ```
 
-4. Verify **this invocation only**. A plain `journalctl -n 50` can still show a
-   line from the process before the restart, so scope the logs to the unit's
-   new invocation:
-
-   ```sh
-   invocation_id=$(systemctl show -p InvocationID --value fillwire.service)
-   test -n "$invocation_id" || echo "no invocation id: do not continue"
-   sudo systemctl show -p ActiveState,NRestarts,InvocationID fillwire.service
-   # expected: ActiveState=active, NRestarts=0, the same InvocationID after a minute
-   sudo journalctl -u fillwire.service "_SYSTEMD_INVOCATION_ID=$invocation_id" --no-pager | grep -E 'KIS websocket initial subscription active|quote reader (started|disabled)|quote reader subscriptions active|fillwire stopped'
-   ```
-
-   Expected: this invocation's `KIS websocket initial subscription active`.
-   If quotes are enabled in the restored TOML, also expect this invocation's
-   `quote reader started`, and **no** `quote reader disabled`. `started` only
-   shows the lane was launched, before it has a token or a subscription. During
-   a trading window also require `quote reader subscriptions active` with the
-   configured subscription count and zero rejected (README "Verifying"); outside
-   the window the idle line verifies startup only, so confirm subscriptions at
-   the next open.
+Then re-run the same three verification commands from deploy step 4.
 
 ### Undoing a failed rollback
 
-If the rolled-back unit fails verification, restore the snapshot step 1 wrote,
-**pin and TOML together, before restarting**. Use the `stamp` step 1 printed
-(the newest history file is that snapshot):
+If the rolled-back unit fails verification, the pre-rollback pin is the
+newest history file — the snapshot written in rollback step 1. Restore it
+the same way:
 
 ```sh
-ls -t /var/lib/fillwire /var/lib/fillwire/config-snapshots
-sudo cp /var/lib/fillwire/fillwire.service.image.<stamp-from-step-1> /var/lib/fillwire/fillwire.service.image
-sudo cp -p /var/lib/fillwire/config-snapshots/fillwire.toml.<stamp-from-step-1> /etc/fillwire/fillwire.toml
-stat -c '%U:%G %a' /etc/fillwire/fillwire.toml   # must equal the owner and mode noted in step 1
+ls -t /var/lib/fillwire
+cat /var/lib/fillwire/fillwire.service.image.<newest-stamp>
+sudo cp /var/lib/fillwire/fillwire.service.image.<newest-stamp> /var/lib/fillwire/fillwire.service.image
 sudo docker pull "$(cut -d= -f2 /var/lib/fillwire/fillwire.service.image)"
 sudo systemctl restart fillwire.service
 ```
 
-Then repeat step 4 with the new invocation ID. If that also fails, escalate —
-do not keep cycling pins.
+Then verify again. If that also fails, escalate — do not keep cycling pins.
 
 ## Alternating with python at-kis-ws
 
@@ -347,6 +295,6 @@ exit 1 with the bounded logs and timestamps.
 
 Step 7 restore remains the existing switch-back procedure above: stop
 fillwire, verify it is inactive, then start at-kis-ws. If fillwire's deployment
-pin must also be restored, use the Roll back section's paired pin and TOML snapshot, restore of
-both, pull, restart, and invocation-scoped verification. Never run both websocket owners
+pin must also be restored, use the Roll back section's snapshot, pin restore,
+pull, restart, and three verification checks. Never run both websocket owners
 at once.
