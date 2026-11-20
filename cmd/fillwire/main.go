@@ -18,6 +18,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
 	"github.com/mgh3326/fillwire/internal/stream"
+	"github.com/mgh3326/fillwire/internal/tokenfetch"
 	"github.com/mgh3326/go-kis/kis"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
@@ -78,11 +79,13 @@ type runDependencies struct {
 	approvalRedis    redis.UniversalClient
 	approvalFallback ws.ApprovalKeyProvider
 	gatewaydEnsurer  reader.GatewaydEnsurer
+	approvalFetcher  tokenfetch.Fetcher
 	dialer           ws.Dialer
 	alerter          alert.Alerter
 
 	// Quote lane test seams. They are never shared with the fills fields above.
 	quoteToken    quote.TokenSource
+	quoteFetcher  tokenfetch.Fetcher
 	quoteDialer   quote.Dialer
 	quoteClock    quote.Clock
 	quoteRetryMin time.Duration
@@ -158,7 +161,26 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		margin = reader.DefaultRefreshMargin
 	}
 	var approval *reader.ApprovalProvider
-	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd {
+	var approvalSource ws.ApprovalKeyProvider
+	var approvalAlert func(func())
+	switch cfg.KIS.ApprovalMode {
+	case reader.ApprovalModeGatewaydFetch:
+		// The key lives in memory and comes from gatewayd's /fetch: no Redis
+		// access for it, no lock, no local issuer.
+		fetcher := dependencies.approvalFetcher
+		if fetcher == nil {
+			client, err := tokenfetch.NewClient(cfg.KIS.Gatewayd.URL, cfg.gatewaydToken)
+			if err != nil {
+				return fmt.Errorf("%w: gatewayd fetch client", reader.ErrApprovalConfig)
+			}
+			fetcher = client
+		}
+		fetchApproval, err := reader.NewApprovalProviderGatewaydFetch(fetcher, cfg.KIS.AccountMode, margin, logger)
+		if err != nil {
+			return err
+		}
+		approvalSource, approvalAlert = fetchApproval, fetchApproval.SetTransientAlert
+	case reader.ApprovalModeGatewayd:
 		ensurer := dependencies.gatewaydEnsurer
 		if ensurer == nil {
 			var err error
@@ -168,14 +190,17 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			}
 		}
 		approval, err = reader.NewApprovalProviderGatewayd(approvalRedis, ensurer, cfg.KIS.AccountMode, margin, logger)
-	} else {
+	default:
 		approval, err = reader.NewApprovalProviderConfig(approvalRedis, issuer, cfg.KIS.ApprovalMode, cfg.KIS.AccountMode, margin, logger)
 	}
 	if err != nil {
 		return err
 	}
+	if approval != nil {
+		approvalSource, approvalAlert = approval, approval.SetTransientAlert
+	}
 	if dependencies.alerter != nil {
-		approval.SetTransientAlert(func() {
+		approvalAlert(func() {
 			dependencies.alerter.Alert(context.Background(), "transient", "fillwire approval refresh failed; retrying while cached key remains valid")
 		})
 	}
@@ -271,7 +296,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			OnBook:        bookEvent,
 			Endpoint:      cfg.KIS.Endpoint,
 			HTSID:         cfg.KIS.HTSID,
-			Approval:      approval,
+			Approval:      approvalSource,
 			Dialer:        dialer,
 			EventBuffer:   cfg.KIS.EventBuffer,
 			Logger:        logger,
