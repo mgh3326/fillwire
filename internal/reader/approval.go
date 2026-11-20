@@ -65,6 +65,7 @@ func (f issuerFunc) Issue(ctx context.Context) (string, error) { return f(ctx) }
 type ApprovalMetrics struct {
 	IssueCalls      atomic.Uint64
 	EnsureCalls     atomic.Uint64
+	FetchCalls      atomic.Uint64
 	LockAcquired    atomic.Uint64
 	LockContended   atomic.Uint64
 	LockWaitSuccess atomic.Uint64

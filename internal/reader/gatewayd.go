@@ -7,10 +7,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"regexp"
-	"strings"
 	"time"
+
+	"github.com/mgh3326/fillwire/internal/tokenfetch"
 )
 
 // Gatewayd ensure timing matches auto_trader token_issuance.py _ENSURE_TIMEOUT:
@@ -36,14 +36,10 @@ type GatewaydEnsurer interface {
 var gatewaydProviderPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
 // NormalizeGatewaydURL applies the same rules as auto_trader
-// token_issuance.py _validated_gatewayd_url: http(s) only, a hostname, and no
-// credentials, query, or fragment. Trailing slashes are stripped.
+// token_issuance.py _validated_gatewayd_url (see tokenfetch.NormalizeURL).
 func NormalizeGatewaydURL(raw string) (string, error) {
-	normalized := strings.TrimRight(strings.TrimSpace(raw), "/")
-	parsed, err := url.Parse(normalized)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
-		parsed.Hostname() == "" || parsed.User != nil ||
-		parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" {
+	normalized, err := tokenfetch.NormalizeURL(raw)
+	if err != nil {
 		return "", errGatewaydConfig
 	}
 	return normalized, nil
