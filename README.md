@@ -159,9 +159,9 @@ first connect (see failure handling below). The call goes to the same
   if that key is still current, and otherwise answers with the newer key it
   already holds; either answer is adopted. A rejected key is never presented
   again.
-- **Failure.** A non-forced refresh failure while the held key still has life
+- **Failure.** A non-forced refresh failure (a timeout included) while the held key still has life
   keeps the stream, raises the transient alert and retries on the next connect.
-  With no live key — and on every failed reissue — the failure is terminal
+  With no live key — and on every failed reissue, a timeout included — the failure is terminal
   (exit 1), with a typed error: `unauthenticated` (401), `provider_not_allowed`
   (403), `unknown_provider` (404), `bad_request` (400) and `issue_unavailable`
   (503) are distinct errors, and anything else is `gatewayd fetch unavailable`.
@@ -329,13 +329,13 @@ first**). In this mode fillwire:
   buffer as above (gatewayd answers with the same token while more than 60 s
   remain), or after a handshake 401.
 - after a 401, sends `failed_token_sha256` for the refused token, so gatewayd
-  reissues or answers with the newer token it already holds. It asks for at most
-  one such reissue per minute, because Toss keeps one valid token per client.
+  reissues or answers with the newer token it already holds. It makes at most
+  one such reissue attempt per minute, failed attempts included, and the refused token's hash stays pending until gatewayd answers, because Toss keeps one valid token per client.
   This **changes the "never issued" contract above**: fillwire can now cause a
   reissue, though only gatewayd talks to Toss, and fillwire still holds no Toss
   client id or secret.
 - trusts gatewayd's `expires_at` against its own clock.
-- on any gatewayd failure (401, 403, 404, 400, 503, transport) does not dial; it
+- on any gatewayd failure (401, 403, 404, 400, 503, transport, timeout) does not dial, even while the held token still has life left; it
   retries at the same 15 s cadence as an empty cache, with a typed reason in the
   `quote reader window run failed; retrying` warning. Nothing falls back to
   Redis or to a local issue.
