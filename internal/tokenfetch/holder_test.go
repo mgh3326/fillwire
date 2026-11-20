@@ -19,7 +19,7 @@ func newHolder(t *testing.T, margin time.Duration) (*fetchtest.Server, *tokenfet
 	if err != nil {
 		t.Fatal(err)
 	}
-	return server, tokenfetch.NewHolder(client, "kis-live-approval", margin, clock.Now), clock
+	return server, tokenfetch.NewHolder(client, "kis-live-approval", margin, true, clock.Now), clock
 }
 
 func TestHolderSteadyStateMakesNoCalls(t *testing.T) {
@@ -111,5 +111,43 @@ func TestHolderReissueFailureNeverServesTheRejectedToken(t *testing.T) {
 	// Still failing: the rejected token must not come back as a "live" fallback.
 	if _, _, err := holder.Current(context.Background()); !errors.Is(err, tokenfetch.ErrIssueUnavailable) {
 		t.Fatalf("Current after failed reissue err = %v", err)
+	}
+}
+
+func TestHolderKeepsTheRejectedHashPendingAfterAFailedReissue(t *testing.T) {
+	server, holder, _ := newHolder(t, time.Hour)
+	first, _, _ := holder.Current(context.Background())
+	server.FailWith(503, "")
+	if _, err := holder.Reissue(context.Background(), first.Value()); err == nil {
+		t.Fatal("reissue unexpectedly succeeded")
+	}
+	server.FailWith(0, "")
+	next, _, err := holder.Current(context.Background())
+	if err != nil || next.Value() == first.Value() {
+		t.Fatalf("Current after a failed reissue = %v, %v", next, err)
+	}
+	calls := server.Calls()
+	if got := calls[len(calls)-1].Failed; got != tokenfetch.Hash(first.Value()) {
+		t.Fatalf("the follow-up fetch lost the rejected hash: %q", got)
+	}
+	// Adopted: the next fetch is a plain one again.
+	if _, _, err := holder.Current(context.Background()); err != nil || len(server.Calls()) != len(calls) {
+		t.Fatalf("pending not cleared: %v, calls %d", err, len(server.Calls()))
+	}
+}
+
+func TestHolderWithoutKeepLiveFailsClosed(t *testing.T) {
+	clock := &fetchtest.Clock{}
+	server := fetchtest.New(clock, credential)
+	t.Cleanup(server.Close)
+	client, _ := tokenfetch.NewClient(server.URL, credential)
+	holder := tokenfetch.NewHolder(client, "toss", 2*time.Minute, false, clock.Now)
+	if _, _, err := holder.Current(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(24*time.Hour - 90*time.Second)
+	server.FailWith(503, "")
+	if token, degraded, err := holder.Current(context.Background()); !errors.Is(err, tokenfetch.ErrIssueUnavailable) || degraded || token.Value() != "" {
+		t.Fatalf("Current = %v %v %v", token, degraded, err)
 	}
 }

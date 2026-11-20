@@ -2,6 +2,7 @@ package reader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -53,7 +54,7 @@ func newFetchApprovalProvider(fetcher tokenfetch.Fetcher, accountMode string, ma
 		provider = "kis-mock-approval"
 	}
 	p := &FetchApprovalProvider{logger: logger, accountMode: accountMode, metrics: &ApprovalMetrics{}, failureCh: make(chan struct{})}
-	p.holder = tokenfetch.NewHolder(observedFetcher{inner: fetcher, p: p}, provider, margin, now)
+	p.holder = tokenfetch.NewHolder(observedFetcher{inner: fetcher, p: p}, provider, margin, true, now)
 	return p, nil
 }
 
@@ -114,8 +115,12 @@ func (p *FetchApprovalProvider) present(token tokenfetch.Token) string {
 
 // terminal records a failure no live key survived. The wrapped error is a
 // tokenfetch sentinel: it names the status class and never a key, URL or body.
+//
+// Only cancellation (shutdown) is exempt. A deadline is a failure: go-kis gives
+// Reissue a 5 s child context and, on any error, redials through ApprovalKey,
+// so an unlatched timeout would keep the stream up with no fresh key.
 func (p *FetchApprovalProvider) terminal(ctx context.Context, err error) (string, error) {
-	if ctx.Err() != nil {
+	if errors.Is(ctx.Err(), context.Canceled) {
 		return "", ctx.Err()
 	}
 	wrapped := fmt.Errorf("reader: approval fetch: %w", err)

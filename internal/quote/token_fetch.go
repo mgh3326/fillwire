@@ -45,7 +45,7 @@ func NewFetchedToken(fetcher tokenfetch.Fetcher, clock Clock) (*FetchedToken, er
 	if clock == nil {
 		clock = systemClock{}
 	}
-	return &FetchedToken{holder: tokenfetch.NewHolder(fetcher, tossProvider, tokenExpiryBuffer, clock.Now), clock: clock}, nil
+	return &FetchedToken{holder: tokenfetch.NewHolder(fetcher, tossProvider, tokenExpiryBuffer, false, clock.Now), clock: clock}, nil
 }
 
 // TokenRejected remembers the refused token until a replacement arrives.
@@ -55,7 +55,9 @@ func (s *FetchedToken) TokenRejected(token string) {
 	s.mu.Unlock()
 }
 
-// Token returns the held token, or fetches. Every failure matches
+// Token returns the held token, or fetches. A refresh failure inside the
+// expiry buffer fails closed even while the held token has life left: the
+// runner must not dial after a gatewayd failure. Every failure matches
 // ErrTokenUnavailable, so the runner keeps polling at its token cadence, and
 // carries only the tokenfetch sentinel.
 func (s *FetchedToken) Token(ctx context.Context) (string, error) {
@@ -66,16 +68,23 @@ func (s *FetchedToken) Token(ctx context.Context) (string, error) {
 		if !last.IsZero() && s.clock.Now().Sub(last) < reissueGap {
 			return "", fmt.Errorf("%w (gatewayd fetch): reissue throttled", ErrTokenUnavailable)
 		}
+		// The attempt counts, not only a success: a 503 or a timeout does not
+		// show that gatewayd skipped the request, so retrying inside the gap
+		// could reissue repeatedly. The rejection stays pending until a
+		// replacement arrives.
+		s.mu.Lock()
+		s.reissuedAt = s.clock.Now()
+		s.mu.Unlock()
 		token, err := s.holder.Reissue(ctx, rejected)
 		if err != nil {
 			return "", fmt.Errorf("%w (gatewayd fetch): %w", ErrTokenUnavailable, err)
 		}
 		s.mu.Lock()
-		s.rejected, s.reissuedAt = "", s.clock.Now()
+		s.rejected = ""
 		s.mu.Unlock()
 		return token.Value(), nil
 	}
-	token, _, err := s.holder.Current(ctx)
+	token, _, err := s.holder.Current(ctx) // keepLive is off: err is never masked
 	if err != nil {
 		return "", fmt.Errorf("%w (gatewayd fetch): %w", ErrTokenUnavailable, err)
 	}

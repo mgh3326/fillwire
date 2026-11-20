@@ -128,21 +128,47 @@ func TestFetchedTokenFailuresAreTypedAndKeepTheLanePolling(t *testing.T) {
 	}
 }
 
-func TestFetchedTokenRefusedKeepsPendingUntilReplaced(t *testing.T) {
-	server, source, _ := newFetchedToken(t)
+func TestFetchedTokenFailedReissueCountsAsAnAttemptAndStaysPending(t *testing.T) {
+	server, source, clock := newFetchedToken(t)
 	refused, _ := source.Token(context.Background())
 	source.TokenRejected(refused)
 	server.FailWith(503, "")
 	if _, err := source.Token(context.Background()); !errors.Is(err, tokenfetch.ErrIssueUnavailable) {
 		t.Fatalf("err = %v", err)
 	}
+	calls := len(server.Calls())
+	// Inside the gap the lane must not POST again, even though gatewayd is back.
 	server.FailWith(0, "")
+	if _, err := source.Token(context.Background()); !errors.Is(err, ErrTokenUnavailable) || len(server.Calls()) != calls {
+		t.Fatalf("retry inside the gap: err %v, calls %d -> %d", err, calls, len(server.Calls()))
+	}
+	clock.Advance(reissueGap)
 	next, err := source.Token(context.Background())
 	if err != nil || next == refused {
-		t.Fatalf("retry = %q, %v", next, err)
+		t.Fatalf("retry after the gap = %q, %v", next, err)
 	}
-	if calls := server.Calls(); calls[len(calls)-1].Failed != tokenfetch.Hash(refused) {
-		t.Fatalf("retry lost the failed hash: %+v", calls[len(calls)-1])
+	if got := server.Calls()[len(server.Calls())-1].Failed; got != tokenfetch.Hash(refused) {
+		t.Fatalf("retry lost the failed hash: %q", got)
+	}
+}
+
+func TestFetchedTokenFailsClosedWhenARefreshFailsWithLifeLeft(t *testing.T) {
+	for name, arrange := range map[string]func(*fetchtest.Server){
+		"503": func(s *fetchtest.Server) { s.FailWith(503, "") },
+		"401": func(s *fetchtest.Server) { s.Credential = "revoked" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			server, source, clock := newFetchedToken(t)
+			if _, err := source.Token(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(24*time.Hour - 90*time.Second) // inside the 120 s buffer, still alive
+			arrange(server)
+			token, err := source.Token(context.Background())
+			if token != "" || !errors.Is(err, ErrTokenUnavailable) || errors.Is(err, nil) {
+				t.Fatalf("Token = %q, %v; want no token and ErrTokenUnavailable", token, err)
+			}
+		})
 	}
 }
 

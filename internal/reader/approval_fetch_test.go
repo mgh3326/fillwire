@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -254,5 +255,85 @@ func TestFetchApprovalConstructorRejectsBadInput(t *testing.T) {
 		if _, err := build(); !errors.Is(err, ErrApprovalConfig) {
 			t.Errorf("%s: err = %v", name, err)
 		}
+	}
+}
+
+// stallFetcher blocks a fetch until its context ends, the way a stalled
+// gatewayd looks to a caller with a deadline.
+type stallFetcher struct {
+	inner  tokenfetch.Fetcher
+	stall  atomic.Bool
+	mu     sync.Mutex
+	failed []string
+}
+
+func (f *stallFetcher) Fetch(ctx context.Context, provider, failed string) (tokenfetch.Token, error) {
+	f.mu.Lock()
+	f.failed = append(f.failed, failed)
+	f.mu.Unlock()
+	if f.stall.Load() {
+		<-ctx.Done()
+		return tokenfetch.Token{}, tokenfetch.ErrUnavailable
+	}
+	return f.inner.Fetch(ctx, provider, failed)
+}
+
+func newStallFixture(t *testing.T) (*FetchApprovalProvider, *stallFetcher, *fetchtest.Clock) {
+	t.Helper()
+	clock := &fetchtest.Clock{}
+	server := fetchtest.New(clock, fetchCredential)
+	t.Cleanup(server.Close)
+	client, err := tokenfetch.NewClient(server.URL, fetchCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stall := &stallFetcher{inner: client}
+	p, err := newFetchApprovalProvider(stall, "live", DefaultRefreshMargin, nil, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p, stall, clock
+}
+
+// go-kis gives Reissue a 5 s child context and ignores the error, then redials
+// through ApprovalKey. A reissue that hits that deadline must latch the typed
+// failure, and the next read must still carry the rejected key's hash.
+func TestFetchApprovalReissueDeadlineIsTerminalAndKeepsTheRejectedHash(t *testing.T) {
+	p, stall, _ := newStallFixture(t)
+	rejected, err := p.ApprovalKey(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stall.stall.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := p.Reissue(ctx); !errors.Is(err, tokenfetch.ErrUnavailable) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Reissue err = %v, want the typed fetch failure", err)
+	}
+	if !errors.Is(p.cacheOnlyFailure(), tokenfetch.ErrUnavailable) {
+		t.Fatalf("terminal failure = %v, want latched", p.cacheOnlyFailure())
+	}
+	stall.stall.Store(false)
+	next, err := p.ApprovalKey(context.Background())
+	if err != nil || next == rejected {
+		t.Fatalf("ApprovalKey after the timed-out reissue = %q, %v; the rejected key must not come back", next, err)
+	}
+	stall.mu.Lock()
+	defer stall.mu.Unlock()
+	if got := stall.failed[len(stall.failed)-1]; got != tokenfetch.Hash(rejected) {
+		t.Fatalf("follow-up fetch failed hash = %q, want the rejected key's", got)
+	}
+}
+
+func TestFetchApprovalRefreshTimeoutKeepsALiveKey(t *testing.T) {
+	p, stall, clock := newStallFixture(t)
+	first, _ := p.ApprovalKey(context.Background())
+	clock.Advance(23*time.Hour + time.Minute) // inside the margin
+	stall.stall.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	got, err := p.ApprovalKey(ctx)
+	if err != nil || got != first || p.cacheOnlyFailure() != nil {
+		t.Fatalf("refresh deadline with a live key = %q, %v, terminal %v", got, err, p.cacheOnlyFailure())
 	}
 }
