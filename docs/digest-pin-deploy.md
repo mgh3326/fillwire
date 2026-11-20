@@ -122,17 +122,24 @@ per replaced pin — so you can return to any recorded digest, not only the one
 in `.previous` (after deploys A→B→C, the original A is still on disk). Pins
 recorded before this release have no paired TOML: before starting, identify the
 TOML that older digest accepts (for example the pre-enablement copy described
-below) and put it in the snapshot directory as `fillwire.toml.<stamp>`.
+below) and put it in the snapshot directory as `fillwire.toml.<stamp>` and give it the live
+file's owner and mode first
+(`sudo chown --reference=/etc/fillwire/fillwire.toml <file> && sudo chmod --reference=/etc/fillwire/fillwire.toml <file>`).
 
 1. Snapshot the **running pin and the running TOML under one identifier** before
    replacing either file. This is what makes a failed rollback undoable. The
-   TOML snapshot is root-only, because the file names credential variables:
+   snapshot **directory** is root-only (the file names credential variables),
+   but the snapshot **file keeps the live file's owner and mode** (`cp -p`):
+   the container runs as the distroless `nonroot` user with the live file
+   bind-mounted, so a restored file that user cannot read makes fillwire exit
+   78, which `RestartPreventExitStatus` does not restart.
 
    ```sh
    stamp=$(date -u +%Y%m%dT%H%M%SZ)   # keep this value: the undo block needs it
    sudo install -d -m 700 /var/lib/fillwire/config-snapshots
    sudo cp /var/lib/fillwire/fillwire.service.image "/var/lib/fillwire/fillwire.service.image.$stamp"
-   sudo install -m 600 /etc/fillwire/fillwire.toml "/var/lib/fillwire/config-snapshots/fillwire.toml.$stamp"
+   sudo cp -p /etc/fillwire/fillwire.toml "/var/lib/fillwire/config-snapshots/fillwire.toml.$stamp"
+   stat -c '%U:%G %a' /etc/fillwire/fillwire.toml   # note it; GNU stat (use stat -f '%Su:%Sg %Lp' on macOS)
    echo "$stamp"
    ```
 
@@ -155,7 +162,8 @@ below) and put it in the snapshot directory as `fillwire.toml.<stamp>`.
 
    ```sh
    sudo cp /var/lib/fillwire/fillwire.service.image.<target-stamp> /var/lib/fillwire/fillwire.service.image
-   sudo install -m 600 /var/lib/fillwire/config-snapshots/fillwire.toml.<target-stamp> /etc/fillwire/fillwire.toml
+   sudo cp -p /var/lib/fillwire/config-snapshots/fillwire.toml.<target-stamp> /etc/fillwire/fillwire.toml
+   stat -c '%U:%G %a' /etc/fillwire/fillwire.toml   # must equal the owner and mode noted in step 1
    sudo docker pull "$(cut -d= -f2 /var/lib/fillwire/fillwire.service.image)"
    sudo systemctl restart fillwire.service
    ```
@@ -190,7 +198,8 @@ If the rolled-back unit fails verification, restore the snapshot step 1 wrote,
 ```sh
 ls -t /var/lib/fillwire /var/lib/fillwire/config-snapshots
 sudo cp /var/lib/fillwire/fillwire.service.image.<stamp-from-step-1> /var/lib/fillwire/fillwire.service.image
-sudo install -m 600 /var/lib/fillwire/config-snapshots/fillwire.toml.<stamp-from-step-1> /etc/fillwire/fillwire.toml
+sudo cp -p /var/lib/fillwire/config-snapshots/fillwire.toml.<stamp-from-step-1> /etc/fillwire/fillwire.toml
+stat -c '%U:%G %a' /etc/fillwire/fillwire.toml   # must equal the owner and mode noted in step 1
 sudo docker pull "$(cut -d= -f2 /var/lib/fillwire/fillwire.service.image)"
 sudo systemctl restart fillwire.service
 ```
