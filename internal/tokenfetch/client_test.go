@@ -99,6 +99,28 @@ func TestFetchStatusesAreTypedAndCarryNoBody(t *testing.T) {
 	}
 }
 
+// A status the client already knows must survive a body that cannot be read.
+func TestFetchKeepsTheStatusWhenTheBodyReadFails(t *testing.T) {
+	for status, want := range map[int]error{
+		http.StatusUnauthorized:       tokenfetch.ErrUnauthenticated,
+		http.StatusForbidden:          tokenfetch.ErrProviderNotAllowed,
+		http.StatusNotFound:           tokenfetch.ErrUnknownProvider,
+		http.StatusBadRequest:         tokenfetch.ErrBadRequest,
+		http.StatusServiceUnavailable: tokenfetch.ErrIssueUnavailable,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"err`)) // then the connection ends early
+		}))
+		client, _ := tokenfetch.NewClient(server.URL, credential)
+		if _, err := client.Fetch(context.Background(), "toss", ""); !errors.Is(err, want) {
+			t.Errorf("status %d with a cut-off body: err = %v, want %v", status, err, want)
+		}
+		server.Close()
+	}
+}
+
 func TestFetchRejectsMalformedAnswers(t *testing.T) {
 	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	good := func() map[string]string {

@@ -196,10 +196,8 @@ func (c *Client) Fetch(ctx context.Context, provider, failedSHA256 string) (Toke
 		return Token{}, ErrUnavailable
 	}
 	defer response.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, maxBodyBytes))
-	if err != nil {
-		return Token{}, ErrUnavailable
-	}
+	// Classify the status first: a body that fails to read must not erase a
+	// status the client already knows (a 401 with a cut-off body is still 401).
 	switch response.StatusCode {
 	case http.StatusOK:
 	case http.StatusUnauthorized:
@@ -213,6 +211,10 @@ func (c *Client) Fetch(ctx context.Context, provider, failedSHA256 string) (Toke
 	case http.StatusServiceUnavailable:
 		return Token{}, ErrIssueUnavailable
 	default:
+		return Token{}, ErrUnavailable
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxBodyBytes))
+	if err != nil {
 		return Token{}, ErrUnavailable
 	}
 	var answer fetchResponse
