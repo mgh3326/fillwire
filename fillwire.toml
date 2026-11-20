@@ -5,7 +5,7 @@
 broker = "kis"
 endpoint = "live" # live or mock; this also selects the matching KIS TR.
 account_mode = "live"
-approval_mode = "" # "" (default): Redis single-flight issue and refresh; "cache-only": read the cached key only; "gatewayd": ask gatewayd to ensure the shared key, then read Redis (see [kis.gatewayd]).
+approval_mode = "" # "" (default): Redis single-flight issue and refresh; "cache-only": read the cached key only; "gatewayd": ask gatewayd to ensure the shared key, then read Redis; "gatewayd-fetch": fetch the key from gatewayd and keep it in memory, no Redis (see [kis.gatewayd]).
 approval_refresh_margin = "1h"
 venue = "krx"
 hts_id = "EXAMPLE_HTS_ID"
@@ -27,7 +27,12 @@ dup_track_max = 10000
 # Redis stays authoritative. The token below is sent as the named header on
 # that POST only and is never logged. Unknown keys in this table reject the
 # config; url/token_env/token_header take effect only when approval_mode is
-# "gatewayd".
+# "gatewayd" or "gatewayd-fetch".
+# "gatewayd-fetch" needs a gatewayd that serves POST /v1/tokens/{provider}/fetch
+# (hk 5760): deploy that first. It POSTs there instead, keeps the returned key
+# in memory and reads no Redis key. token_env is then required and is sent as
+# "Authorization: Bearer <value>" (token_header must stay Authorization; https
+# or loopback only). The same url/token_env serve the quote reader token_source below.
 [kis.gatewayd]
 url = "https://gatewayd.example.invalid:8791" # http is allowed only for loopback when token_env is set
 token_env = "GATEWAYD_TOKEN"        # optional; unset means no auth header
@@ -87,6 +92,10 @@ timeout = "10s"
 # id or secret and never issues or refreshes a token. It opens exactly one of
 # the two Toss websocket connections the account allows. Unknown keys in this
 # table reject the reader. See README "Quote reader".
+# Optional token_source = "gatewayd-fetch" (instead of token_key) takes the
+# token from gatewayd's /fetch via [kis.gatewayd] and keeps it in memory; it
+# needs gatewayd with /fetch (hk 5760) and lets fillwire trigger a reissue
+# after a handshake 401.
 [quotes]
 enabled = false
 provider = "toss"
