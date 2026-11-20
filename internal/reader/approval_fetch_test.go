@@ -129,7 +129,7 @@ func TestFetchApprovalFailuresAreTypedTerminalAndNeverIssueLocally(t *testing.T)
 		{"401", func(f *fetchFixture) { f.server.Credential = "rotated" }, tokenfetch.ErrUnauthenticated},
 		{"403", func(f *fetchFixture) { f.server.Forbid("kis-live-approval") }, tokenfetch.ErrProviderNotAllowed},
 		{"503", func(f *fetchFixture) { f.server.FailWith(503, "") }, tokenfetch.ErrIssueUnavailable},
-		{"404", func(f *fetchFixture) { f.server.FailWith(404, "") }, tokenfetch.ErrUnavailable},
+		{"404", func(f *fetchFixture) { f.server.FailWith(404, "") }, tokenfetch.ErrUnknownProvider},
 	} {
 		for _, forced := range []bool{false, true} {
 			name := tc.name + map[bool]string{false: " read", true: " reissue"}[forced]
