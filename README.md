@@ -178,6 +178,10 @@ first connect (see failure handling below). The call goes to the same
   `token_header` must be `Authorization` or unset. The credential needs an
   `https` URL or a loopback host. The key, the credential and gatewayd's response
   bodies never appear in logs or errors.
+- **Rollback.** An image from before this release rejects `gatewayd-fetch` (exit
+  78, no automatic restart) or the `token_source` key (quote reader disabled).
+  Snapshot the previous `fillwire.toml` before enabling it and restore it with
+  the older pin; see `docs/digest-pin-deploy.md` "Roll back".
 
 Configuration errors, including missing KIS credentials and invalid settings,
 exit 78 and the example systemd unit prevents restart for that code. Session

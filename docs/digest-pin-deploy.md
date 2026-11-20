@@ -139,6 +139,20 @@ one in `.previous` (after deploys A→B→C, the original A is still on disk).
 
 Then re-run the same three verification commands from deploy step 4.
 
+**The pin is not the whole state.** The unit bind-mounts the same host
+`/etc/fillwire/fillwire.toml` into whichever image runs. An image from before
+the gatewayd-fetch release does not know the new settings: with
+`approval_mode = "gatewayd-fetch"` it exits 78 (configuration error), which
+`RestartPreventExitStatus` keeps from restarting, and with `[quotes]
+token_source = "gatewayd-fetch"` its strict `[quotes]` decoder rejects the key
+and leaves the quote reader disabled while fills still start. So before
+enabling either setting, snapshot the host TOML that the current image accepts
+(for example `sudo cp /etc/fillwire/fillwire.toml /etc/fillwire/fillwire.toml.before-fetch`),
+and restore the matching TOML together with the older pin in step 3, before the
+restart. After rolling back, verify both lanes (the fills line above and, if
+quotes are enabled, the `quote reader started` line). The same applies when
+undoing a failed rollback: restore the TOML that matches the pin you restore.
+
 ### Undoing a failed rollback
 
 If the rolled-back unit fails verification, the pre-rollback pin is the
@@ -153,7 +167,9 @@ sudo docker pull "$(cut -d= -f2 /var/lib/fillwire/fillwire.service.image)"
 sudo systemctl restart fillwire.service
 ```
 
-Then verify again. If that also fails, escalate — do not keep cycling pins.
+Restore the host TOML that matches that pin as well (see "The pin is not the
+whole state" above), then verify again. If that also fails, escalate — do not
+keep cycling pins.
 
 ## Alternating with python at-kis-ws
 
