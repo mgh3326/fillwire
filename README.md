@@ -173,7 +173,8 @@ first connect (see failure handling below). The call goes to the same
 - **Transport.** Same rules as the ensure call: 5 s budget, 3 s connect, no
   proxy environment, no redirects. The credential is **required**: `token_env`
   names the variable, whose value is sent as `Authorization: Bearer <value>`
-  (put the bare credential in the variable, without `Bearer `), and
+  (the variable may hold the bare credential or `Bearer <credential>`; exactly one
+  `Bearer` is sent, so a value already shared with `"gatewayd"` mode works), and
   `token_header` must be `Authorization` or unset. The credential needs an
   `https` URL or a loopback host. The key, the credential and gatewayd's response
   bodies never appear in logs or errors.

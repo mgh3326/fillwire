@@ -47,6 +47,26 @@ func TestFetchRequestShapeAndAnswer(t *testing.T) {
 	}
 }
 
+func TestCredentialSentWithExactlyOneBearer(t *testing.T) {
+	for _, given := range []string{credential, "Bearer " + credential, "  Bearer " + credential + " "} {
+		server := fetchtest.New(&fetchtest.Clock{}, credential)
+		client, err := tokenfetch.NewClient(server.URL, given)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Fetch(context.Background(), "toss", ""); err != nil {
+			t.Fatalf("credential %q: %v", given, err)
+		}
+		if calls := server.Calls(); len(calls) != 1 || calls[0].Auth != "Bearer "+credential {
+			t.Fatalf("credential %q sent %+v", given, calls)
+		}
+		server.Close()
+	}
+	if _, err := tokenfetch.NewClient("http://127.0.0.1:1", "Bearer "); err == nil {
+		t.Fatal("empty credential after the prefix accepted")
+	}
+}
+
 func TestFetchStatusesAreTypedAndCarryNoBody(t *testing.T) {
 	server, client := newPair(t)
 	bad, _ := tokenfetch.NewClient(server.URL, "wrong-credential")

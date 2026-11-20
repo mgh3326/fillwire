@@ -131,10 +131,19 @@ type Client struct {
 }
 
 // NewClient builds a fetch client. The credential is required and is sent as
-// "Authorization: Bearer <credential>"; it is refused over plain http to a
+// "Authorization: Bearer <credential>" (a leading "Bearer " in the given value
+// is not doubled); it is refused over plain http to a
 // non-loopback host.
 func NewClient(rawurl, credential string) (*Client, error) {
 	base, err := NormalizeURL(rawurl)
+	// The ensure client sends the variable's value raw as the header value, so
+	// the same variable may already read "Bearer <credential>". Send exactly
+	// one "Bearer" either way.
+	credential = strings.TrimSpace(credential)
+	if credential == "Bearer" {
+		credential = ""
+	}
+	credential = strings.TrimSpace(strings.TrimPrefix(credential, "Bearer "))
 	if err != nil || credential == "" || !CredentialTransportOK(base) {
 		return nil, ErrConfig
 	}
