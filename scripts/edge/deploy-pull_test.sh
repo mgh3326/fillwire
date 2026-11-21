@@ -3,8 +3,8 @@
 # endpoint is contacted: each is replaced by a command at the front of PATH.
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-script=$root/scripts/deploy-pull.sh
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+script=$root/scripts/edge/deploy-pull.sh
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/deploy-pull-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 bin=$tmp/bin

@@ -55,7 +55,7 @@ Only these environment variable names are read or documented:
 `KIS_MOCK_ACCOUNT_NO` accepts either an eight-digit CANO (which uses product
 code `01`) or an explicit ten-digit / `12345678-01` account form.
 
-[.env.example](.env.example) has placeholders only. Keep populated env files
+[.env.example](../../deploy/edge/.env.example) has placeholders only. Keep populated env files
 out of this public repository.
 
 ```sh
@@ -261,7 +261,7 @@ disposition, whether an evidence read ran (`completed`, `not_needed`,
 `unavailable`), and match counts. The canary uses it after an ambiguous place
 to decide whether its own timed-out order is resting before cancelling it.
 
-See [the edge boundary](docs/kis-mock-edge.md) for the command, receipt, and
+See [the edge boundary](kis-mock-edge.md) for the command, receipt, and
 failure contract. Repository tests use fake transport responses and do not
 place real VTS orders.
 
@@ -278,9 +278,9 @@ it is durably idempotent and cannot issue a second broker request.
 
 Do not cite or integrate the orphan `auto_trader kis_websocket` Redis pub/sub
 legacy path. OPSP8996 때문에 live WS shadow는 금지하며,
-[fixtures/](fixtures/) is only a placeholder directory.
+[fixtures/edge/](../../fixtures/edge/) is only a placeholder directory.
 
-`execution_contracts/` provides the minimal command and receipt schema. Python은
+[`execution_contracts/`](../../execution_contracts/) provides the minimal command and receipt schema. Python은
 지금 이 스키마로 호출하지 않는다.
 
 ## Verification
@@ -289,7 +289,7 @@ legacy path. OPSP8996 때문에 live WS shadow는 금지하며,
 go test ./...
 go test -race ./...
 go vet ./...
-./scripts/secret_scan.sh
+./scripts/edge/secret_scan.sh
 ```
 
 
@@ -311,7 +311,7 @@ With the local edge already running and its placement gate armed, run the
 bounded one-shot smoke path with:
 
 ```sh
-sh ./scripts/kis_mock_us_smoke.sh
+sh ./scripts/edge/kis_mock_us_smoke.sh
 ```
 
 It creates a `broker-edge-smoke:` correlation ID, places exactly one AAPL

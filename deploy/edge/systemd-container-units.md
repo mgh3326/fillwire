@@ -34,15 +34,15 @@ the host file, and every restart loses the store.
 
 The `:main` tag follows the latest successful main build. Do not run it
 directly in a unit: use the digest-pinning pull deployment documented in
-[`docs/digest-pin-deploy.md`](../docs/digest-pin-deploy.md). The examples below
+[`docs/digest-pin-deploy.md`](../../docs/edge/digest-pin-deploy.md). The examples below
 are retained as the former floating-tag reference; use the new
-`deploy/systemd/*.service.example` files for a digest-pinned unit.
+`deploy/edge/systemd/*.service.example` files for a digest-pinned unit.
 
 ## `/etc/systemd/system/broker-edge.service`
 
-This is the expanded form of `deploy/systemd/broker-edge.service.example`.
+This is the expanded form of `deploy/edge/systemd/broker-edge.service.example`.
 `/etc/broker-edge/broker-edge.env` remains a host-only placeholder, while the
-image file is written by `scripts/deploy-pull.sh broker-edge.service`.
+image file is written by `scripts/edge/deploy-pull.sh broker-edge.service`.
 
 ```ini
 [Unit]
@@ -67,8 +67,8 @@ WantedBy=multi-user.target
 
 ## `/etc/systemd/system/gatewayd.service`
 
-This is the expanded form of `deploy/systemd/gatewayd.service.example`; its
-image file is written by `scripts/deploy-pull.sh gatewayd.service`.
+This is the expanded form of `deploy/edge/systemd/gatewayd.service.example`; its
+image file is written by `scripts/edge/deploy-pull.sh gatewayd.service`.
 
 ```ini
 [Unit]
@@ -92,6 +92,6 @@ WantedBy=multi-user.target
 ```
 
 After Ops has reviewed the environment-file paths, they can run `systemctl
-daemon-reload` and enable the two units. Use `scripts/deploy-pull.sh` to pull,
+daemon-reload` and enable the two units. Use `scripts/edge/deploy-pull.sh` to pull,
 pin, restart, and health-check them; do not place credentials in a unit file or
 this repository.

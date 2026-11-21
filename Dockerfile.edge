@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
+# broker-edge image, kept alongside the fillwire Dockerfile until hk 5874.
+# Same four binaries and CMD as broker-edge @ 0bdec8e. The Go base follows this
+# module's go.mod (1.27); sources are copied by directory instead of COPY . .
 
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -10,7 +13,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
+COPY execution_contracts ./execution_contracts
 
 # modernc.org/sqlite is pure Go, so these binaries can remain fully static.
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \

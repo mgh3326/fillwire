@@ -1,6 +1,6 @@
 # Digest-pinned pull deployment
 
-`scripts/deploy-pull.sh` resolves a requested GHCR tag to its immutable
+`scripts/edge/deploy-pull.sh` resolves a requested GHCR tag to its immutable
 `RepoDigest`, writes a systemd `EnvironmentFile`, restarts one unit, and checks
 its Prometheus metrics endpoint. It is intended to run **on the target host**;
 this repository contains no host environment files or credentials.
@@ -8,8 +8,8 @@ this repository contains no host environment files or credentials.
 ## One-time unit setup
 
 Copy and adapt the appropriate example in
-`deploy/systemd/broker-edge.service.example` or
-`deploy/systemd/gatewayd.service.example`. The `STATE_DIR` and `--env-file`
+`deploy/edge/systemd/broker-edge.service.example` or
+`deploy/edge/systemd/gatewayd.service.example`. The `STATE_DIR` and `--env-file`
 values are deliberately placeholders: choose the existing host locations and
 keep populated environment files off this public repository. The unit's
 `EnvironmentFile` must be the state file managed by the script, and its
@@ -32,8 +32,8 @@ ownership required by the host's service setup.
 Run with the service unit name. The tag defaults to `main`.
 
 ```sh
-sudo scripts/deploy-pull.sh broker-edge.service
-sudo BROKER_EDGE_HEALTH_PORT=9090 scripts/deploy-pull.sh gatewayd.service main
+sudo scripts/edge/deploy-pull.sh broker-edge.service
+sudo BROKER_EDGE_HEALTH_PORT=9090 scripts/edge/deploy-pull.sh gatewayd.service main
 ```
 
 The health gate is `GET /metrics`, defaulting to
@@ -51,7 +51,7 @@ recovery gate is reported explicitly for operator intervention.
 To return immediately to the recorded prior digest:
 
 ```sh
-sudo scripts/deploy-pull.sh --rollback broker-edge.service
+sudo scripts/edge/deploy-pull.sh --rollback broker-edge.service
 ```
 
 Rollback swaps current and previous pins, restarts, and health-checks the
