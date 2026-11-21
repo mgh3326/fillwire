@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
-	"github.com/mgh3326/broker-edge/internal/kismockread"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
+	"github.com/mgh3326/fillwire/internal/kismockread"
 )
 
 const (

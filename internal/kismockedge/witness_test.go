@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
 )
 
 func testLiveWitnessCommand(commandID string) executioncontracts.ExecutionCommandV1 {
@@ -215,7 +215,7 @@ func TestKISLiveWitnessHasNoEgressDependencies(t *testing.T) {
 			t.Fatal(err)
 		}
 		switch name {
-		case "net/http", "net/url", "github.com/mgh3326/broker-edge/internal/kislive", "github.com/mgh3326/broker-edge/internal/kismockread":
+		case "net/http", "net/url", "github.com/mgh3326/fillwire/internal/kislive", "github.com/mgh3326/fillwire/internal/kismockread":
 			t.Fatalf("shadow witness imports egress dependency %q", name)
 		}
 	}
@@ -236,7 +236,7 @@ func TestKISLiveWitnessHasNoEgressDependencies(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if name == "github.com/mgh3326/broker-edge/internal/kislive" {
+			if name == "github.com/mgh3326/fillwire/internal/kislive" {
 				t.Fatalf("Phase 1 edge imports live TR table from %s", entry.Name())
 			}
 		}

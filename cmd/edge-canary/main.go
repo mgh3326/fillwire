@@ -5,7 +5,7 @@ import (
 	"context"
 	"os"
 
-	"github.com/mgh3326/broker-edge/internal/canary"
+	"github.com/mgh3326/fillwire/internal/canary"
 )
 
 func main() { os.Exit(canary.Run(context.Background(), canary.Options{})) }

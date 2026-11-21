@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
-	"github.com/mgh3326/broker-edge/internal/kismockread"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
+	"github.com/mgh3326/fillwire/internal/kismockread"
 )
 
 // Command 254's stored row shape: command_id broker-edge-canary:20260930T050055.73257

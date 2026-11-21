@@ -5,7 +5,7 @@ import (
 	"context"
 	"os"
 
-	"github.com/mgh3326/broker-edge/internal/gatewayd"
+	"github.com/mgh3326/fillwire/internal/gatewayd"
 )
 
 func main() {

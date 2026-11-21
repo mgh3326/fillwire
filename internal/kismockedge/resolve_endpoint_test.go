@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
-	"github.com/mgh3326/broker-edge/internal/kismockread"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
+	"github.com/mgh3326/fillwire/internal/kismockread"
 )
 
 var resolveTestNow = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)

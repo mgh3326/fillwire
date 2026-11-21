@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
 )
 
 const commandBodyLimit = 16 * 1024

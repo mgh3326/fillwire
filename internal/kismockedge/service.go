@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
-	"github.com/mgh3326/broker-edge/internal/kismockread"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
+	"github.com/mgh3326/fillwire/internal/kismockread"
 )
 
 // ConfigLoader supplies mock-only configuration after the placement gate is

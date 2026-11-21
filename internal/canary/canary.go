@@ -20,8 +20,8 @@ import (
 	"strings"
 	"time"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
-	"github.com/mgh3326/broker-edge/internal/kismockedge"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
+	"github.com/mgh3326/fillwire/internal/kismockedge"
 	_ "time/tzdata" // The production image is distroless and has no zoneinfo files.
 )
 

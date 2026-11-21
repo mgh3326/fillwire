@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
-	"github.com/mgh3326/broker-edge/internal/kismockedge"
-	"github.com/mgh3326/broker-edge/internal/kismockread"
+	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
+	"github.com/mgh3326/fillwire/internal/kismockedge"
+	"github.com/mgh3326/fillwire/internal/kismockread"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mgh3326/broker-edge/internal/kismockread"
+	"github.com/mgh3326/fillwire/internal/kismockread"
 )
 
 // TokenProvider is the closed set of token issuers gatewayd may own. It is

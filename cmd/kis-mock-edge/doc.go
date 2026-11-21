@@ -5,7 +5,7 @@ import (
 	"context"
 	"os"
 
-	"github.com/mgh3326/broker-edge/internal/kismockedge"
+	"github.com/mgh3326/fillwire/internal/kismockedge"
 )
 
 func main() {
