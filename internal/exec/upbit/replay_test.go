@@ -762,3 +762,78 @@ func TestParseDepthRefusesAnOffTickLevel(t *testing.T) {
 		}
 	}
 }
+
+// Review finding (round 2): a slot-trigger stop issued inside a gap is judged
+// on the first book after the gap, not killed for want of one.
+func TestSlotStopIssuedInsideAGapIsJudgedOnTheFirstBookAfterIt(t *testing.T) {
+	lines := func(bid int64) []string {
+		return []string{
+			top(9_500, 2_950, 2_951),
+			markLine("gap", 9_800), // the slot at 10 s falls inside the outage
+			markLine("connected", 11_000),
+			top(11_100, bid, bid+1),
+			top(12_200, bid, bid+1),
+		}
+	}
+	reports := runReplay(t, []ReplayIntent{stopIntent(t)}, lines(2_880)...)
+	slot := byRule(t, reports, RuleThrough, TriggerSlot)
+	if slot.Result.Done == DoneNotTriggered || len(slot.Children) == 0 || !slot.Children[0].DecidedAt.Equal(at(11_100)) {
+		t.Fatalf("slot run = %+v / %+v; want a child decided at the 11100 ms book", slot.Result, slot.Children)
+	}
+	// Judged once: a first book above the stop ends it.
+	above := runReplay(t, []ReplayIntent{stopIntent(t)}, lines(2_950)...)
+	if r := byRule(t, above, RuleThrough, TriggerSlot).Result; r.Done != DoneNotTriggered {
+		t.Fatalf("a first post-gap bid above the stop started the run: %+v", r)
+	}
+}
+
+// Review finding (round 2): an open gap is evidenced by a later heartbeat too,
+// which proves the time passed without moving the replay's clock.
+func TestOpenGapIsExposedByALaterHeartbeat(t *testing.T) {
+	arrive := []string{top(0, 2_999, 3_000), orderbookLine(1_000, []lvl{{3_000, "10"}}, []lvl{{2_999, "1"}})}
+	hb := func(ms int64) string {
+		return fmt.Sprintf(`{"kind":"heartbeat","market":"KRW-XRP","received_at":%q}`, iso(ms))
+	}
+	long := runReplay(t, []ReplayIntent{buyIntent(t, nil)}, append(arrive[:2:2], markLine("gap", 2_000), hb(63_000))...)
+	if !byRule(t, long, RuleThrough, TriggerNone).Result.GapExposed {
+		t.Error("gap at 2 s and a heartbeat at 63 s: want gap_exposed")
+	}
+	exact := runReplay(t, []ReplayIntent{buyIntent(t, nil)}, append(arrive[:2:2], markLine("gap", 2_000), hb(62_000))...)
+	if byRule(t, exact, RuleThrough, TriggerNone).Result.GapExposed {
+		t.Error("exactly 60 s is not over 60 s")
+	}
+}
+
+// Review finding (round 2): the plan's price bound is 1e10 and a band can go
+// above it, so such an intent is refused up front, not mid-replay.
+func TestReplayIntentRefusesABandAboveThePlanBound(t *testing.T) {
+	var in ReplayIntent
+	in.Intent = testIntent(t, func(in *Intent) {
+		in.LimitPriceKRW = maxLimitPriceKRW
+		in.MaxSlippageBps = 500
+		in.MaxQuantity = Qty{units: 100_000_000}
+		in.MaxNotionalKRW = 5_000_000
+		in.ExpiresAt = testNow.Add(time.Minute)
+	})
+	if err := in.Intent.Validate(); err != nil {
+		t.Fatalf("base intent must be valid for this test: %v", err)
+	}
+	if _, high := in.Band(); high <= maxLimitPriceKRW {
+		t.Fatalf("band high %d is not above the plan bound", high)
+	}
+	if err := in.Validate(); !errors.Is(err, ErrIntent) {
+		t.Fatalf("Validate = %v, want ErrIntent", err)
+	}
+}
+
+// Review finding (round 2): a child in flight when a gap marker arrives is
+// lost to the gap even if the plan cancels at that same instant.
+func TestGapMarkerVoidsAChildInFlightBeforeThePlanCancels(t *testing.T) {
+	in := buyIntent(t, func(in *Intent) { in.ExpiresAt = testNow.Add(5 * time.Second) })
+	reports := runReplay(t, []ReplayIntent{in}, top(4_500, 2_999, 3_000), markLine("gap", 5_200))
+	for _, rep := range reports {
+		if c := rep.Children[0]; c.Status != StatusVoidGap || rep.Result.VoidChildren != 1 {
+			t.Fatalf("%s: child %+v, void_children %d", rep.Result.Rule, c, rep.Result.VoidChildren)
+		}
+	}
+}

@@ -117,6 +117,8 @@ func (in ReplayIntent) Validate() error {
 	switch {
 	case !in.IssuedAt.IsZero() && !in.IssuedAt.Before(in.ExpiresAt):
 		return bad("issued_at %s is not before expires_at", in.IssuedAt.Format(time.RFC3339Nano))
+	case bandHigh(in.Intent) > maxLimitPriceKRW:
+		return bad("price band reaches above %d KRW, the plan's price bound", maxLimitPriceKRW)
 	case in.StopPriceKRW < 0:
 		return bad("stop_price_krw %d", in.StopPriceKRW)
 	case in.StopPriceKRW > 0 && in.Side != Sell:
@@ -127,6 +129,11 @@ func (in ReplayIntent) Validate() error {
 		return bad("stop_price_krw needs issued_at, the slot that checks it")
 	}
 	return nil
+}
+
+func bandHigh(in Intent) int64 {
+	_, high := in.Band()
+	return high
 }
 
 // Fill is one execution of a child.
@@ -266,6 +273,13 @@ func NewReplay(intents []ReplayIntent, cfg Config) (*Replay, error) {
 // new execution and is dropped after its order check.
 func (r *Replay) Feed(ev Event) error {
 	if ev.Kind == EventOther {
+		// Clock-only: it moves nothing, but it proves how long an open gap has
+		// lasted.
+		for _, run := range r.runs {
+			if run.in.Market == ev.Market {
+				run.checkExposure(ev.At)
+			}
+		}
 		return nil
 	}
 	if last, ok := r.lastAt[ev.Market]; ok && ev.At.Before(last) {
@@ -334,6 +348,7 @@ type run struct {
 	plan *Plan
 
 	started, triggered, dead bool
+	slotPending              bool // the slot fell inside a gap: judged on the first book after it
 	last                     *Depth
 	lastAt                   time.Time
 	frames                   int // book frames seen
@@ -373,6 +388,16 @@ func (r *run) feed(ev Event) error {
 		r.closeGap(ev.At)
 		r.frames++
 		d := ev.Book
+		if r.slotPending {
+			// The slot's own book is gone with the gap: judge once, on this
+			// first book after it.
+			r.slotPending = false
+			if ev.At.Before(r.in.ExpiresAt) && d.BidPriceKRW <= r.in.StopPriceKRW {
+				r.triggered = true
+			} else {
+				r.dead = true
+			}
+		}
 		if r.started && !r.triggered && !r.dead && r.trig == TriggerContinuous &&
 			ev.At.Before(r.in.ExpiresAt) && d.BidPriceKRW <= r.in.StopPriceKRW {
 			r.triggered = true
@@ -396,7 +421,6 @@ func (r *run) feed(ev Event) error {
 			}
 		}
 	case EventGap:
-		r.tick(ev.At)
 		r.openGap(ev.At)
 	case EventRefused:
 		r.refused++
@@ -424,13 +448,15 @@ func (r *run) tick(at time.Time) {
 // start runs once, at the slot (rule 7). Only the slot trigger looks back at
 // the last book; the continuous one waits for a book at or after issued_at.
 // Inside a gap there is no book to price from (openGap dropped it), so the
-// slot decides nothing and the first book after the gap does.
+// slot decides nothing and the first book after the gap judges and prices.
 func (r *run) start() {
 	r.started = true
 	slot := r.in.IssuedAt
 	switch {
 	case r.in.StopPriceKRW == 0:
 		r.triggered = true
+	case r.trig == TriggerSlot && r.inGap:
+		r.slotPending = true
 	case r.trig == TriggerSlot:
 		if r.last != nil && slot.Sub(r.last.ReceivedAt) <= r.cfg.StaleAfter && r.last.BidPriceKRW <= r.in.StopPriceKRW {
 			r.triggered = true
@@ -604,15 +630,20 @@ func (r *run) fill(at time.Time, q Qty, price int64, source string) error {
 func (r *run) openGap(at time.Time) {
 	if r.inGap {
 		r.checkExposure(at)
+		r.tick(at)
 		return
 	}
-	r.inGap, r.gapAt, r.gapHeld = true, at, r.positionHeld()
+	r.inGap, r.gapAt = true, at
 	r.last = nil
 	r.gaps++
+	// The window opens first: a child in flight is lost to it even when the
+	// plan cancels at this very instant.
 	for _, c := range r.pending {
 		c.Status = StatusVoidGap
 	}
 	r.pending = nil
+	r.tick(at)
+	r.gapHeld = r.positionHeld()
 }
 
 // checkExposure marks the run gap_exposed if the open window has by now
