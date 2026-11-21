@@ -168,7 +168,6 @@ func allDigitsAtMost(value string, maximum int) bool {
 	return true
 }
 
-
 // validOverseasStockCode retains auto_trader's DB symbol convention. A period
 // is converted to KIS's slash form only while constructing the KIS request.
 func validOverseasStockCode(value string) bool {

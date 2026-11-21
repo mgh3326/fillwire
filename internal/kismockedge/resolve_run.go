@@ -98,7 +98,6 @@ func (reader environmentOrderHistoryReader) DomesticOrderHistory(ctx context.Con
 	return orders, nil
 }
 
-
 // OverseasOrderHistory is the only mock-US evidence reader. It deliberately
 // mirrors auto_trader's mock-available daily history TR, not the mock-blocked
 // overseas pending-orders inquiry.

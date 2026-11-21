@@ -185,7 +185,6 @@ func domesticOrder(record map[string]json.RawMessage) (DomesticOrder, *SafeError
 	return DomesticOrder{BrokerOrderID: orderID, Side: side, StockCode: stockCode, Quantity: quantity, Price: price, OrderedAt: orderedAt.UTC()}, nil
 }
 
-
 // OverseasOrder is the minimum non-sensitive evidence exposed to the US
 // reconciliation path. It mirrors the ft_* fields returned by the overseas
 // daily-order history TR and deliberately carries no account data or payload.
