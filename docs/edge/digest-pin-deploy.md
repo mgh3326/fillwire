@@ -33,8 +33,10 @@ Run with the service unit name. The tag defaults to `main`.
 
 ```sh
 sudo scripts/edge/deploy-pull.sh broker-edge.service
-sudo BROKER_EDGE_HEALTH_PORT=9090 scripts/edge/deploy-pull.sh gatewayd.service main
+sudo BROKER_EDGE_HEALTH_PORT=8791 scripts/edge/deploy-pull.sh gatewayd.service main
 ```
+
+The port above is gatewayd's default listen port (8791); use the port of your configured `GATEWAYD_LISTEN_ADDR`.
 
 The health gate is `GET /metrics`, defaulting to
 `http://127.0.0.1:8080/metrics`. Configure a different port with
