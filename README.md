@@ -84,7 +84,7 @@ The KIS `app_key_env`/`app_secret_env` pair is required only when
 `approval_mode = ""` — fillwire then issues approval keys through the KIS REST
 client — or when `[books] enabled = true`, whose REST reader sends both and
 whose mock token-cache key derives from the app key. With
-`approval_mode = "cache-only"` or `"gatewayd"` and books off, the names may be
+`approval_mode = "cache-only"`, `"gatewayd"` or `"gatewayd-fetch"` and books off, the names may be
 omitted; a configured name whose variable is unset is not an error and the
 value is never read.
 
@@ -133,8 +133,66 @@ follows no redirects. An optional `token_env`/`token_header` pair sends a
 credential on that POST only; the value never appears in logs or errors, and a
 configured credential requires an `https` URL or a loopback host so it is never
 sent in cleartext. The `[kis.gatewayd]` table needs a valid `url` only in this
-mode and its settings apply only in this mode, but unknown keys in the table
+mode (or `"gatewayd-fetch"`, below) and its settings apply only in those modes
+(plus the Toss `token_source` below), but unknown keys in the table
 always reject the config.
+
+`approval_mode = "gatewayd-fetch"` takes the approval key from gatewayd's
+response and keeps it in memory. **It needs a gatewayd that serves
+`POST /v1/tokens/{provider}/fetch` (hk 5760); deploy that gatewayd first.**
+Against an older gatewayd the route does not exist and fillwire exits on the
+first connect (see failure handling below). The call goes to the same
+`[kis.gatewayd]` URL for `kis-live-approval` or `kis-mock-approval`, with body
+`{}` or `{"failed_token_sha256": "<hex>"}`. In this mode:
+
+- **No Redis for the key.** fillwire reads no approval key, takes no lock and
+  never issues locally. The approval key exists only in process memory.
+- **Refresh.** The key is read from memory while more than
+  `approval_refresh_margin` of its life remains, with no HTTP call at all.
+  Inside the margin, the next connect or reconnect asks gatewayd again. gatewayd
+  reissues only when under 60 s remain, so a request inside the margin may
+  legitimately return the same key; fillwire adopts it without an alert. There
+  is no background refresh loop, as in `"gatewayd"` mode: the key matters only
+  at the websocket handshake.
+- **KIS rejection.** Where `""` mode forces a reissue, fillwire sends
+  `failed_token_sha256`, the SHA-256 of the key KIS rejected. gatewayd reissues
+  if that key is still current, and otherwise answers with the newer key it
+  already holds; either answer is adopted. This covers every key reported
+  through the websocket client's `Reissue` callback: that key is never presented
+  again, and its hash stays pending across a failed or timed-out request.
+  **Limitation:** the pinned go-kis client calls `Reissue` once per rejection
+  code until a request is acknowledged. If KIS rejects key A with `OPSP0011`,
+  gatewayd supplies B, and KIS rejects B with the same code before any
+  acknowledgement, go-kis does not call `Reissue` again and fillwire has no
+  signal for B. It keeps presenting B from memory while B has more than the
+  margin left, so the fills stream stays disconnected and retrying until B
+  nears expiry or the process restarts. A restart does not help by itself: its
+  empty memory fetches without a hash, and gatewayd may return the same B.
+  Treat repeated `OPSP0011` after a gatewayd-supplied key as an operator case
+  (reissue at gatewayd). The first rejection at startup, before any
+  acknowledgement, is handled by the same go-kis rule and is not changed here.
+- **Failure.** A non-forced refresh failure (a timeout included) while the held key still has life
+  keeps the stream, raises the transient alert and retries on the next connect.
+  With no live key — and on every failed reissue, a timeout included — the failure is terminal
+  (exit 1), with a typed error: `unauthenticated` (401), `provider_not_allowed`
+  (403), `unknown_provider` (404), `bad_request` (400) and `issue_unavailable`
+  (503) are distinct errors, and anything else is `gatewayd fetch unavailable`.
+  fillwire never falls back to issuing locally or to reading Redis.
+- **Expiry is trusted from gatewayd's `expires_at` against this host's clock**,
+  not from a Redis TTL as in the other modes. The response's `provider`,
+  `token_sha256` and `expires_at` are validated; a malformed answer or one
+  already expired is `gatewayd fetch unavailable`.
+- **Transport.** Same rules as the ensure call: 5 s budget, 3 s connect, no
+  proxy environment, no redirects. The credential is **required**: `token_env`
+  names the variable, whose value is sent as `Authorization: Bearer <value>`
+  (the variable may hold the bare credential or `Bearer <credential>`; exactly one
+  `Bearer` is sent, so a value already shared with `"gatewayd"` mode works), and
+  `token_header` must be `Authorization` or unset. The credential needs an
+  `https` URL or a loopback host. The key, the credential and gatewayd's response
+  bodies never appear in logs or errors.
+- **Rollback.** An image from before this release rejects `gatewayd-fetch` (exit
+  78, no automatic restart) or the `token_source` key (quote reader disabled), so
+  keep the previous `fillwire.toml` when you go back to an older pin.
 
 Configuration errors, including missing KIS credentials and invalid settings,
 exit 78 and the example systemd unit prevents restart for that code. Session
@@ -208,7 +266,12 @@ Toss accepts it and closes the oldest one without a close code. So:
   dial while a connection is open, and every reconnect closes the old
   connection before dialing (break before make).
 
-### Access token: read-only, never issued
+### Access token: read-only, never issued (Redis source)
+
+This is the default `token_source = "redis"`. With `token_source =
+"gatewayd-fetch"` fillwire asks gatewayd for the token instead; see
+[Access token from gatewayd](#access-token-from-gatewayd-token_source--gatewayd-fetch)
+for what changes.
 
 The websocket handshake uses the same Bearer access token as the Toss REST
 API. Toss allows one valid token per client, so a new token invalidates the
@@ -266,6 +329,43 @@ they block enabling the reader, not the code:
 2. **Toss allowed IP.** The fillwire host must be on the Toss allowed-IP list,
    the same list REST uses. Otherwise the handshake returns 403 and the reader
    retries every 5 minutes.
+
+### Access token from gatewayd (`token_source = "gatewayd-fetch"`)
+
+Optional. gatewayd keeps the Toss token in its memory and returns it from
+`POST /v1/tokens/toss/fetch` (hk 5760; **deploy a gatewayd with `/fetch`
+first**). **Prerequisite: gatewayd must be the only issuer for that Toss
+client.** Toss keeps one valid token per client, so any other issuer (auto_trader
+issuing locally, a second gatewayd) invalidates the token gatewayd holds; a
+handshake 401 would then make gatewayd reissue and invalidate the token the
+other issuer uses for REST orders. fillwire's one-attempt-per-minute limit
+cannot coordinate independent issuers. Before enabling, move auto_trader and any
+other REST consumer of that client to gatewayd's token and turn their local
+issuance off (tracked in hk 5766). In this mode fillwire:
+
+- reads no Redis token key, so `token_key` must be absent. It uses the
+  `[kis.gatewayd]` `url` and `token_env` (sent as `Authorization: Bearer`, https
+  or loopback only; `token_header` must be `Authorization`) through its own
+  client and its own in-memory holder, shared with nothing on the KIS path.
+- keeps the token in memory and asks again only inside the same 120 s expiry
+  buffer as above (gatewayd answers with the same token while more than 60 s
+  remain), or after a handshake 401.
+- after a 401, sends `failed_token_sha256` for the refused token, so gatewayd
+  reissues or answers with the newer token it already holds. It makes at most
+  one such reissue attempt per minute, failed attempts included, and the refused token's hash stays pending until gatewayd answers, because Toss keeps one valid token per client.
+  This **changes the "never issued" contract above**: fillwire can now cause a
+  reissue, though only gatewayd talks to Toss, and fillwire still holds no Toss
+  client id or secret.
+- trusts gatewayd's `expires_at` against its own clock.
+- on any gatewayd failure (401, 403, 404, 400, 503, transport, timeout) does not dial, even while the held token still has life left; it
+  retries at the same 15 s cadence as an empty cache, with a typed reason in the
+  `quote reader window run failed; retrying` warning. Nothing falls back to
+  Redis or to a local issue.
+- never logs the token or the credential.
+
+Settings are checked when the lane starts: a missing or invalid `[kis.gatewayd]`
+URL, an unset credential variable, or `token_key` set alongside disables the
+quote lane only (an error is logged) and never touches the fills path.
 
 ### Isolation from the fills path
 
@@ -428,6 +528,11 @@ has exactly these fields, always all present:
    max_len = 100000           # default; XADD MAXLEN ~ N
    buffer = 1024              # default, at most 65536
    ```
+
+   To take the token from gatewayd instead of Redis, drop `token_key` and set
+   `token_source = "gatewayd-fetch"` (see above). Do this only after gatewayd is
+   the sole issuer for that Toss client and every REST consumer uses its token
+   (hk 5766); otherwise the two issuers invalidate each other's token.
 
 5. Restart fillwire the usual way (`docs/digest-pin-deploy.md`). A restart also
    restarts the KIS fills socket, so use the same window you would for a

@@ -168,7 +168,7 @@ func loadConfig(path string) (runtimeConfig, error) {
 			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
 		}
 	}
-	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd && strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) != "" {
+	if cfg.usesGatewayd() && strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) != "" {
 		if cfg.gatewaydToken, ok = os.LookupEnv(cfg.KIS.Gatewayd.TokenEnv); !ok || cfg.gatewaydToken == "" {
 			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.Gatewayd.TokenEnv)
 		}
@@ -187,10 +187,16 @@ func loadConfig(path string) (runtimeConfig, error) {
 	return cfg, nil
 }
 
+// usesGatewayd reports whether the approval mode talks to gatewayd: the
+// ensure-then-Redis mode or the fetch mode.
+func (cfg runtimeConfig) usesGatewayd() bool {
+	return cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd || cfg.KIS.ApprovalMode == reader.ApprovalModeGatewaydFetch
+}
+
 // kisCredentialsRequired reports whether an enabled lane reads the KIS app
 // key and secret: approval_mode "" issues approval keys through the KIS REST
 // client, and the books lane sends both on REST reads and derives the mock
-// token-cache key from the app key. cache-only and gatewayd never issue, so
+// token-cache key from the app key. cache-only, gatewayd and gatewayd-fetch never issue, so
 // with books off neither credential is needed; configured names are then
 // optional and their values are never read.
 func (cfg runtimeConfig) kisCredentialsRequired() bool {
@@ -201,10 +207,20 @@ func (cfg runtimeConfig) validateStatic() error {
 	if cfg.KIS.Broker != "kis" {
 		return errors.New("config: broker must be kis")
 	}
-	if cfg.KIS.ApprovalMode != "" && cfg.KIS.ApprovalMode != reader.ApprovalModeCacheOnly && cfg.KIS.ApprovalMode != reader.ApprovalModeGatewayd {
+	if cfg.KIS.ApprovalMode != "" && cfg.KIS.ApprovalMode != reader.ApprovalModeCacheOnly && !cfg.usesGatewayd() {
 		return errors.New("config: unsupported KIS approval_mode")
 	}
-	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewayd {
+	if cfg.KIS.ApprovalMode == reader.ApprovalModeGatewaydFetch {
+		// The fetch client always sends "Authorization: Bearer <credential>"
+		// and gatewayd answers 401 without it, so the credential is required.
+		if strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) == "" {
+			return errors.New("config: KIS gatewayd-fetch requires [kis.gatewayd] token_env")
+		}
+		if !strings.EqualFold(cfg.KIS.Gatewayd.TokenHeader, "Authorization") {
+			return errors.New("config: KIS gatewayd-fetch sends the credential as Authorization; token_header must be Authorization")
+		}
+	}
+	if cfg.usesGatewayd() {
 		normalized, err := reader.NormalizeGatewaydURL(cfg.KIS.Gatewayd.URL)
 		if err != nil {
 			return errors.New("config: invalid KIS gatewayd url")

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/recording"
+	"github.com/mgh3326/fillwire/internal/tokenfetch"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -32,6 +34,9 @@ const (
 	// XADD or consumer group needs.
 	quoteRedisPoolSize = 4
 	quoteRedisTimeout  = 2 * time.Second
+
+	quoteTokenSourceRedis = "redis"
+	quoteTokenSourceFetch = "gatewayd-fetch"
 )
 
 // quoteFileConfig is the [quotes] table. It is decoded strictly, apart from
@@ -41,6 +46,7 @@ type quoteFileConfig struct {
 	Provider    string `toml:"provider"`
 	SymbolsFile string `toml:"symbols_file"`
 	TokenKey    string `toml:"token_key"`
+	TokenSource string `toml:"token_source"`
 	StreamKey   string `toml:"stream_key"`
 	MaxLen      int64  `toml:"max_len"`
 	Buffer      int    `toml:"buffer"`
@@ -50,13 +56,18 @@ type quoteFileConfig struct {
 // does not exist. When err is set the operator enabled it but the settings
 // were rejected; the lane stays off and the fills pipeline runs unchanged.
 type quoteSettings struct {
-	enabled   bool
-	err       error
-	symbols   []quote.Symbol
-	tokenKey  string
-	streamKey string
-	maxLen    int64
-	buffer    int
+	enabled  bool
+	err      error
+	symbols  []quote.Symbol
+	tokenKey string
+	// fetch is set when token_source = "gatewayd-fetch": the token comes
+	// from gatewayd's /fetch at fetchURL with fetchCredential, held in memory.
+	fetch           bool
+	fetchURL        string
+	fetchCredential string
+	streamKey       string
+	maxLen          int64
+	buffer          int
 }
 
 // resolveQuoteSettings never fails the fills configuration. It runs after the
@@ -109,12 +120,40 @@ func resolveQuoteSettings(contents []byte, fills runtimeConfig) quoteSettings {
 		return reject(err.Error())
 	}
 	settings.symbols = symbols
-	// The lane reads this one cached token and nothing else; it holds no
-	// Toss client id or secret and can never issue or refresh a token.
-	if !quote.ValidTokenKey(q.TokenKey) {
-		return reject("token_key must be the cached token key toss:oauth:<16 hex>:access_token")
+	switch q.TokenSource {
+	case "", quoteTokenSourceRedis:
+		// The lane reads this one cached token and nothing else; it holds no
+		// Toss client id or secret and can never issue or refresh a token.
+		if !quote.ValidTokenKey(q.TokenKey) {
+			return reject("token_key must be the cached token key toss:oauth:<16 hex>:access_token")
+		}
+		settings.tokenKey = q.TokenKey
+	case quoteTokenSourceFetch:
+		// gatewayd owns the token; the lane asks it and keeps the answer in
+		// memory. It reads no Redis token key and holds no Toss secret. A bad
+		// gatewayd setting disables this lane only, never the fills path.
+		if q.TokenKey != "" {
+			return reject("token_key is not used with token_source = \"gatewayd-fetch\"")
+		}
+		g := fills.KIS.Gatewayd
+		base, err := tokenfetch.NormalizeURL(g.URL)
+		if err != nil {
+			return reject("gatewayd-fetch needs a valid [kis.gatewayd] url")
+		}
+		if strings.TrimSpace(g.TokenEnv) == "" || !strings.EqualFold(g.TokenHeader, "Authorization") {
+			return reject("gatewayd-fetch needs [kis.gatewayd] token_env and sends it as Authorization")
+		}
+		if !tokenfetch.CredentialTransportOK(base) {
+			return reject("gatewayd-fetch credential requires an https or loopback [kis.gatewayd] url")
+		}
+		credential, ok := os.LookupEnv(g.TokenEnv)
+		if !ok || credential == "" {
+			return reject("gatewayd-fetch credential environment variable is unset")
+		}
+		settings.fetch, settings.fetchURL, settings.fetchCredential = true, base, credential
+	default:
+		return reject("token_source must be redis or gatewayd-fetch")
 	}
-	settings.tokenKey = q.TokenKey
 	settings.streamKey = q.StreamKey
 	if settings.streamKey == "" {
 		settings.streamKey = quote.DefaultStreamKey
@@ -179,6 +218,27 @@ func startQuoteLane(cfg runtimeConfig, logger *slog.Logger, dependencies runDepe
 	redisClient := redis.NewClient(redisOptions)
 
 	token := dependencies.quoteToken
+	if token == nil && settings.fetch {
+		// The lane's own client and holder: nothing is shared with the KIS
+		// approval path.
+		fetcher := dependencies.quoteFetcher
+		if fetcher == nil {
+			client, err := tokenfetch.NewClient(settings.fetchURL, settings.fetchCredential)
+			if err != nil {
+				_ = redisClient.Close()
+				logger.Error("quote reader disabled: gatewayd fetch client rejected")
+				return quoteLane{}
+			}
+			fetcher = client
+		}
+		fetched, err := quote.NewFetchedToken(fetcher, dependencies.quoteClock)
+		if err != nil {
+			_ = redisClient.Close()
+			logger.Error("quote reader disabled", "reason", err.Error())
+			return quoteLane{}
+		}
+		token = fetched
+	}
 	if token == nil {
 		cached, err := quote.NewCachedToken(redisClient, settings.tokenKey, dependencies.quoteClock)
 		if err != nil {
