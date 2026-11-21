@@ -1,0 +1,320 @@
+# broker-edge
+
+`broker-edge` contains deliberately bounded paper-trading paths plus a
+non-executing live-order audit witness:
+`kis-mock-read` is KIS VTS GET-only, and `kis-mock-edge` is a separately
+approved, loopback-only placement edge that routes a closed account scope to
+either KIS VTS or Alpaca paper crypto. `cmd/` follows Go convention only—Python
+does not import it, and Python retains ownership of `order_send_intents`.
+
+## Read path: `kis-mock-read`
+
+`kis-mock-read` reads an already-issued VTS token from Redis and makes a small,
+GET-only allowlist of KIS mock account reads. It is fail-closed:
+
+- Redis key: `kis_mock:{host}:{fp16}:access_token`, where `host` is the
+  lowercased base-URL netloc and `fp16` is the first 16 hex characters of
+  `sha256(KIS_MOCK_APP_KEY)`.
+- Cached value must be exactly a JSON object with `access_token` and numeric
+  `expires_at`; it is usable only when `now < expires_at - 60 seconds`.
+- Missing, malformed, or near-expiry tokens stop the command. There is no token
+  issuance, cache write, cache clear, refresh, or lock fallback.
+- The REST authority is pinned to
+  `https://openapivts.koreainvestment.com:29443`; HTTP, another host, and every
+  redirect are rejected. The request URL is checked again immediately before
+  transport.
+
+The read allowlist was copied read-only from the specified `auto_trader` KIS
+sources. Every operation is HTTP GET and its TR ID ends in `R`.
+
+| CLI operation | Path | VTS TR ID |
+| --- | --- | --- |
+| `domestic-balance` (or `balance`) | `/uapi/domestic-stock/v1/trading/inquire-balance` | `VTTC8434R` |
+| `overseas-balance` | `/uapi/overseas-stock/v1/trading/inquire-balance` | `VTTS3012R` |
+| `domestic-order-history` (or `orders`) | `/uapi/domestic-stock/v1/trading/inquire-daily-ccld` | `VTTC8001R` |
+| `overseas-order-history` (or `overseas-orders`) | `/uapi/overseas-stock/v1/trading/inquire-ccnl` | `VTTS3035R` |
+
+The mock pending-order inquiry is deliberately excluded because the reference
+implementation rejects it in mock mode. Integrated-margin, buyable-amount, and
+other VTS behavior have no measurement in this bootstrap and remain UNKNOWN.
+
+Human output is a count-only summary. `--json` emits this closed schema only:
+`schema_version`, `operation`, `status`, `error_code`, `tr_id`, `pages`, and
+`records`. It never emits a raw broker response, credential, Redis URL, or token
+value.
+
+## Read configuration and use
+
+Only these environment variable names are read or documented:
+
+- `KIS_MOCK_APP_KEY`
+- `KIS_MOCK_APP_SECRET`
+- `KIS_MOCK_ACCOUNT_NO`
+- `REDIS_URL`
+
+`KIS_MOCK_ACCOUNT_NO` accepts either an eight-digit CANO (which uses product
+code `01`) or an explicit ten-digit / `12345678-01` account form.
+
+[.env.example](../../deploy/edge/.env.example) has placeholders only. Keep populated env files
+out of this public repository.
+
+```sh
+go run ./cmd/kis-mock-read domestic-balance
+go run ./cmd/kis-mock-read domestic-balance --json
+go run ./cmd/kis-mock-read domestic-order-history --from 20260901 --to 20260901 --json
+go run ./cmd/kis-mock-read overseas-order-history --from 20260901 --to 20260901 --exchange NASD --json
+```
+
+## Provider-scoped token gateway: `gatewayd`
+
+`gatewayd` is a separate, loopback-only OAuth token issuer. It exposes
+`GET /healthz` and `POST /v1/tokens/{provider}/ensure`, where `provider` is the
+closed set `kis-mock`, `kis-live`, `toss`, `kis-live-approval`, or `kis-mock-approval`. The ensure response is only
+`{"state":"fresh"}` or `{"state":"issued"}`; it never includes a token.
+
+The daemon defaults to `--providers=kis-mock`. A deployment must explicitly
+select `kis-live` and/or `toss`; merely placing their credentials in the
+environment cannot activate their issuance paths. The optional autonomous mode
+also refreshes only that selected provider set:
+
+```sh
+go run ./cmd/gatewayd --ensure-interval=5m
+go run ./cmd/gatewayd --providers=kis-mock,toss --ensure-interval=5m
+```
+
+Token providers use Redis `SET NX EX 30`, recheck the cache under the lock, and
+return a fixed error rather than bypass a contended lock. Their authority and
+cache contracts are separately pinned:
+
+- `kis-mock` uses the existing VTS authority and
+  `kis_mock:{host}:{fp16}:access_token` three-field KIS JSON payload.
+- `kis-live` posts only to `https://openapi.koreainvestment.com:9443/oauth2/tokenP`,
+  uses `KIS_APP_KEY`/`KIS_APP_SECRET`, and mirrors the default Python namespace
+  exactly: `kis:access_token` and `kis:token:lock`.
+- `toss` posts only form-encoded client credentials to
+  `https://openapi.tossinvest.com/oauth2/token`, uses
+  `TOSS_API_CLIENT_ID`/`TOSS_API_CLIENT_SECRET`, and mirrors its Python cache
+  key `toss:oauth:{sha256(client_id)[:16]}:access_token` plus its **two-field**
+  JSON payload. Toss permits one valid token per client, so a replacement is
+  written to Redis before the shared lock is released.
+
+The opt-in `kis-live-approval` and `kis-mock-approval` providers use the
+corresponding KIS credentials and `/oauth2/Approval` endpoint. They share the
+Python WebSocket approval-key cache and its 15-second issuance lock. The Redis
+value is the raw approval key with a 23-hour TTL; it is refreshed when at most
+60 seconds remain. `POST /v1/tokens/{provider}/ensure?force=true` forces an
+approval-key replacement, publishing the new value atomically without first
+deleting the old value. Concurrent contenders wait for the lock holder.
+
+### Token fetch: `POST /v1/tokens/{provider}/fetch`
+
+`/fetch` lets a local consumer receive the token in the response instead of
+reading Redis on every use. It composes the existing issuance path: a miss calls
+the same `Ensure` that `/ensure` calls (same Redis lock, leases, timeouts and
+Redis writes), then reads the Redis value **and** its remaining TTL in one
+script execution and keeps the result in gatewayd's memory. `/ensure` and
+`/healthz` are unchanged; Python keeps reading the same Redis keys.
+
+- Request: `Authorization: Bearer <consumer credential>` and a JSON body of
+  `{}` or `{"failed_token_sha256":"<64 lowercase hex>"}`; unknown fields are
+  `400`.
+- `200`: `{"provider","token","expires_at" (RFC 3339 UTC),"token_sha256","source"}`
+  with `Cache-Control: no-store`. `source` is `memory`, `redis` or `issued`.
+- Errors never carry a token: `401 unauthenticated`, `403 provider_not_allowed`,
+  `404 unknown_provider`, `400 bad_request`, `503 issue_unavailable`
+  (body `{"error":"<code>"}`).
+- Without a failed hash, a token with more than 60 s left is served from memory
+  (zero Redis calls); otherwise `Ensure` runs. A failed hash equal to the
+  current token's hash forces a reissue under the lock; a different hash means
+  the caller is stale and gets the current token (read from Redis, never from
+  memory alone) without a reissue. A token confirmed failed is not served again
+  until a different usable token replaces it; overlapping reports of the same
+  failed token share one reissue attempt. If the token
+  the caller reported as failed is still current after the reissue (contended
+  lock, or the broker returned the same token), the answer is
+  `503 issue_unavailable` — there is no retry loop.
+- Consumer auth applies to `/fetch` only and is off by default (every request is
+  `401`). Configure it with `GATEWAYD_FETCH_CONSUMERS`, a JSON array of
+  `{"name","credential","providers"}`; credentials are at least 32 characters,
+  compared in constant time, and each consumer may read only its listed
+  providers. The listener stays loopback-only.
+- The token never appears in logs, metrics labels, errors or recovered panics.
+  `gatewayd_fetch_results_total{provider,result}` counts outcomes.
+
+**Assumption:** one gatewayd is the sole issuer for each credential. A token
+rotated by another issuer is noticed only through a consumer's failed-hash
+report. There is no revocation, withdrawal, lease-extension or multi-instance
+handling.
+
+`gatewayd` has no order, command, intent, or execution endpoint. It exposes
+loopback `GET /metrics` with standard Go/process collectors and a bounded
+`gatewayd_ensure_results_total{provider,state}` counter.
+
+## Mock placement edge: `kis-mock-edge`
+
+`kis-mock-edge` accepts `POST /v1/commands`,
+`POST /v1/commands/{command_id}/cancel`,
+`POST /v1/commands/{command_id}/resolve`, and Prometheus-format `GET /metrics`
+on `127.0.0.1:8080` by default. The listener rejects non-loopback overrides.
+`account_scope` is closed
+to `kis_mock`, `kis_mock_us`, `alpaca_paper_crypto`, and `kis_live`. The mock
+scopes use the SQLite receipt store,
+where `command_id UNIQUE` means a repeated ID returns the saved receipt and
+makes zero additional broker POSTs.
+
+The edge metric registry includes standard Go/process collectors plus bounded
+`broker_edge_commands_total{scope,disposition}`,
+`broker_edge_cancels_total{scope,state}`,
+`broker_edge_broker_requests_total{scope,kind}`, and an HTTP duration
+histogram. Command IDs, symbols, prices, and quantities are never metric
+labels.
+
+Placement is disabled by default. It is allowed only when
+`BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit. A pending `UNKNOWN` receipt
+is committed immediately before the one possible broker POST. Therefore a kill,
+timeout, 5xx, redirect, or ambiguous provider response cannot be retried as
+`NOT_CREATED`.
+
+### KIS live boundary — shadow witness only (2026-09-02)
+
+`kis_live` is a **shadow witness only** in Phase 1. With
+`EDGE_KIS_LIVE_SHADOW_ENABLED=true`, `POST /v1/commands` validates and records
+Python's immutable live-order intent in SQLite, but sends **zero broker HTTP
+requests**. It returns a replayable `{witness_id, command_id, recorded_at,
+mode:"shadow"}` receipt. Python may attach the actual broker response through
+`POST /v1/commands/{command_id}/echo`; missing echoes are available at
+`GET /v1/commands?scope=kis_live&missing_echo=true`.
+
+`EDGE_KIS_LIVE_MODE` may only be `shadow` (or omitted, which defaults to it);
+any other value makes startup fail. No live host pin, live token lookup, token
+write, or live request builder exists in this edge. Phase 2 egress requires a
+separate approval.
+
+The `kis_mock` path supports Korean limit orders only. It preserves price and
+quantity strings verbatim, rejects invalid KRX ticks rather than adjusting them,
+and has non-configurable caps of 100 shares and KRW 1,000,000 notional. It
+reuses the read path's GET-only cached token loader; it cannot issue or mutate a
+token.
+
+The `alpaca_paper_crypto` smoke path is independent of Redis and KIS tokens.
+It accepts only a `buy` limit order for `BTC/USD` (carried in the existing
+`stock_code` field), with positive decimal `quantity` and `price` strings and a
+non-configurable USD 10 notional cap. It sends those strings unchanged to only
+`https://paper-api.alpaca.markets/v2/orders`, authenticating with static paper
+key headers, and sends the durable command ID as Alpaca's `client_order_id`.
+The live `https://api.alpaca.markets` authority, HTTP, host overrides, and
+redirects are all refused before a second transfer can occur.
+
+Local settings:
+
+- `BROKER_EDGE_MOCK_PLACE_ENABLED` — must be exactly `true` to permit a place.
+- `BROKER_EDGE_LISTEN_ADDR` — optional loopback address; default
+  `127.0.0.1:8080`.
+- `BROKER_EDGE_SQLITE_PATH` — optional local receipt database; default
+  `kis-mock-edge.sqlite` relative to the process working directory. Deployed
+  units must set it to a path inside the mounted state directory: the default
+  lands inside the container's ephemeral layer under `docker run --rm`.
+- `EDGE_KIS_LIVE_SHADOW_ENABLED` — must be exactly `true` to accept `kis_live`
+  intent witnesses; otherwise the scope returns `403 scope_disabled`.
+- `EDGE_KIS_LIVE_MODE` — optional; only `shadow` is accepted.
+- `ALPACA_PAPER_CRYPTO_API_KEY` — static paper API key, used only for
+  `alpaca_paper_crypto`.
+- `ALPACA_PAPER_CRYPTO_API_SECRET` — static paper API secret, used only for
+  `alpaca_paper_crypto`.
+
+Run it only after the explicit gate is intentionally armed:
+
+```sh
+BROKER_EDGE_MOCK_PLACE_ENABLED=true go run ./cmd/kis-mock-edge
+```
+
+### Resolving an UNKNOWN receipt
+
+`kis-mock-edge resolve` is a bounded, read-only reconciliation command. It
+uses the existing GET-only domestic order-history route (`VTTC8001R`) for the
+KIS mock account and never performs a placement, token issue, refresh, or
+cache write.
+
+```sh
+go run ./cmd/kis-mock-edge resolve
+go run ./cmd/kis-mock-edge resolve --grace=10m
+```
+
+For a stored `UNKNOWN/kis_mock` receipt, one matching order (side, stock,
+quantity, price, and send-time window) appends an `ACCEPTED` resolution with
+the broker order number. A successful complete read with no match appends
+`NOT_CREATED/resolved_absent` only after the ten-minute default grace period.
+Read errors, multiple matches, and young receipts remain `UNKNOWN`. The
+original receipt row is preserved; resolution is an additive SQLite record and
+the command's JSON output contains the resulting receipt(s).
+
+For a newer stored `UNKNOWN/alpaca_paper_crypto` receipt, the resolver performs
+only a pinned `GET /v2/orders:by_client_order_id?client_order_id=...` evidence
+read. A matching echoed client order ID appends `ACCEPTED`; a completed 404
+after grace appends `NOT_CREATED/resolved_absent`; failures remain `UNKNOWN`.
+Historical Alpaca rows without a persisted client-order-id mapping remain
+`UNKNOWN`, because absence cannot be proven for them.
+
+`POST /v1/commands/{command_id}/resolve` applies the same single-command
+check on demand and answers a `command-check/v1` object: the effective
+disposition, whether an evidence read ran (`completed`, `not_needed`,
+`unavailable`), and match counts. The canary uses it after an ambiguous place
+to decide whether its own timed-out order is resting before cancelling it.
+
+See [the edge boundary](kis-mock-edge.md) for the command, receipt, and
+failure contract. Repository tests use fake transport responses and do not
+place real VTS orders.
+
+## What it does not do
+
+This repository does **not** contain Go PG intents, gRPC, proto, or an
+`auto_trader` modification/dependency. Its only live authorities are the
+provider-pinned OAuth token endpoints documented above; it does not place live
+orders or support order modification, market orders, Binance, or any paper
+mutation beyond the specifically gated KIS domestic limit and Alpaca BTC/USD
+limit placement boundaries plus cancellation of a durably ACCEPTED order.
+Cancellation is available only through `POST /v1/commands/{command_id}/cancel`;
+it is durably idempotent and cannot issue a second broker request.
+
+Do not cite or integrate the orphan `auto_trader kis_websocket` Redis pub/sub
+legacy path. OPSP8996 때문에 live WS shadow는 금지하며,
+[fixtures/edge/](../../fixtures/edge/) is only a placeholder directory.
+
+[`execution_contracts/`](../../execution_contracts/) provides the minimal command and receipt schema. Python은
+지금 이 스키마로 호출하지 않는다.
+
+## Verification
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+./scripts/edge/secret_scan.sh
+```
+
+
+### KIS mock US extension
+
+`kis_mock_us` is an additive, fixed-NASD KIS VTS limit-order surface. It
+accepts uppercase US symbols (including `BRK.B`, sent as `BRK/B`), positive
+integer shares, and positive decimal prices. It mirrors auto_trader's overseas
+VTS TR IDs: buy `VTTT1002U`, US sell `VTTT1001U`, and cancellation
+`VTTT1004U`; no hashkey is sent. Its immutable limits are 100 shares and USD
+1,000 notional.
+
+UNKNOWN US receipts are resolved only by mock-available overseas daily history:
+GET `/uapi/overseas-stock/v1/trading/inquire-ccnl` with `VTTS3035R`.
+`TTTS3018R` is not used because auto_trader rejects that mock pending-order
+inquiry. A domestic-only reader is never evidence for a US conclusion.
+
+With the local edge already running and its placement gate armed, run the
+bounded one-shot smoke path with:
+
+```sh
+sh ./scripts/edge/kis_mock_us_smoke.sh
+```
+
+It creates a `broker-edge-smoke:` correlation ID, places exactly one AAPL
+share at a USD 1–50 limit (default USD 1), requires ACCEPTED, cancels it, then
+runs the read-only resolver. `BROKER_EDGE_SMOKE_URL` must stay on
+`http://127.0.0.1:...`.

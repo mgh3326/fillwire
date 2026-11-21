@@ -1,0 +1,19 @@
+[Unit]
+Description=broker-edge gatewayd container (digest pinned)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# STATE_DIR and the --env-file path are host-specific placeholders.
+Environment=STATE_DIR=/var/lib/broker-edge
+EnvironmentFile=${STATE_DIR}/gatewayd.service.image
+ExecStartPre=-/usr/bin/docker rm -f gatewayd
+ExecStart=/usr/bin/docker run --rm --name gatewayd --network host --env-file /etc/broker-edge/PLACEHOLDER.env ${IMAGE} gatewayd
+ExecStop=/usr/bin/docker stop --time 30 gatewayd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

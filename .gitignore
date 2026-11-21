@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+bin/
+coverage.out
+
+# Built by "go build ./cmd/edge-canary" without -o; never commit it (broker-edge c450f46 did).
+/edge-canary
+/kis-mock-edge
+/kis-mock-read
+/gatewayd
+/market-tap
+/fillwire

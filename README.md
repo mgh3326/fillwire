@@ -743,6 +743,17 @@ go test ./cmd/execmock ./internal/book -update
 
 PR1 exposes a named in-process counter snapshot for validation drops, duplicate suspects, successful XADDs, successful XACKs, and failed ingest attempts. It deliberately has no Prometheus dependency or endpoint.
 
+## broker-edge now lives here
+
+The `broker-edge` repository (`mgh3326/broker-edge` @ `0bdec8e`) was imported into this repository with its history (hk 5872). Its commands are `cmd/{edge-canary,gatewayd,kis-mock-edge,kis-mock-read,market-tap}`; the packages are under `internal/{canary,gatewayd,kislive,kismockedge,kismockread}` plus `execution_contracts/`. Behaviour and flags are unchanged. `Dockerfile.edge` builds the same four-binary image that `broker-edge` published, until the deploy cut-over (hk 5874).
+
+Its documents moved:
+
+- [`docs/edge/README.md`](docs/edge/README.md): the former `broker-edge` README (commands, environment, gatewayd, kis-mock-edge).
+- [`docs/edge/`](docs/edge): `kis-mock-edge.md`, `canary.md`, `digest-pin-deploy.md`.
+- [`deploy/edge/`](deploy/edge): systemd units, observability, `.env.example`, container-unit notes.
+- [`scripts/edge/`](scripts/edge) and [`fixtures/edge/`](fixtures/edge).
+
 ## 시세 기록기 (기본 비활성화)
 
 Upbit 공개 웹소켓 기록기는 API 키 없이 최대 20개 KRW 마켓의 `orderbook`(15개 호가 단위, 상위 10개 활용 가능) 및 `trade` 프레임을 수신합니다. `[upbit] enabled = true`를 설정하고 `markets_file`에 한 줄마다 `KRW-BTC`와 같은 마켓 코드를 적은 뒤 서비스를 재시작하세요. 기록은 `<directory>/upbit/<UTC 날짜>/<마켓>.jsonl`에 추가되며 UTC 날짜가 바뀌면 이전 파일을 동기화하고 gzip으로 닫습니다. 연결 단절 및 재연결은 `gap`과 `connected` 레코드로 남습니다.
@@ -765,3 +776,7 @@ fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fil
 ## 재연결 reconcile 트리거 (기본 비활성화)
 
 `[reconcile] enabled = true`로 켜면 KIS 최초 구독 직후, 재연결 성공 직후, 그리고 `interval`(설정 시)마다 auto_trader의 `reconcile/trigger` 엔드포인트를 호출해 수 초의 체결 통지 공백을 바로 메웁니다. 토큰은 `[ingest]`와 같은 것을 쓰며 로그에 남지 않습니다. 호출은 체결 처리 경로와 분리되어 있어 느리거나 실패해도 처리·종료에 영향이 없습니다. 기본값 `dry_run = true`는 보고만 하며, `dry_run = false`(커밋) 전환과 auto_trader의 30분 TaskIQ 크론 해제는 별도 승인 후의 환경 변경입니다.
+
+## broker-edge 통합
+
+`broker-edge` 저장소(`mgh3326/broker-edge` @ `0bdec8e`)를 이력째 이 저장소로 들여왔습니다(hk 5872). 명령은 `cmd/{edge-canary,gatewayd,kis-mock-edge,kis-mock-read,market-tap}`, 패키지는 `internal/{canary,gatewayd,kislive,kismockedge,kismockread}`와 `execution_contracts/`에 있고 동작과 플래그는 바뀌지 않았습니다. 배포 전환(hk 5874) 전까지 `Dockerfile.edge`가 `broker-edge`가 게시하던 것과 같은 4개 바이너리 이미지를 만듭니다. 문서는 [`docs/edge/README.md`](docs/edge/README.md)와 `docs/edge/`, `deploy/edge/`, `scripts/edge/`, `fixtures/edge/`로 옮겼습니다.

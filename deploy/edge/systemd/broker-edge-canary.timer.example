@@ -1,0 +1,10 @@
+[Unit]
+Description=Run broker-edge mock order canary hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=broker-edge-canary.service
+
+[Install]
+WantedBy=timers.target
