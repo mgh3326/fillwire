@@ -556,6 +556,9 @@ func (r *run) closeGap(at time.Time) {
 }
 
 func (r *run) finish() Report {
+	// A plan that cancels needs one more step to finish (it has no cancel
+	// outcome to wait for), so the recording's end steps it twice.
+	r.tick(r.lastAt)
 	r.tick(r.lastAt)
 	for _, c := range r.pending {
 		c.Status = StatusNotArrived
