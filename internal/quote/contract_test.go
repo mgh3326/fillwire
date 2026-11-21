@@ -22,6 +22,19 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("module root not found at %s", root)
 	}
+	// gatewayd is the one sanctioned token issuer (imported from broker-edge,
+	// hk 5872): it owns the Toss/KIS OAuth issuance this test keeps everything
+	// else away from. Only these two directories are exempt; both must exist so
+	// a rename cannot silently widen the exemption.
+	issuerDirs := map[string]bool{
+		filepath.Join(root, "internal", "gatewayd"): true,
+		filepath.Join(root, "cmd", "gatewayd"):      true,
+	}
+	for dir := range issuerDirs {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Fatalf("token issuer directory %s not found", dir)
+		}
+	}
 	forbidden := []string{"oauth2", "/oauth", "client_secret", "client_credentials", "grant_type", "openapi.tossinvest.com", "toss_api_client"}
 	tossHosts := 0
 	scanned := 0
@@ -30,6 +43,9 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 			return err
 		}
 		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == "testdata") {
+			return filepath.SkipDir
+		}
+		if entry.IsDir() && issuerDirs[path] {
 			return filepath.SkipDir
 		}
 		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {

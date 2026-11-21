@@ -86,7 +86,28 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # gitleaks-action scans a pull request as <first commit>^..head, which
+      # errors on a root commit; the broker-edge import (hk 5872) carries one.
+      # Pull requests therefore run the same gitleaks release directly, pinned
+      # by version and sha256 (checksums.txt of the v8.24.3 release), over
+      # base..head, which includes every imported commit.
+      - name: gitleaks (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          GITLEAKS_VERSION: 8.24.3
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$archive"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          "$RUNNER_TEMP/gitleaks/gitleaks" detect --redact -v --exit-code=2 --no-banner --log-opts="--no-merges ${BASE_SHA}..${HEAD_SHA}"
       - name: gitleaks
+        if: github.event_name != 'pull_request'
         uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
