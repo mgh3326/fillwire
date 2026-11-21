@@ -34,7 +34,9 @@ import (
 //  5. A gap record opens a window that the next connected record (or the next
 //     frame) closes. A child still in flight when a gap opens is void, and no
 //     fill is recognised inside the window. A gap longer than GapExposedAfter
-//     that opens while a position is held marks the run gap_exposed.
+//     that opens while the run holds a position (positionHeld) marks it
+//     gap_exposed; the episode, which knows the position the run does not,
+//     is the harness's to judge.
 //  6. Every run is done once per fill rule, so through and touch are counted
 //     separately; the plan decides from the fills of its own rule.
 //  7. An intent with stop_price_krw is a stop-loss sell, dormant until
@@ -347,14 +349,14 @@ func (r *run) feed(ev Event) error {
 	case EventTrade:
 		r.closeGap(ev.At)
 		if r.live() {
+			r.handle(r.plan.Tick(ev.At), ev.At)
 			if err := r.onTrade(ev.At, ev.Trade); err != nil {
 				return err
 			}
-			r.handle(r.plan.Tick(ev.At), ev.At)
 		}
 	case EventGap:
-		r.openGap(ev.At)
 		r.tick(ev.At)
+		r.openGap(ev.At)
 	case EventRefused:
 		r.refused++
 	default: // connected, other
@@ -537,12 +539,23 @@ func (r *run) openGap(at time.Time) {
 	if r.inGap {
 		return
 	}
-	r.inGap, r.gapAt, r.gapHeld = true, at, !r.filled.IsZero()
+	r.inGap, r.gapAt, r.gapHeld = true, at, r.positionHeld()
 	r.gaps++
 	for _, c := range r.pending {
 		c.Status = StatusVoidGap
 	}
 	r.pending = nil
+}
+
+// positionHeld is whether this run has a position exposed to the market. A
+// buy holds one from its first fill on, to the end of the recording. A sell
+// holds the position it is selling from the run's start until it is done or
+// filled; a stop that never triggered under the slot value sells nothing.
+func (r *run) positionHeld() bool {
+	if r.in.Side == Buy {
+		return !r.filled.IsZero()
+	}
+	return r.started && !r.dead && r.plan.Done() == "" && r.filled.Cmp(r.in.Target()) < 0
 }
 
 func (r *run) closeGap(at time.Time) {
