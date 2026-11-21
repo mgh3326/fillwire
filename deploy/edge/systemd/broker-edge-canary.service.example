@@ -1,0 +1,10 @@
+[Unit]
+Description=broker-edge mock order canary (one bounded round trip)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Create this local file with real mock-only configuration; never commit it.
+EnvironmentFile=/etc/broker-edge/canary.env
+ExecStart=/usr/bin/docker run --rm --network host --env-file /etc/broker-edge/canary.env --mount type=bind,src=/var/lib/node_exporter/textfile,dst=/var/lib/node_exporter/textfile broker-edge:REPLACE_WITH_IMAGE_TAG edge-canary

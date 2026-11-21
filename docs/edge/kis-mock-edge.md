@@ -1,0 +1,181 @@
+# kis-mock-edge boundary design
+
+## Approved scope
+
+`kis-mock-edge` is a deliberately narrow, local HTTP receiver for a closed set
+of paper-only placement commands: Korean equity **mock VTS** and Alpaca paper
+crypto. It is the separately approved evolution of the formerly reserved
+command name; it does not change Python ownership of `order_send_intents`,
+redirect Python traffic, or modify `auto_trader`.
+
+The receiver exposes `POST /v1/commands`,
+`POST /v1/commands/{command_id}/cancel`, the bounded
+`POST /v1/commands/{command_id}/resolve`, and the read-only
+`GET /v1/price-band`, and binds to `127.0.0.1:8080` by
+default. `BROKER_EDGE_LISTEN_ADDR` may select another loopback address (for
+example `127.0.0.1:0` in tests), but cannot expose the unauthenticated receiver
+on a non-loopback interface. Authentication and authorization remain a later,
+separate design.
+
+## Command and receipt boundary
+
+`execution_contracts.ExecutionCommandV1` has only these fields:
+`schema_version`, `command_id`, `account_scope`, `side`, `stock_code`,
+`quantity`, `price`, `order_type`, and `issued_at`. Account scope is closed to
+`kis_mock` and `alpaca_paper_crypto`; both accept only `limit` orders so their
+fixed notional caps can be proven before sending. The wire shape is unchanged:
+for `alpaca_paper_crypto`, `stock_code` carries the Alpaca symbol.
+
+Price and quantity are decimal strings and are sent unchanged. For `kis_mock`,
+quantity and price must be positive integer strings; the KRX tick table and
+buy-floor/sell-ceiling logic are ported as pure validation functions from
+`auto_trader`, and a nonmatching limit price receives `NOT_CREATED` with
+`tick_mismatch`. For `alpaca_paper_crypto`, both values must be positive strict
+decimal strings and no KRX tick check is applied. The edge never adjusts or
+re-prices a command.
+
+`ExecutionReceiptV1` is the only successful command response shape. Its
+`disposition` is a closed vocabulary:
+
+- `NOT_CREATED`: a deterministic pre-send check failed.
+- `ACCEPTED`: the mock broker returned `rt_cd="0"` and an order number.
+- `UNKNOWN`: the pending send boundary was crossed but provider acceptance
+  cannot be proved.
+
+`broker_order_id` and `error_code` are optional. When the broker answered a
+place or cancel without accepting it, the response additionally carries
+`rejection`: the broker's own `rt_cd`, `msg_cd`, `msg1`, and `http_status`,
+masked at capture so account numbers, access tokens, and application keys can
+never appear. `rejection` is response-only — no schema column persists it —
+and aside from it the response does not contain broker payloads, credentials,
+account identifiers, order details, or tokens.
+
+## Durable idempotency and failure semantics
+
+The local SQLite `commands` table has a `command_id UNIQUE` constraint and
+stores the receipt. Reusing a command ID always returns its durable receipt and
+does not POST to the broker again.
+
+Immediately before the single broker POST, the edge commits an `UNKNOWN`
+pending receipt. If the process dies after that commit, including while the
+HTTP operation may have reached a broker, a restart returns that `UNKNOWN`
+receipt and never resends. Broker timeouts, 5xx responses, redirects, malformed
+responses, and non-accepted responses after this point remain `UNKNOWN`; they
+are never relabeled `NOT_CREATED`.
+
+## Cancellation boundary
+
+Cancellation is not a new order command: the path parameter must identify an
+effective `ACCEPTED` receipt with a stored broker order id. Missing,
+`NOT_CREATED`, and `UNKNOWN` commands are rejected before broker preparation
+or network activity. The additive `cancel_attempts` table has a unique command
+id and records one closed cancellation state. It commits `UNKNOWN` immediately
+before the cancellation request; duplicate calls replay it and never send
+again. A completed cancellation is `CANCELLED`, a provider 404 is
+`NOT_FOUND/cancel_not_found`, and every ambiguous post-send outcome remains
+`UNKNOWN`.
+
+Alpaca paper cancellation is `DELETE /v2/orders/{broker_order_id}` and only a
+204 result is `CANCELLED`. KIS mock cancellation uses the VTS-pinned
+`VTTC0013U` `order-rvsecncl` TR with its domestic cancellation body, including
+the stored order number as `ORGN_ODNO`, `RVSE_CNCL_DVSN_CD="02"`, and KRX
+routing. It does not introduce a live KIS authority or credential path.
+
+`kis-mock-edge resolve` is the only later conclusion path. It queries the
+already allowlisted, GET-only VTS domestic daily-order history endpoint
+(`VTTC8001R`) and appends a resolution record; it does not alter the original
+receipt. A single order matching side, stock, quantity, price, and the pending
+send timestamp within its fixed five-minute match window yields `ACCEPTED` and
+the broker order number. A successful complete query with no corresponding
+order may yield `NOT_CREATED/resolved_absent` only after a ten-minute grace
+period. Query failure, ambiguous matches, and an unexpired grace period remain
+`UNKNOWN` without a resolution record. Legacy receipt rows that predate stored
+command facts are resolved absent only when the successful day query contains
+zero orders.
+
+`POST /v1/commands/{command_id}/resolve` applies the same machinery to one
+command on demand. It exists for callers — notably the canary — that must
+learn whether their own command's possibly-sent order is resting before they
+decide to cancel. The answer is a `CommandCheckV1` (`command-check/v1`):
+`disposition` is the command's effective disposition after the check,
+`broker_order_id` appears only when the disposition is `ACCEPTED`,
+`evidence_read` reports `completed`, `not_needed` (the stored disposition was
+already conclusive), or `unavailable` (no evidence source can address the
+command), and `orders_seen`/`matched` carry counts only. Matching is by the
+command's own stored facts — a same-symbol foreign order never satisfies it —
+and the only possible write is the same additive `command_resolutions` row the
+scheduled resolver appends. An unknown command answers `404`, an invalid ID
+`400`, a store failure `500`, and an evidence-read failure `502` with the
+reader's closed code. The endpoint never issues a broker mutation; the canary
+combines it with the existing command-id cancel to clean up exactly its own
+proven-resting order.
+
+## Read-only price band
+
+`GET /v1/price-band` serves one domestic mock symbol's daily price band. The
+query must be exactly `scope=kis_mock&stock_code=<6 digits>`; anything else is
+`400/invalid_command`. The edge answers `PriceBandV1` — `schema_version`,
+`stock_code`, `last_price`, `upper_limit`, `lower_limit`, `base_price`, each a
+decimal digit string — mapped from the KIS inquire-price output fields
+`stck_prpr`, `stck_mxpr`, `stck_llam`, and `stck_sdpr`.
+
+The inquiry is `GET /uapi/domestic-stock/v1/quotations/inquire-price` with
+`tr_id=FHKST01010100` on the same pinned VTS authority as the order paths,
+using the same strict read-only cached token. It issues no token, writes
+nothing durable, records no pending marker, and cannot prepare an order.
+Configuration, token, transport, and parse failures are `502` with the
+reader's closed error code, so a caller can always fail closed. The canary
+uses it to derive its KR limit price at run time.
+
+## Mock-only placement gates
+
+Placement is disabled unless `BROKER_EDGE_MOCK_PLACE_ENABLED=true` is explicit.
+When disabled, no configuration load, Redis access, or broker transport call
+is attempted and the receipt is `NOT_CREATED/place_disabled`.
+
+For `kis_mock`, immutable process constants cap a command at 100 shares and KRW
+1,000,000 notional. There is no environment override that can raise either cap.
+The only KIS broker URL is the pinned HTTPS VTS authority
+`openapivts.koreainvestment.com:29443`; redirects are refused and the final URL
+is rechecked inside the transport.
+
+The edge reuses `kis-mock-read`'s strict cached-token loader. It can only issue
+Redis `GET` and validate the existing Python-written token payload. It has no
+token issuance, refresh, clear, migration, write, or lock capability.
+
+## Alpaca paper crypto scope
+
+`alpaca_paper_crypto` is a separate `Broker` implementation selected only when
+`account_scope` exactly matches that value. It has no Redis or KIS-token
+dependency. It reads only `ALPACA_PAPER_CRYPTO_API_KEY` and
+`ALPACA_PAPER_CRYPTO_API_SECRET`; these static values are used only as the
+`APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` request headers and are never
+returned, logged, or placed in a receipt.
+
+The scope allows only `buy` `BTC/USD` orders. `quantity` and `price` are
+positive decimal strings; their exact product may not exceed USD 10. There is
+no environment override for the allowlist, side, or cap. The request is one
+`POST /v2/orders` body with `symbol`, `qty`, `side`, `type="limit"`,
+`limit_price`, and `time_in_force="gtc"`. A 2xx response is accepted only when
+it contains a nonempty string `id` and a `status` field.
+
+The only permitted authority is `https://paper-api.alpaca.markets`. HTTP,
+userinfo, fragments, ports, redirects, and every other host are refused. The
+live `https://api.alpaca.markets` authority is a compile-time forbidden value in
+the same spirit as `auto_trader`'s `FORBIDDEN_TRADING_BASE_URLS`; it cannot be
+set through the environment. The pin is checked when constructing the request
+and again inside the RoundTripper immediately before any transport call.
+
+## Explicit exclusions
+
+- No live KIS host, live credentials, or live place route exists here.
+- No live Alpaca host, live credential name, or host override exists here.
+- No modification, market order, or other mutation endpoint is exposed.
+- `POST /v1/commands/{command_id}/cancel` may cancel only a durably
+  `ACCEPTED` command with a broker order id. It persists one closed result:
+  `CANCELLED`, `NOT_FOUND` (`cancel_not_found`), or `UNKNOWN`; duplicate POSTs
+  replay that result and never resend the broker request.
+- No retry or replay path can issue a second broker POST for a command ID.
+- No account, order, or token values are emitted as metrics or response data.
+- This repository's tests use fake transports only; they do not execute a real
+  KIS VTS or Alpaca paper placement.
