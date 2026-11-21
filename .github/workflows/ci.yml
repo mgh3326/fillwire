@@ -62,11 +62,18 @@ jobs:
         run: GOMAXPROCS=4 go test -race -p=4 ./... -count=1
       - name: go build
         run: GOMAXPROCS=4 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p=4 -trimpath -ldflags='-s -w' -o /tmp/fillwire ./cmd/fillwire
+      # Imported from broker-edge (hk 5872): its CI ran this script test too. The
+      # Go packages are already covered by the vet and test steps above.
+      - name: edge deploy-pull script test
+        run: sh scripts/edge/deploy-pull_test.sh
       # The main stage's image build is publish (below), which builds and
       # pushes the same image to GHCR. Pull requests keep the local build.
       - name: container build
         if: github.event_name == 'pull_request'
         run: docker buildx build --load --platform linux/amd64 --tag "fillwire:pr-${GITHUB_SHA}" .
+      - name: edge container build
+        if: github.event_name == 'pull_request'
+        run: docker buildx build --load --platform linux/amd64 --file Dockerfile.edge --tag "broker-edge:pr-${GITHUB_SHA}" .
 
   secrets:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.suite != 'deploy' }}

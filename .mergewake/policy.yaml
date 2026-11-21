@@ -12,8 +12,19 @@ blocking:
     reason: Sink and decoder changes write or classify fills in the execution ledger before a revert.
   - paths: ['fillwire.toml', 'cmd/**']
     reason: Runtime configuration and entrypoint changes alter which streams and sinks run in production.
-  - paths: ['deploy/**', 'Dockerfile', '.dockerignore']
+  - paths: ['deploy/**', 'Dockerfile', 'Dockerfile.edge', '.dockerignore']
     reason: Deploy, image and host-unit changes reach production directly.
+  # Carried over from broker-edge's policy (hk 5872); cmd/** above already covers the cmd/ paths.
+  - paths:
+      - 'internal/kismockedge/**'
+      - 'cmd/kis-mock-edge/**'
+      - 'execution_contracts/**'
+    reason: The placement edge sends paper/demo orders to KIS VTS and Alpaca paper; a revert does not undo a sent order.
+  - paths:
+      - 'internal/kislive/**'
+      - 'internal/gatewayd/**'
+      - 'cmd/gatewayd/**'
+    reason: Live-account witness and broker token issuance (gatewayd owns KIS/Toss OAuth for the production fleet); a wrong token publish or invalidation breaks live sessions before a revert.
   - paths: ['.github/workflows/**', '.mergewake/**', 'go.mod', 'go.sum']
     reason: Verification, dependency and policy changes can bypass recovery controls.
 review_gate:
@@ -24,3 +35,6 @@ fast_lane:
 deploy_approval:
   - paths: ['internal/reader/**', 'internal/sink/**', 'internal/stream/**', 'deploy/**']
     reason: Feed authorization, durable ledger writes or service enablement changes
+  # Carried over from broker-edge's policy (hk 5872).
+  - paths: ['internal/gatewayd/**', 'cmd/gatewayd/**', 'internal/kismockedge/**', 'cmd/kis-mock-edge/**', 'internal/kislive/**', 'execution_contracts/**', 'Dockerfile.edge']
+    reason: Host units and processes that hold broker credentials or send orders; rollout needs an operator decision.
