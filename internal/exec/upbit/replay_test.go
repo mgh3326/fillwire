@@ -40,9 +40,16 @@ func top(ms, bid int64, ask int64) string {
 }
 
 func tradeLine(ms, price int64, vol string) string {
-	raw := fmt.Sprintf(`{"type":"trade","code":"KRW-XRP","timestamp":%d,"trade_price":%d.0,"trade_volume":%s,"ask_bid":"BID","sequential_id":1}`,
-		at(ms).UnixMilli(), price, vol)
+	raw := fmt.Sprintf(`{"type":"trade","code":"KRW-XRP","timestamp":%d,"trade_price":%d.0,"trade_volume":%s,"ask_bid":"BID","sequential_id":%d}`,
+		at(ms).UnixMilli(), price, vol, 1_000_000+ms)
 	return fmt.Sprintf(`{"kind":"trade","market":"KRW-XRP","received_at":%q,"raw":%s}`, iso(ms), raw)
+}
+
+// tradeSeq is a trade frame with an explicit stream type and sequential id.
+func tradeSeq(ms, price int64, vol, stream string, seq int64) string {
+	raw := fmt.Sprintf(`{"type":"trade","code":"KRW-XRP","timestamp":%d,"trade_price":%d.0,"trade_volume":%s,"ask_bid":"BID","sequential_id":%d,"stream_type":%q}`,
+		at(ms).UnixMilli(), price, vol, seq, stream)
+	return fmt.Sprintf(`{"kind":"trade","market":"KRW-XRP","received_at":%q,"sequential_id":%d,"raw":%s}`, iso(ms), seq, raw)
 }
 
 func markLine(kind string, ms int64) string {
@@ -108,7 +115,9 @@ func TestRule1And2ChildArrivesAfterOneSecondAndSweepsDisplayedDepth(t *testing.T
 		top(0, 2_999, 3_000),
 		// 500 ms: better ask, but the child cannot be there yet.
 		orderbookLine(500, []lvl{{2_990, "50"}}, []lvl{{2_989, "1"}}),
-		deep)
+		deep,
+		// The next book still has an ask at the limit: the resting rest fills.
+		top(1_500, 2_994, 3_000))
 
 	through := byRule(t, reports, RuleThrough, TriggerNone)
 	submit := through.Children[0]
@@ -125,11 +134,14 @@ func TestRule1And2ChildArrivesAfterOneSecondAndSweepsDisplayedDepth(t *testing.T
 		t.Fatalf("through result = %+v", through.Result)
 	}
 
-	// Touch: the 15 taken, the other 18 fill at the limit because the same
-	// frame's ask is at or through it.
+	// Touch: the 15 taken on arrival; the other 18 fill at the limit only on
+	// the next book, because the arrival frame's own touch was just swept.
 	touch := byRule(t, reports, RuleTouch, TriggerNone)
 	if got := fillSummary(touch.Children[0]); got != "10@2995/taker 5@3000/taker 18@3000/touch_book" {
 		t.Fatalf("touch fills = %q", got)
+	}
+	if f := touch.Children[0].Fills[2]; !f.At.Equal(at(1_500)) {
+		t.Fatalf("touch_book fill at %s, want the 1500 ms book", f.At)
 	}
 	if touch.Result.Filled.String() != "33" || touch.Result.Done != DoneFilled {
 		t.Fatalf("touch result = %+v", touch.Result)
@@ -588,5 +600,165 @@ func TestReadRecordsReadsPlainAndGzipDays(t *testing.T) {
 	}
 	if err := ReadRecords(plain, func(Event) error { return nil }); err == nil || !strings.Contains(err.Error(), "line 1") {
 		t.Fatalf("bad line: %v", err)
+	}
+}
+
+// Review finding: children that arrive on one frame share its displayed size.
+func TestArrivalsOnOneFrameShareDisplayedDepth(t *testing.T) {
+	reports := runReplay(t, []ReplayIntent{buyIntent(t, nil)},
+		top(0, 2_999, 3_000),
+		top(100, 2_999, 3_001), // the plan amends 3000 -> 3001
+		orderbookLine(1_200, []lvl{{3_000, "10"}, {3_002, "100"}}, []lvl{{2_999, "1"}, {2_998, "1"}}))
+	through := byRule(t, reports, RuleThrough, TriggerNone)
+	if len(through.Children) < 2 || through.Children[1].Action != ActAmend {
+		t.Fatalf("children = %+v", through.Children)
+	}
+	if through.Result.Filled.String() != "10" {
+		t.Fatalf("filled %s from 10 displayed units (submit %q, amend %q)", through.Result.Filled,
+			fillSummary(through.Children[0]), fillSummary(through.Children[1]))
+	}
+}
+
+// Review finding: a trade snapshot after a reconnect is history, not a new
+// execution, and a repeated sequential id is the same execution.
+func TestTradeSnapshotAndRepeatedSequenceDoNotFillAgain(t *testing.T) {
+	in := buyIntent(t, func(in *Intent) { in.MaxRequotes = 0 })
+	reports := runReplay(t, []ReplayIntent{in},
+		top(0, 2_999, 3_000),
+		top(1_000, 2_999, 3_001),
+		tradeSeq(1_100, 2_999, "10", "REALTIME", 7),
+		tradeSeq(1_150, 2_999, "10", "REALTIME", 7), // the same execution again
+		markLine("gap", 1_500),
+		markLine("connected", 1_600),
+		tradeSeq(1_650, 2_999, "10", "SNAPSHOT", 7), // replayed history
+		tradeSeq(1_660, 2_999, "10", "SNAPSHOT", 8)) // history never seen live
+	through := byRule(t, reports, RuleThrough, TriggerNone)
+	if through.Result.Filled.String() != "10" {
+		t.Fatalf("filled %s from one 10-unit execution; fills %q", through.Result.Filled, fillSummary(through.Children[0]))
+	}
+}
+
+// Review finding: an intent issued inside a gap cannot be priced from the
+// book from before the gap.
+func TestIntentIssuedInsideAGapIsNotPricedFromAPreGapBook(t *testing.T) {
+	in := buyIntent(t, func(in *Intent) {})
+	in.IssuedAt = at(500)
+	reports := runReplay(t, []ReplayIntent{in},
+		top(0, 2_999, 3_000),
+		markLine("gap", 100),
+		markLine("connected", 1_500),
+		top(1_600, 2_989, 2_990))
+	for _, rep := range reports {
+		if len(rep.Children) == 0 || !rep.Children[0].DecidedAt.Equal(at(1_600)) {
+			t.Fatalf("%s: first child = %+v, want one decided at the 1600 ms book", rep.Result.Rule, rep.Children)
+		}
+	}
+}
+
+// Review finding: an amend that targets a child that never arrived must not
+// be applied to the order that is working.
+func TestAmendTargetingAVoidChildIsNotApplied(t *testing.T) {
+	reports := runReplay(t, []ReplayIntent{buyIntent(t, nil)},
+		top(0, 2_999, 3_000),
+		top(1_000, 2_999, 3_001), // A arrives; the plan amends to B (3001)
+		markLine("gap", 1_200),   // B is lost
+		markLine("connected", 1_300),
+		top(1_400, 2_999, 3_002), // the plan amends again, targeting B (C, 3002)
+		top(2_500, 2_999, 3_002))
+	through := byRule(t, reports, RuleThrough, TriggerNone)
+	var c *ChildReport
+	for i := range through.Children {
+		if through.Children[i].Action == ActAmend && through.Children[i].LimitPriceKRW == 3_002 {
+			c = &through.Children[i]
+		}
+	}
+	if c == nil {
+		t.Fatalf("no amend to 3002 in %+v", through.Children)
+	}
+	if c.Status != StatusTargetUnknown || len(c.Fills) != 0 || !through.Result.Filled.IsZero() {
+		t.Fatalf("amend = %+v, filled %s", c, through.Result.Filled)
+	}
+}
+
+// Review finding: the slot's book is the last one at or before issued_at,
+// that includes a book received exactly at it, whether or not a marker with
+// the same time comes first.
+func TestSlotTriggerUsesTheBookReceivedExactlyAtTheSlot(t *testing.T) {
+	for name, lines := range map[string][]string{
+		"book at the slot":        {top(9_500, 2_950, 2_951), top(10_000, 2_890, 2_891), top(10_400, 2_950, 2_951)},
+		"marker before that book": {top(9_500, 2_950, 2_951), markLine("connected", 10_000), top(10_000, 2_890, 2_891), top(10_400, 2_950, 2_951)},
+	} {
+		reports := runReplay(t, []ReplayIntent{stopIntent(t)}, lines...)
+		slot := byRule(t, reports, RuleThrough, TriggerSlot)
+		if slot.Result.Done == DoneNotTriggered || len(slot.Children) == 0 || !slot.Children[0].DecidedAt.Equal(at(10_000)) || slot.Children[0].LimitPriceKRW != 2_890 {
+			t.Errorf("%s: slot run = %+v / %+v", name, slot.Result, slot.Children)
+		}
+	}
+	reversed := runReplay(t, []ReplayIntent{stopIntent(t)}, top(9_500, 2_890, 2_891), top(10_000, 2_950, 2_951), top(10_400, 2_950, 2_951))
+	if r := byRule(t, reversed, RuleThrough, TriggerSlot).Result; r.Done != DoneNotTriggered {
+		t.Errorf("a bid above the stop at the slot triggered: %+v", r)
+	}
+}
+
+// Review finding: the continuous trigger fires on a book at or after issued_at,
+// not on the slot's look-back.
+func TestContinuousTriggerIgnoresTheLookBack(t *testing.T) {
+	reports := runReplay(t, []ReplayIntent{stopIntent(t)},
+		top(9_500, 2_890, 2_891), // under the stop, before the slot
+		top(10_400, 2_950, 2_951),
+		top(11_000, 2_950, 2_951))
+	if r := byRule(t, reports, RuleThrough, TriggerContinuous).Result; r.Done != DoneNotTriggered || r.Children != 0 {
+		t.Fatalf("continuous run = %+v", r)
+	}
+	if r := byRule(t, reports, RuleThrough, TriggerSlot).Result; r.Children == 0 {
+		t.Fatalf("slot run did not start: %+v", r)
+	}
+}
+
+// Review finding: a stop must fire while the intent is valid.
+func TestContinuousTriggerDoesNotFireAfterExpiry(t *testing.T) {
+	reports := runReplay(t, []ReplayIntent{stopIntent(t)}, // expires at 60 s
+		top(9_500, 2_950, 2_951), top(30_000, 2_950, 2_951), top(61_000, 2_890, 2_891), top(62_000, 2_890, 2_891))
+	if r := byRule(t, reports, RuleThrough, TriggerContinuous).Result; r.Done != DoneNotTriggered || r.Children != 0 {
+		t.Fatalf("continuous run = %+v", r)
+	}
+}
+
+// Review finding: an outage that is known to exceed 60 s is exposed even if
+// no reconnect follows.
+func TestGapExposedWithoutAReconnect(t *testing.T) {
+	arrive := []string{top(0, 2_999, 3_000), orderbookLine(1_000, []lvl{{3_000, "10"}}, []lvl{{2_999, "1"}})}
+	long := runReplay(t, []ReplayIntent{buyIntent(t, nil)}, append(arrive[:2:2], markLine("gap", 2_000), markLine("gap", 63_000))...)
+	if !byRule(t, long, RuleThrough, TriggerNone).Result.GapExposed {
+		t.Error("gap at 2 s and a retry marker at 63 s is a 61 s outage while holding: want gap_exposed")
+	}
+	short := runReplay(t, []ReplayIntent{buyIntent(t, nil)}, append(arrive[:2:2], markLine("gap", 2_000), markLine("gap", 62_000))...)
+	if byRule(t, short, RuleThrough, TriggerNone).Result.GapExposed {
+		t.Error("60 s is not over 60 s")
+	}
+}
+
+// Review finding: a heartbeat is written by another goroutine, so it may sit
+// out of time order between market frames; it must not abort the replay or
+// move the clock.
+func TestHeartbeatOutOfOrderIsIgnored(t *testing.T) {
+	hb := fmt.Sprintf(`{"kind":"heartbeat","market":"KRW-XRP","received_at":%q}`, iso(5_000))
+	reports := runReplay(t, []ReplayIntent{buyIntent(t, nil)}, top(0, 2_999, 3_000), hb, top(4_900, 2_999, 3_000))
+	if len(reports) != 2 {
+		t.Fatalf("%d reports", len(reports))
+	}
+}
+
+// Review finding: a level must sit on its own tick, not just above the grid.
+func TestParseDepthRefusesAnOffTickLevel(t *testing.T) {
+	for name, lines := range map[string][2][]lvl{
+		"ask off its tick": {{{100_001, "1"}}, {{100_000, "1"}}},
+		"bid off its tick": {{{100_100, "1"}}, {{100_050, "1"}}},
+		"deeper off tick":  {{{100_100, "1"}, {100_250, "1"}}, {{100_000, "1"}, {99_900, "1"}}},
+	} {
+		ev, err := DecodeRecord([]byte(orderbookLine(0, lines[0], lines[1])))
+		if err != nil || ev.Kind != EventRefused {
+			t.Errorf("%s: event %+v, %v", name, ev, err)
+		}
 	}
 }

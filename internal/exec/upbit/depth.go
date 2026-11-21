@@ -26,7 +26,7 @@ type Depth struct {
 // ParseDepth decodes one orderbook frame received at receivedAt and refuses
 // what ParseBook refuses (not an orderbook, unknown market, no levels,
 // non-integer or sub-grid won price, empty or crossed touch, bad quantity),
-// plus any deeper level that is empty, off the grid or out of price order: a
+// plus any level that is empty, off its tick or out of price order: a
 // frame whose depth cannot be read exactly is not a book to fill against.
 func ParseDepth(data []byte, receivedAt time.Time) (Depth, error) {
 	var w wireBook
@@ -66,6 +66,8 @@ func ParseDepth(data []byte, receivedAt time.Time) (Depth, error) {
 		switch {
 		case TickAt(ask) == 0 || TickAt(bid) == 0:
 			return Depth{}, fmt.Errorf("%w: level %d price below the whole-won grid (bid %d ask %d)", ErrBook, i, bid, ask)
+		case ask%TickAt(ask) != 0 || bid%TickAt(bid) != 0:
+			return Depth{}, fmt.Errorf("%w: level %d price is off its tick (bid %d ask %d)", ErrBook, i, bid, ask)
 		case askQty.IsZero() || bidQty.IsZero():
 			return Depth{}, fmt.Errorf("%w: level %d is empty", ErrBook, i)
 		case i == 0 && bid >= ask:

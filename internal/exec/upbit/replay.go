@@ -141,12 +141,13 @@ type Fill struct {
 
 // Child statuses.
 const (
-	StatusApplied    = "applied"          // a cancel
-	StatusActive     = "active"           // arrived; Fills tells what it did
-	StatusVoidGap    = "void_gap"         // in flight when a gap opened
-	StatusNoOrder    = "no_working_order" // an amend with nothing left to amend
-	StatusCancelled  = "cancelled"        // cancelled before it arrived
-	StatusNotArrived = "not_arrived"      // the recording ended first
+	StatusApplied       = "applied"          // a cancel
+	StatusActive        = "active"           // arrived; Fills tells what it did
+	StatusVoidGap       = "void_gap"         // in flight when a gap opened
+	StatusNoOrder       = "no_working_order" // an amend with nothing left to amend
+	StatusCancelled     = "cancelled"        // cancelled before it arrived
+	StatusNotArrived    = "not_arrived"      // the recording ended first
+	StatusTargetUnknown = "target_unknown"   // an amend of a child that is not the working one
 )
 
 // Finish reasons a run adds to the plan's own (filled, deadline).
@@ -222,6 +223,9 @@ type Report struct {
 type Replay struct {
 	runs   []*run
 	lastAt map[string]time.Time
+	// seen holds the sequential ids of the trades already replayed, per
+	// market, so an execution that the stream repeats counts once.
+	seen map[string]map[int64]bool
 }
 
 // NewReplay builds the runs: for each intent, both rules, and for a stop-loss
@@ -230,7 +234,7 @@ func NewReplay(intents []ReplayIntent, cfg Config) (*Replay, error) {
 	if len(intents) == 0 {
 		return nil, errors.New("upbit: replay needs an intent")
 	}
-	r := &Replay{lastAt: map[string]time.Time{}}
+	r := &Replay{lastAt: map[string]time.Time{}, seen: map[string]map[int64]bool{}}
 	for _, in := range intents {
 		triggers := []Trigger{TriggerNone}
 		if in.StopPriceKRW > 0 {
@@ -253,12 +257,37 @@ func NewReplay(intents []ReplayIntent, cfg Config) (*Replay, error) {
 }
 
 // Feed gives every run one record. Records of a market must not go back in
-// time; a recording that does is not evidence of an order.
+// time; a recording that does is not evidence of an order. Heartbeats are the
+// exception: the recorder's ping goroutine stamps them on its own clock, so
+// one can sit between market frames out of order, and a clock-only marker is
+// ignored rather than allowed to move the replay or abort it. A trade that is
+// a SNAPSHOT (history Upbit replays on every subscribe, which the recorder
+// does not opt out of) or whose sequential id was already replayed is not a
+// new execution and is dropped after its order check.
 func (r *Replay) Feed(ev Event) error {
+	if ev.Kind == EventOther {
+		return nil
+	}
 	if last, ok := r.lastAt[ev.Market]; ok && ev.At.Before(last) {
 		return fmt.Errorf("%s record at %s is before the one at %s", ev.Market, ev.At.Format(time.RFC3339Nano), last.Format(time.RFC3339Nano))
 	}
 	r.lastAt[ev.Market] = ev.At
+	if ev.Kind == EventTrade {
+		if ev.Trade.StreamType == "SNAPSHOT" {
+			return nil
+		}
+		if id := ev.Trade.SequentialID; id != 0 {
+			seen := r.seen[ev.Market]
+			if seen == nil {
+				seen = map[int64]bool{}
+				r.seen[ev.Market] = seen
+			}
+			if seen[id] {
+				return nil
+			}
+			seen[id] = true
+		}
+	}
 	for _, run := range r.runs {
 		if run.in.Market != ev.Market {
 			continue
@@ -292,6 +321,9 @@ type rest struct {
 	c     *child
 	price int64
 	open  Qty
+	// frame is the book frame the order was (re)priced on; Touch does not
+	// match it against that same frame, which its own sweep just consumed.
+	frame int
 }
 
 type run struct {
@@ -304,6 +336,7 @@ type run struct {
 	started, triggered, dead bool
 	last                     *Depth
 	lastAt                   time.Time
+	frames                   int // book frames seen
 
 	pending  []*child
 	rest     *rest
@@ -324,16 +357,24 @@ func (r *run) live() bool { return r.started && r.triggered && !r.dead }
 
 func (r *run) feed(ev Event) error {
 	r.lastAt = ev.At
-	if !r.started && (r.in.IssuedAt.IsZero() || !ev.At.Before(r.in.IssuedAt)) {
-		if err := r.start(); err != nil {
-			return err
+	if r.inGap {
+		r.checkExposure(ev.At)
+	}
+	if !r.started && r.slotReached(ev) {
+		if ev.Kind == EventBook && ev.At.Equal(r.in.IssuedAt) {
+			// A book received exactly at the slot is the slot's book.
+			d := ev.Book
+			r.last = &d
 		}
+		r.start()
 	}
 	switch ev.Kind {
 	case EventBook:
 		r.closeGap(ev.At)
+		r.frames++
 		d := ev.Book
-		if r.started && !r.triggered && !r.dead && r.trig == TriggerContinuous && d.BidPriceKRW <= r.in.StopPriceKRW {
+		if r.started && !r.triggered && !r.dead && r.trig == TriggerContinuous &&
+			ev.At.Before(r.in.ExpiresAt) && d.BidPriceKRW <= r.in.StopPriceKRW {
 			r.triggered = true
 		}
 		if r.live() {
@@ -359,13 +400,19 @@ func (r *run) feed(ev Event) error {
 		r.openGap(ev.At)
 	case EventRefused:
 		r.refused++
-	default: // connected, other
-		if ev.Kind == EventConnected {
-			r.closeGap(ev.At)
-		}
+	case EventConnected:
+		r.closeGap(ev.At)
 		r.tick(ev.At)
 	}
 	return nil
+}
+
+// slotReached is whether this record starts the run: the first one after
+// issued_at, or a book received exactly at it. A marker received exactly at
+// the slot waits, so the slot still sees the book that shares its time.
+func (r *run) slotReached(ev Event) bool {
+	slot := r.in.IssuedAt
+	return slot.IsZero() || ev.At.After(slot) || (ev.At.Equal(slot) && ev.Kind == EventBook)
 }
 
 func (r *run) tick(at time.Time) {
@@ -374,26 +421,27 @@ func (r *run) tick(at time.Time) {
 	}
 }
 
-// start runs once, at the first record at or after issued_at (rule 7's slot).
-func (r *run) start() error {
+// start runs once, at the slot (rule 7). Only the slot trigger looks back at
+// the last book; the continuous one waits for a book at or after issued_at.
+// Inside a gap there is no book to price from (openGap dropped it), so the
+// slot decides nothing and the first book after the gap does.
+func (r *run) start() {
 	r.started = true
 	slot := r.in.IssuedAt
-	if r.in.StopPriceKRW == 0 {
-		r.triggered = true
-	} else if r.last != nil && slot.Sub(r.last.ReceivedAt) <= r.cfg.StaleAfter && r.last.BidPriceKRW <= r.in.StopPriceKRW {
-		r.triggered = true
-	}
 	switch {
-	case r.triggered:
-		// The slot prices from the last book it can see, which is older than
-		// the record that starts the run.
-		if r.last != nil && !slot.IsZero() {
-			r.handle(r.plan.OnBook(slot, r.last.Book), slot)
-		}
+	case r.in.StopPriceKRW == 0:
+		r.triggered = true
 	case r.trig == TriggerSlot:
-		r.dead = true
+		if r.last != nil && slot.Sub(r.last.ReceivedAt) <= r.cfg.StaleAfter && r.last.BidPriceKRW <= r.in.StopPriceKRW {
+			r.triggered = true
+		} else {
+			r.dead = true
+		}
 	}
-	return nil
+	if r.triggered && r.last != nil && !slot.IsZero() && !r.inGap {
+		// The slot prices from the last book it can see.
+		r.handle(r.plan.OnBook(slot, r.last.Book), slot)
+	}
 }
 
 // handle records what the plan decided at at.
@@ -426,11 +474,13 @@ func (r *run) handle(d Decision, at time.Time) {
 }
 
 // arrive lands every child that is due at this book frame (rule 1) and takes
-// the book's displayed size for it (rule 2).
+// the frame's displayed size for it (rule 2). The children that arrive on one
+// frame share its size: each takes what the earlier ones left.
 func (r *run) arrive(at time.Time, d Depth) error {
 	if len(r.pending) == 0 {
 		return nil
 	}
+	avail := Depth{Asks: append([]Level(nil), d.Asks...), Bids: append([]Level(nil), d.Bids...)}
 	var wait []*child
 	for _, c := range r.pending {
 		if at.Before(c.due) {
@@ -445,6 +495,12 @@ func (r *run) arrive(at time.Time, d Depth) error {
 				c.Status = StatusNoOrder
 				continue
 			}
+			if r.rest.c.Key != c.TargetKey {
+				// The plan moved on from a child that never arrived (a gap
+				// voided it); this amend is not of the order that works.
+				c.Status = StatusTargetUnknown
+				continue
+			}
 			// An amend never grows the order: it keeps what is still open.
 			open := r.rest.open
 			if c.qty.Cmp(open) < 0 {
@@ -452,10 +508,11 @@ func (r *run) arrive(at time.Time, d Depth) error {
 			}
 			r.rest = &rest{c: c, price: c.price, open: open}
 		}
+		r.rest.frame = r.frames
 		c.Status = StatusActive
 		arrived := at
 		c.ArrivedAt = &arrived
-		if err := r.sweep(at, d); err != nil {
+		if err := r.sweep(at, &avail); err != nil {
 			return err
 		}
 	}
@@ -464,13 +521,14 @@ func (r *run) arrive(at time.Time, d Depth) error {
 }
 
 // sweep is rule 2: the working order takes each opposite level within its
-// limit, best first, up to the level's displayed size.
-func (r *run) sweep(at time.Time, d Depth) error {
-	levels, ok := d.Asks, func(p int64) bool { return p <= r.rest.price }
+// limit, best first, up to what is left of the level's displayed size.
+func (r *run) sweep(at time.Time, avail *Depth) error {
+	levels, ok := avail.Asks, func(p int64) bool { return p <= r.rest.price }
 	if r.in.Side == Sell {
-		levels, ok = d.Bids, func(p int64) bool { return p >= r.rest.price }
+		levels, ok = avail.Bids, func(p int64) bool { return p >= r.rest.price }
 	}
-	for _, l := range levels {
+	for i := range levels {
+		l := &levels[i]
 		if r.rest == nil || !ok(l.PriceKRW) {
 			break
 		}
@@ -478,6 +536,10 @@ func (r *run) sweep(at time.Time, d Depth) error {
 		if r.rest.open.Cmp(q) < 0 {
 			q = r.rest.open
 		}
+		if q.IsZero() {
+			continue
+		}
+		l.Qty = l.Qty.Sub(q)
 		if err := r.fill(at, q, l.PriceKRW, fillSourceTaker); err != nil {
 			return err
 		}
@@ -486,9 +548,10 @@ func (r *run) sweep(at time.Time, d Depth) error {
 }
 
 // touchBook is rule 3 under Touch for a book frame: an opposite touch at or
-// through the limit fills all that is open, at the limit.
+// through the limit fills all that is open, at the limit. An order priced on
+// this very frame has just swept it, so it waits for the next one.
 func (r *run) touchBook(at time.Time, d Depth) error {
-	if r.rule != RuleTouch || r.rest == nil || !at.Before(r.in.ExpiresAt) {
+	if r.rule != RuleTouch || r.rest == nil || r.rest.frame == r.frames || !at.Before(r.in.ExpiresAt) {
 		return nil
 	}
 	if reaches(r.in.Side, oppositeTouch(r.in.Side, d.Book), r.rest.price) {
@@ -533,18 +596,31 @@ func (r *run) fill(at time.Time, q Qty, price int64, source string) error {
 	return r.plan.Fill(q, price)
 }
 
-// openGap starts rule 5's window: a child in flight is lost, and a position
-// held now is exposed for as long as the window lasts.
+// openGap starts rule 5's window: a child in flight is lost, the book from
+// before the window is no longer something to price from, and a position held
+// now is exposed for as long as the window lasts. A further gap marker while
+// the window is open (a failed reconnect) is evidence of how long it has
+// lasted.
 func (r *run) openGap(at time.Time) {
 	if r.inGap {
+		r.checkExposure(at)
 		return
 	}
 	r.inGap, r.gapAt, r.gapHeld = true, at, r.positionHeld()
+	r.last = nil
 	r.gaps++
 	for _, c := range r.pending {
 		c.Status = StatusVoidGap
 	}
 	r.pending = nil
+}
+
+// checkExposure marks the run gap_exposed if the open window has by now
+// outlasted GapExposedAfter with a position held.
+func (r *run) checkExposure(at time.Time) {
+	if r.inGap && r.gapHeld && at.Sub(r.gapAt) > GapExposedAfter {
+		r.exposed = true
+	}
 }
 
 // positionHeld is whether this run has a position exposed to the market. A
@@ -562,15 +638,17 @@ func (r *run) closeGap(at time.Time) {
 	if !r.inGap {
 		return
 	}
+	r.checkExposure(at)
 	r.inGap = false
-	if r.gapHeld && at.Sub(r.gapAt) > GapExposedAfter {
-		r.exposed = true
-	}
 }
 
 func (r *run) finish() Report {
 	// A plan that cancels needs one more step to finish (it has no cancel
 	// outcome to wait for), so the recording's end steps it twice.
+	if !r.started && !r.lastAt.IsZero() && !r.lastAt.Before(r.in.IssuedAt) {
+		r.start() // the recording ends exactly at the slot
+	}
+	r.checkExposure(r.lastAt)
 	r.tick(r.lastAt)
 	r.tick(r.lastAt)
 	for _, c := range r.pending {

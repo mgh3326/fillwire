@@ -17,6 +17,11 @@ type Trade struct {
 	Qty        Qty
 	ExchangeMS int64
 	ReceivedAt time.Time
+	// StreamType is SNAPSHOT for the trades Upbit replays on subscribing (the
+	// recorder does not ask for realtime only) and REALTIME for a new one.
+	StreamType string
+	// SequentialID identifies one execution within its market; 0 if absent.
+	SequentialID int64
 }
 
 // wireTrade holds the fields of a DEFAULT-format websocket trade message that
@@ -27,6 +32,8 @@ type wireTrade struct {
 	Timestamp int64       `json:"timestamp"`
 	Price     json.Number `json:"trade_price"`
 	Volume    json.Number `json:"trade_volume"`
+	Stream    string      `json:"stream_type"`
+	Sequence  int64       `json:"sequential_id"`
 }
 
 // ParseTrade decodes one trade frame received at receivedAt. Like ParseBook it
@@ -57,5 +64,5 @@ func ParseTrade(data []byte, receivedAt time.Time) (Trade, error) {
 	if price < 1 || qty.IsZero() {
 		return Trade{}, fmt.Errorf("%w: price %d quantity %q", ErrTrade, price, qty)
 	}
-	return Trade{Market: w.Code, PriceKRW: price, Qty: qty, ExchangeMS: w.Timestamp, ReceivedAt: receivedAt}, nil
+	return Trade{Market: w.Code, PriceKRW: price, Qty: qty, ExchangeMS: w.Timestamp, ReceivedAt: receivedAt, StreamType: w.Stream, SequentialID: w.Sequence}, nil
 }
