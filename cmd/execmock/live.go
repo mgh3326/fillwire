@@ -264,8 +264,21 @@ func liveRun(fc fileConfig, cfg e1.Config, ecfg exec.Config, intentPath, journal
 	ecfg.SendEnabled = true
 	ecfg.RequireLedgerComplete = !dry
 	kill := &exec.KillSwitch{}
-	e := exec.New(ecfg, j, st, client, kill)
 	clock := time.Now
+	// The latency report only observes: in send mode the same calls run in the
+	// same order through thin wrappers (latency.go).
+	var gw exec.Gateway = client
+	ledger := client.Fills
+	var latency *latencyTracker
+	if !dry {
+		var notice noticeRead
+		if fc.Stream.Key != "" {
+			notice = streamNoticeRead(r, fc.Stream.Key)
+		}
+		latency = newLatencyTracker(clock, notice)
+		gw, ledger, broker = latency.Gateway(client), latency.Ledger(client.Fills), latency.Broker(broker)
+	}
+	e := exec.New(ecfg, j, st, gw, kill)
 	now := clock()
 	if !st.Started() {
 		if err := e.Start(intent, now.UnixNano()); err != nil {
@@ -282,7 +295,12 @@ func liveRun(fc fileConfig, cfg e1.Config, ecfg exec.Config, intentPath, journal
 	defer stop()
 	timer := time.NewTicker(time.Second)
 	defer timer.Stop()
-	return driveLive(ctx, e, kill, dry, now.Add(duration), liveInputs{Book: func(ctx context.Context) (bookfeed.Snapshot, bool, error) {
+	err = driveLive(ctx, e, kill, dry, now.Add(duration), liveInputs{Book: func(ctx context.Context) (bookfeed.Snapshot, bool, error) {
 		return bookfeed.Latest(ctx, r, intent.Symbol)
-	}, Ledger: client.Fills, Broker: broker, Now: clock, Ticks: timer.C})
+	}, Ledger: ledger, Broker: broker, Now: clock, Ticks: timer.C})
+	if latency != nil {
+		// Written however the run ended: an interrupted run still has timings.
+		err = errors.Join(err, latency.Flush(stdout))
+	}
+	return err
 }

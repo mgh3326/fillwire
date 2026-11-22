@@ -170,6 +170,43 @@ Do not schedule the run until every item holds:
 - **Ledger:** every fill the executor counts has a ledger row and a `broker_order_id` from the journal.
 - **Broker (KIS mock HTS):** at most one working order for the intent, and its price is never beyond the intent's cap.
 
+## Fill-evidence latency report
+
+In `-send` mode `execmock` prints one JSON line per child it sent, after the run
+ends (also after an interrupt or an error). It measures only; the order path,
+caps and one-submit/no-resend rule are unchanged, and no request is added to
+E1 or VTS. Fields (`wall` is RFC 3339 UTC; `mono_ns` is the offset from the run
+start):
+
+```json
+{"latency":{"intent_id":"…","child_key":"…","action":"submit","status":"accepted","broker_order_id":"123",
+ "post":{"wall":"…","mono_ns":0},
+ "kis_notice":{"wall":"…"},
+ "e1_fills":{"wall":"…","mono_ns":0},
+ "vts_readback":{"wall":"…","mono_ns":0},
+ "deltas_ns":{"post_to_kis_notice":0,"post_to_e1_fills":0,"post_to_vts_readback":0,
+              "kis_notice_to_e1_fills":0,"kis_notice_to_vts_readback":0}}}
+```
+
+- `post`: just before the child's POST to E1.
+- `e1_fills`: when the first `GET /intents/<id>/fills` response listing a fill
+  for the child's order arrived.
+- `vts_readback`: when the first VTS exact-order readback reporting a filled
+  quantity above zero arrived.
+- `kis_notice`: the earliest `raw_payload_json.received_at` fillwire stored for
+  the order in its Redis fills stream. Another process took it, so it has no
+  `mono_ns`; deltas that use it rest on both hosts' wall clocks. It needs
+  `[stream] key = "fills:kis"` in the execmock config (same key as fillwire's
+  `[stream]`); without it, or when the stream is unreadable (then
+  `kis_notice_error` says so), `kis_notice` is `null`. The lookup is one
+  read-only `XRANGE` on the Redis `execmock` already opens, made after the run.
+- A stamp that was never observed is `null` and its deltas are omitted. A
+  child with no fill (a cancel, a refusal) keeps only `post`.
+- Limits: the E1 and VTS reads happen once per one-second poll, and VTS is read
+  only for orders the ledger already lists, so those two stamps cannot be
+  earlier than the poll that found them. Orders from an earlier run of the same
+  journal are not reported.
+
 ## Stop conditions
 
 Stop, then set `GLOBAL_FREEZE` or stop the process, on any of these:
