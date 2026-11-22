@@ -38,6 +38,11 @@ type fileConfig struct {
 	Redis struct {
 		URLEnv string `toml:"url_env"`
 	} `toml:"redis"`
+	// Stream names fillwire's fills stream. Optional: with it, the latency
+	// report also carries the KIS notice receive time (read-only XRANGE).
+	Stream struct {
+		Key string `toml:"key"`
+	} `toml:"stream"`
 	BrokerRead struct {
 		AppKeyEnv    string `toml:"app_key_env"`
 		AppSecretEnv string `toml:"app_secret_env"`
