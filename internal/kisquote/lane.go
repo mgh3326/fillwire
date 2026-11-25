@@ -143,6 +143,10 @@ type Lane struct {
 	closed  bool
 	queue   chan tick
 
+	// stale counts registrations a failed subscription may have left active on
+	// the server. They are subtracted from the free budget for the rest of the
+	// session so the lane never admits a replacement over a live registration.
+	stale     int
 	cancel    context.CancelFunc
 	workers   sync.WaitGroup
 	published atomic.Uint64
@@ -445,7 +449,13 @@ func (l *Lane) Close() {
 	}
 }
 
-func (l *Lane) freeLocked() int { return l.capacity - len(l.slots.Held()) }
+func (l *Lane) freeLocked() int {
+	free := l.capacity - len(l.slots.Held()) - l.stale
+	if free < 0 {
+		return 0
+	}
+	return free
+}
 
 // victimLocked picks the lowest-priority promoted symbol below belowPriority
 // whose MinHold has elapsed. Ties go to the lexicographically smallest symbol,
@@ -498,18 +508,45 @@ func (l *Lane) detach(ctx context.Context, session Session, symbol string) error
 }
 
 // add subscribes trs in order, removing the ones already added when a later
-// one fails. Each call carries its own deadline.
+// one fails. Each call carries its own deadline. A failed Subscribe may have
+// left its registration in go-kis's restore list (ErrApprovalRejected keeps
+// it), so the rollback covers the failed transaction too.
 func (l *Lane) add(ctx context.Context, session Session, symbol string, trs []string) error {
 	for i, tr := range trs {
 		callCtx, cancel := context.WithTimeout(ctx, subscribeTimeout)
 		err := session.Subscribe(callCtx, tr, symbol)
 		cancel()
 		if err != nil {
-			_ = l.remove(context.WithoutCancel(ctx), session, symbol, trs[:i])
+			l.rollback(context.WithoutCancel(ctx), session, symbol, trs[:i+1])
 			return fmt.Errorf("kisquote: subscribe %s: %w", tr, err)
 		}
 	}
 	return nil
+}
+
+// rollback removes registrations a failed subscribe pass may have retained.
+// A removal that also fails leaves a registration the server may still hold:
+// it is counted as a stale slot for the rest of the session, so the budget
+// never treats it as free even though this lane handles no ticks for it.
+func (l *Lane) rollback(ctx context.Context, session Session, symbol string, trs []string) {
+	failed := 0
+	for _, tr := range trs {
+		callCtx, cancel := context.WithTimeout(ctx, subscribeTimeout)
+		err := session.Unsubscribe(callCtx, tr, symbol)
+		cancel()
+		if err != nil {
+			failed++
+		}
+	}
+	if failed == 0 {
+		return
+	}
+	l.mu.Lock()
+	l.stale += failed
+	l.mu.Unlock()
+	if l.cfg.Logger != nil {
+		l.cfg.Logger.Warn("KIS 승격 등록 롤백 실패, 슬롯을 계속 점유합니다", "symbol", symbol, "retained", failed)
+	}
 }
 
 // remove unsubscribes trs, reporting the first failure.
@@ -586,6 +623,7 @@ drain:
 
 func (l *Lane) publishOne(ctx context.Context, t tick) {
 	if err := l.publish(ctx, t); err != nil {
+		l.dropped.Add(1)
 		if l.cfg.Logger != nil {
 			l.cfg.Logger.Warn("KIS 승격 시세 발행 실패", "symbol", t.symbol, "reason", err.Error())
 		}

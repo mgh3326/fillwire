@@ -67,6 +67,7 @@ type fakeSession struct {
 	subs       map[string]bool
 	trace      []string
 	failUnsub  bool
+	failSubTR  string        // when set, Subscribe of this TR records then fails
 	blockSub   chan struct{} // when non-nil, Subscribe waits for close or ctx end
 	subStarted chan struct{} // receives once when blockSub is set
 }
@@ -92,8 +93,13 @@ func (f *fakeSession) Subscribe(ctx context.Context, tr, key string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A failed subscribe still leaves the registration on the server side in
+	// go-kis (ErrApprovalRejected keeps it for the reconnect restore list).
 	f.subs[tr+"|"+key] = true
 	f.trace = append(f.trace, "sub "+tr+"|"+key)
+	if f.failSubTR != "" && f.failSubTR == tr {
+		return errors.New("fake session: subscribe rejected")
+	}
 	return nil
 }
 
@@ -368,7 +374,7 @@ func TestFeedGapRecoversFromREST(t *testing.T) {
 	cfg.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	cfg.FeedGap = 30 * time.Second
 	rest := &fakeREST{bodies: map[string]string{
-		tradeRESTPath: `{"rt_cd":"0","output":{"stck_cntg_hour":"090005","stck_prpr":"71000","cntg_vol":"10"}}`,
+		tradeRESTPath: `{"rt_cd":"0","output":[{"stck_cntg_hour":"090005","stck_prpr":"71000","cntg_vol":"10"},{"stck_cntg_hour":"090001","stck_prpr":"70900","cntg_vol":"4"}]}`,
 		"/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn": askingPriceBody("005930"),
 	}}
 	cfg.REST = rest
@@ -561,6 +567,68 @@ func TestCloseIsBoundedWhenRedisHangs(t *testing.T) {
 	}
 	if got := lane.Stats().Dropped; got == 0 {
 		t.Fatal("unpublished ticks were not counted as dropped")
+	}
+}
+
+// The trade read returns a list; the newest row by exchange clock is used, and
+// an empty list is an error rather than a zero-value tick.
+func TestPollTradeSelectsNewestRecord(t *testing.T) {
+	rest := &fakeREST{bodies: map[string]string{
+		tradeRESTPath: `{"rt_cd":"0","output":[{"stck_cntg_hour":"090010","stck_prpr":"71100","cntg_vol":"5"},{"stck_cntg_hour":"090012","stck_prpr":"71200","cntg_vol":"7"}]}`,
+	}}
+	got, err := pollTrade(context.Background(), rest, "005930", func() time.Time { return at(15000) })
+	if err != nil {
+		t.Fatalf("pollTrade: %v", err)
+	}
+	if got.price != 71200 || got.qty != 7 || got.exchange.In(kst).Format("150405") != "090012" {
+		t.Fatalf("selected record = %+v", got)
+	}
+	rest.bodies[tradeRESTPath] = `{"rt_cd":"0","output":[]}`
+	if _, err := pollTrade(context.Background(), rest, "005930", func() time.Time { return at(15000) }); err == nil {
+		t.Fatal("empty trade list accepted")
+	}
+}
+
+// A registration a failed subscribe left behind (and a failed rollback could
+// not remove) keeps consuming budget: no replacement may be admitted over it.
+func TestRetainedRegistrationCountsAgainstTheBudget(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.RegistrationLimit = 4 // safety 2 + one symbol
+	cfg.Fixed = nil
+	lane := newLane(t, cfg)
+	session := newFakeSession()
+	lane.Attach(context.Background(), session)
+	session.mu.Lock()
+	session.failSubTR = book.TRTrade
+	session.failUnsub = true
+	session.mu.Unlock()
+
+	if err := lane.Promote(context.Background(), "005930", 10); err == nil {
+		t.Fatal("promotion with a rejected subscribe succeeded")
+	}
+	err := lane.Promote(context.Background(), "000660", 10)
+	if code := ratebudget.CodeOf(err); code != ratebudget.CodeBudgetCut {
+		t.Fatalf("replacement promotion = %v, want budget_cut while the registration may be live", err)
+	}
+
+	// When the rollback succeeds, the slot is free again.
+	cfg2 := baseConfig(t)
+	cfg2.RegistrationLimit = 4
+	cfg2.Fixed = nil
+	lane2 := newLane(t, cfg2)
+	session2 := newFakeSession()
+	lane2.Attach(context.Background(), session2)
+	session2.mu.Lock()
+	session2.failSubTR = book.TRTrade
+	session2.mu.Unlock()
+	if err := lane2.Promote(context.Background(), "005930", 10); err == nil {
+		t.Fatal("promotion with a rejected subscribe succeeded")
+	}
+	session2.mu.Lock()
+	session2.failSubTR = ""
+	session2.mu.Unlock()
+	if err := lane2.Promote(context.Background(), "000660", 10); err != nil {
+		t.Fatalf("replacement after a clean rollback: %v", err)
 	}
 }
 

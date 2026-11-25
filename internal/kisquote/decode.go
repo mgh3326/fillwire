@@ -124,14 +124,19 @@ func ticksFromEvent(ev ws.Event, owned func(string) bool) ([]tick, error) {
 	return out, nil
 }
 
-// pollTrade reads the read-only current-price trade quote (FHKST01010300).
+// ccnlRecord is one trade row of the FHKST01010300 response.
+type ccnlRecord struct {
+	Hour  string `json:"stck_cntg_hour"`
+	Price string `json:"stck_prpr"`
+	Qty   string `json:"cntg_vol"`
+}
+
+// pollTrade reads the read-only current-price trade quote (FHKST01010300). The
+// transaction answers with a list of trades; the newest row is selected by its
+// exchange clock so the choice does not depend on response ordering.
 func pollTrade(ctx context.Context, r RESTReader, symbol string, now func() time.Time) (tick, error) {
 	var response struct {
-		Output struct {
-			Hour  string `json:"stck_cntg_hour"`
-			Price string `json:"stck_prpr"`
-			Qty   string `json:"cntg_vol"`
-		} `json:"output"`
+		Output []ccnlRecord `json:"output"`
 	}
 	err := r.Read(ctx, tradeRESTPath, tradeRESTTR, map[string]string{
 		"FID_COND_MRKT_DIV_CODE": "J",
@@ -140,16 +145,25 @@ func pollTrade(ctx context.Context, r RESTReader, symbol string, now func() time
 	if err != nil {
 		return tick{}, errors.New("kisquote: trade read failed")
 	}
+	if len(response.Output) == 0 {
+		return tick{}, errors.New("kisquote: empty trade read")
+	}
+	newest := response.Output[0]
+	for _, record := range response.Output[1:] {
+		if record.Hour > newest.Hour {
+			newest = record
+		}
+	}
 	received := now()
-	exchange, err := bookfeed.ExchangeTime(response.Output.Hour, received)
+	exchange, err := bookfeed.ExchangeTime(newest.Hour, received)
 	if err != nil {
 		return tick{}, err
 	}
-	price, err := strconv.ParseInt(response.Output.Price, 10, 64)
+	price, err := strconv.ParseInt(newest.Price, 10, 64)
 	if err != nil || price <= 0 {
 		return tick{}, errors.New("kisquote: invalid trade price")
 	}
-	qty, err := strconv.ParseInt(response.Output.Qty, 10, 64)
+	qty, err := strconv.ParseInt(newest.Qty, 10, 64)
 	if err != nil || qty < 0 {
 		return tick{}, errors.New("kisquote: invalid trade quantity")
 	}
