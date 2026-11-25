@@ -44,13 +44,54 @@ func TestEnabledRefusesMissingConfiguration(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run([]string{
 		"-enabled", "-targets", targets, "-calendar", calendar, "-out", output,
-		"-once", "-app-key-env", "FILLWIRE_TEST_APP_KEY", "-app-secret-env", "FILLWIRE_TEST_APP_SECRET",
+		"-once", "-token-redis", "redis://127.0.0.1:1",
+		"-app-key-env", "FILLWIRE_TEST_APP_KEY", "-app-secret-env", "FILLWIRE_TEST_APP_SECRET",
 	}, &stdout, &stderr)
 	if code != ExitConfiguration {
 		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitConfiguration, stderr.String())
 	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatal("a refused configuration created the output file")
+	}
+}
+
+func TestRefusesRemotePlaintextRedis(t *testing.T) {
+	dir := t.TempDir()
+	targets := filepath.Join(dir, "targets.json")
+	calendar := filepath.Join(dir, "calendar.json")
+	if err := os.WriteFile(targets, []byte(`{"targets":[{"market":"kr","symbol":"005930","venue":"KRX"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(calendar, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-enabled", "-targets", targets, "-calendar", calendar, "-out", filepath.Join(dir, "rows.jsonl"),
+		"-redis", "redis://redis.example.invalid:6379", "-once",
+	}, &stdout, &stderr)
+	if code != ExitConfiguration {
+		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitConfiguration, stderr.String())
+	}
+}
+
+func TestRefusesACredentialHostThatIsNotTLSOrLoopback(t *testing.T) {
+	dir := t.TempDir()
+	targets := filepath.Join(dir, "targets.json")
+	calendar := filepath.Join(dir, "calendar.json")
+	if err := os.WriteFile(targets, []byte(`{"targets":[{"market":"kr","symbol":"005930","venue":"KRX"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(calendar, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-enabled", "-targets", targets, "-calendar", calendar, "-out", filepath.Join(dir, "rows.jsonl"),
+		"-host", "http://kis.example.invalid:9443", "-once",
+	}, &stdout, &stderr)
+	if code != ExitConfiguration {
+		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitConfiguration, stderr.String())
 	}
 }
 

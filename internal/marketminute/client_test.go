@@ -57,7 +57,7 @@ func TestOverseasFetchUsesThePinnedTransaction(t *testing.T) {
 	var seen *http.Request
 	client, _ := newClient(t, func(writer http.ResponseWriter, request *http.Request) {
 		seen = request
-		writer.Write([]byte(`{"rt_cd":"0","output2":[{"xymd":"20261215","xhms":"093000","open":"1.50","high":"2.00","low":"1.00","close":"1.75","volume":"30","value":"52.5"}]}`))
+		writer.Write([]byte(`{"rt_cd":"0","output2":[{"xymd":"20261215","xhms":"093000","open":"1.50","high":"2.00","low":"1.00","last":"1.75","evol":"30","eamt":"52.5"}]}`))
 	}, fixedToken("fixture-token"))
 	result := client.Fetch(context.Background(), marketminute.Target{Market: "us", Symbol: "BRK.B", Venue: "NYSE"})
 	if result.Err != nil {
@@ -69,6 +69,33 @@ func TestOverseasFetchUsesThePinnedTransaction(t *testing.T) {
 	}
 	if len(result.Rows) != 1 || result.Rows[0].DateTime != "2026-12-15 09:30" {
 		t.Fatalf("rows = %+v", result.Rows)
+	}
+	row := result.Rows[0]
+	if *row.Close != "1.75" || *row.Volume != "30" || *row.Value != "52.5" {
+		t.Fatalf("row fields = close %v volume %v value %v", *row.Close, *row.Volume, *row.Value)
+	}
+}
+
+func TestValidateHostRefusesCredentialsOutsideTLSOrLoopback(t *testing.T) {
+	for _, host := range []string{
+		"http://kis.example.invalid:9443",
+		"http://127.0.0.1:1@evil.example",
+		"ftp://127.0.0.1",
+		"https://127.0.0.1:1?x=1",
+	} {
+		if err := marketminute.ValidateHost(host); err == nil {
+			t.Errorf("ValidateHost(%q) accepted", host)
+		}
+	}
+	for _, host := range []string{
+		marketminute.DefaultHost,
+		marketminute.MockHost,
+		"http://127.0.0.1:8080",
+		"http://localhost:8080",
+	} {
+		if err := marketminute.ValidateHost(host); err != nil {
+			t.Errorf("ValidateHost(%q) = %v", host, err)
+		}
 	}
 }
 
@@ -94,6 +121,7 @@ func TestFetchMapsRateLimitsAndKeepsTheRetryAfter(t *testing.T) {
 func TestFetchAsksForANewTokenOnceOnExpiry(t *testing.T) {
 	var calls atomic.Int32
 	tokens := atomic.Int32{}
+	rejected := atomic.Int32{}
 	client, _ := newClient(t, func(writer http.ResponseWriter, _ *http.Request) {
 		if calls.Add(1) == 1 {
 			writer.Write([]byte(`{"rt_cd":"1","msg_cd":"EGW00123"}`))
@@ -104,12 +132,19 @@ func TestFetchAsksForANewTokenOnceOnExpiry(t *testing.T) {
 		value := tokens.Add(1)
 		return "token-" + string(rune('0'+value)), nil
 	})
+	client.Reject = func(_ context.Context, token string) error {
+		if token != "token-1" {
+			t.Errorf("rejected token = %q, want the presented token-1", token)
+		}
+		rejected.Add(1)
+		return nil
+	}
 	result := client.Fetch(context.Background(), marketminute.Target{Market: "kr", Symbol: "005930", Venue: "KRX"})
 	if result.Err != nil || len(result.Rows) != 1 {
 		t.Fatalf("result = %+v", result)
 	}
-	if calls.Load() != 2 || tokens.Load() != 2 {
-		t.Fatalf("calls=%d token reads=%d, want 2 and 2", calls.Load(), tokens.Load())
+	if calls.Load() != 2 || tokens.Load() != 2 || rejected.Load() != 1 {
+		t.Fatalf("calls=%d token reads=%d rejected=%d, want 2/2/1", calls.Load(), tokens.Load(), rejected.Load())
 	}
 }
 

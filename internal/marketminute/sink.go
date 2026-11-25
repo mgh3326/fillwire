@@ -44,9 +44,10 @@ func (s *JSONLSink) Flush() error {
 	return s.buffer.Flush()
 }
 
-// RedisSink appends rows to Redis Streams named minute:kis:<symbol> with
-// MAXLEN ~, so the shadow output stays bounded. Redis has no null field, so a
-// nil value is omitted from the entry instead of written as an empty string.
+// RedisSink appends rows to Redis Streams named minute:kis:<venue>:<symbol>
+// with MAXLEN ~, so the shadow output stays bounded and the same symbol on KRX
+// and NTX never interleaves in one stream. Redis has no null field, so a nil
+// value is omitted from the entry instead of written as an empty string.
 type RedisSink struct {
 	mu      sync.Mutex
 	client  redis.UniversalClient
@@ -89,7 +90,7 @@ func (s *RedisSink) Write(ctx context.Context, bar Bar) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	err := s.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: s.keyBase + bar.Symbol,
+		Stream: s.keyBase + bar.Venue + ":" + bar.Symbol,
 		MaxLen: s.maxLen,
 		Approx: true,
 		Values: values,

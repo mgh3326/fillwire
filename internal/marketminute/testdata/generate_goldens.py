@@ -318,39 +318,34 @@ US_CASES = [
 ]
 
 
+def segment_case(market: str, venue: str, at: datetime) -> dict[str, object]:
+    """One golden case whose expected label is Python's own answer."""
+    return {
+        "market": market,
+        "venue": venue,
+        "at": rfc3339(at),
+        "naive": False,
+        "expected": session_segment_of(market, venue, at),
+    }
+
+
 def segments() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
-    for clock, krx, ntx in KR_CASES:
-        out.append({"market": "kr", "venue": "KRX", "at": rfc3339(kst(KR_DAY, clock)),
-                    "naive": False, "expected": krx})
-        out.append({"market": "kr", "venue": "NTX", "at": rfc3339(kst(KR_DAY, clock)),
-                    "naive": False, "expected": ntx})
     for clock, _, _ in KR_CASES:
-        out.append({"market": "kr", "venue": "KRX", "at": rfc3339(kst(KR_HOLIDAY, clock)),
-                    "naive": False, "expected": "UNKNOWN"})
-        out.append({"market": "kr", "venue": "NTX", "at": rfc3339(kst(KR_HOLIDAY, clock)),
-                    "naive": False, "expected": "UNKNOWN"})
-    out.append({"market": "kr", "venue": "KRX",
-                "at": rfc3339(kst((2026, 11, 21), "10:00")), "naive": False,
-                "expected": session_segment_of("kr", "KRX", kst((2026, 11, 21), "10:00"))})
-    out.append({"market": "kr", "venue": "XXX", "at": rfc3339(kst(KR_DAY, "10:00")),
-                "naive": False, "expected": "UNKNOWN"})
+        out.append(segment_case("kr", "KRX", kst(KR_DAY, clock)))
+        out.append(segment_case("kr", "NTX", kst(KR_DAY, clock)))
+        out.append(segment_case("kr", "KRX", kst(KR_HOLIDAY, clock)))
+        out.append(segment_case("kr", "NTX", kst(KR_HOLIDAY, clock)))
+    out.append(segment_case("kr", "KRX", kst((2026, 11, 21), "10:00")))
+    out.append(segment_case("kr", "XXX", kst(KR_DAY, "10:00")))
     for day in (US_EDT_DAY, US_EST_DAY):
-        for clock, expected in US_CASES:
+        for clock, _ in US_CASES:
             for venue in ("NASD", "NYSE", "AMEX"):
-                out.append({"market": "us", "venue": venue,
-                            "at": rfc3339(et(day, clock)), "naive": False,
-                            "expected": expected})
-    for clock, expected in (("12:59", "US_REGULAR"), ("13:00", "US_POST")):
-        out.append({"market": "us", "venue": "NASD",
-                    "at": rfc3339(et(US_EARLY_CLOSE, clock)), "naive": False,
-                    "expected": expected})
-    out.append({"market": "us", "venue": "NASD",
-                "at": rfc3339(et(US_HOLIDAY, "10:00")), "naive": False,
-                "expected": "UNKNOWN"})
-    out.append({"market": "us", "venue": "KRX",
-                "at": rfc3339(et(US_EDT_DAY, "10:00")), "naive": False,
-                "expected": "UNKNOWN"})
+                out.append(segment_case("us", venue, et(day, clock)))
+    for clock, _ in (("12:59", "US_REGULAR"), ("13:00", "US_POST")):
+        out.append(segment_case("us", "NASD", et(US_EARLY_CLOSE, clock)))
+    out.append(segment_case("us", "NASD", et(US_HOLIDAY, "10:00")))
+    out.append(segment_case("us", "KRX", et(US_EDT_DAY, "10:00")))
     return out
 
 

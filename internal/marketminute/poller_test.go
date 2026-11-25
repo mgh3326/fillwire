@@ -200,3 +200,85 @@ func TestPollerPropagatesSinkFailure(t *testing.T) {
 		t.Fatal("sink failure was swallowed")
 	}
 }
+
+func TestPollerSkipsRowsAlreadyWritten(t *testing.T) {
+	clock := &testClock{now: time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)}
+	reader := &scriptedReader{results: map[string]FetchResult{"005930": {Rows: oneBar("005930")}}}
+	sink := &recordSink{}
+	poller := newTestPoller(t, reader, sink, clock, []Target{{Market: "kr", Symbol: "005930", Venue: "KRX"}}, 1)
+	first, err := poller.Run(context.Background())
+	if err != nil || first.Rows != 1 {
+		t.Fatalf("first run = %+v, %v", first, err)
+	}
+	second, err := poller.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Rows != 0 || second.Duplicates != 1 {
+		t.Fatalf("second run = %+v, want 0 rows and 1 duplicate", second)
+	}
+	if len(sink.bars) != 1 {
+		t.Fatalf("sink has %d bars, want 1 (the repeated page must not be appended)", len(sink.bars))
+	}
+}
+
+func TestTokenFailureDoesNotOpenTheEndpointCircuit(t *testing.T) {
+	clock := &testClock{now: time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)}
+	reader := &scriptedReader{results: map[string]FetchResult{
+		"005930": {Err: ErrTokenUnavailable},
+		"000660": {Rows: oneBar("000660")},
+	}}
+	calendar, _ := LoadCalendar([]byte(`{}`))
+	limiter, err := ratebudget.New(ratebudget.Config{
+		Providers: []ratebudget.Provider{{
+			Name:       "kis",
+			AccountRef: "live",
+			Limit:      ratebudget.Limit{Rate: 1000, Burst: 100},
+			Endpoints:  []ratebudget.Endpoint{{Name: mustEndpoint(t), Limit: ratebudget.Limit{Rate: 1000, Burst: 100}}},
+		}},
+		ResearchShare: 1,
+		Circuit:       ratebudget.Circuit{OpenAfter: 1, OpenFor: 30 * time.Second},
+		Clock:         clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordSink{}
+	poller, err := NewPoller(Config{
+		Targets:    []Target{{Market: "kr", Symbol: "005930", Venue: "KRX"}, {Market: "kr", Symbol: "000660", Venue: "KRX"}},
+		Reader:     reader,
+		Limiter:    limiter,
+		Sink:       sink,
+		Calendar:   calendar,
+		Provider:   "kis",
+		AccountRef: "live",
+		Clock:      clock.Now,
+		Workers:    1,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			clock.advance(d)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := poller.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Rows != 1 || len(report.Refusals) != 0 {
+		t.Fatalf("report = %+v, want one row and no circuit refusal", report)
+	}
+	if len(report.Errors) != 1 || report.Errors[0].Class != classTokenUnavailable {
+		t.Fatalf("errors = %+v", report.Errors)
+	}
+}
+
+func mustEndpoint(t *testing.T) string {
+	t.Helper()
+	name, err := Endpoint("KRX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return name
+}

@@ -98,6 +98,7 @@ type Report struct {
 	SkippedInvalid int            `json:"skipped_invalid"`
 	NullValue      int            `json:"null_value"`
 	EmptyReads     int            `json:"empty_reads"`
+	Duplicates     int            `json:"duplicates"`
 	Refusals       map[string]int `json:"refusals,omitempty"`
 	Errors         []TargetError  `json:"errors,omitempty"`
 }
@@ -123,6 +124,10 @@ type Config struct {
 type Poller struct {
 	config   Config
 	endpoint map[string]string
+	// written is the newest closed bar already written per target. A poll
+	// re-reads the same trailing KIS page, so rows at or below the watermark
+	// are duplicates and are not emitted again.
+	written map[string]time.Time
 }
 
 const defaultWorkers = 4
@@ -168,7 +173,7 @@ func NewPoller(config Config) (*Poller, error) {
 		}
 		endpoints[target.Venue] = name
 	}
-	return &Poller{config: config, endpoint: endpoints}, nil
+	return &Poller{config: config, endpoint: endpoints, written: make(map[string]time.Time)}, nil
 }
 
 // Key is the ratebudget key for a target.
@@ -222,9 +227,8 @@ func (p *Poller) Run(ctx context.Context) (Report, error) {
 		return report, err
 	}
 
-	for _, result := range results {
+	for index, result := range results {
 		report.Reads++
-		report.Rows += len(result.bars)
 		report.SkippedForming += result.skippedForming
 		report.SkippedInvalid += result.skippedInvalid
 		report.NullValue += result.nullValue
@@ -238,11 +242,39 @@ func (p *Poller) Run(ctx context.Context) (Report, error) {
 			report.Errors = append(report.Errors, *result.targetError)
 			continue
 		}
-		if err := p.write(ctx, result.bars); err != nil {
+		target := p.config.Targets[index]
+		fresh := p.freshBars(target, result.bars)
+		report.Duplicates += len(result.bars) - len(fresh)
+		if err := p.write(ctx, fresh); err != nil {
 			return report, err
+		}
+		report.Rows += len(fresh)
+		if len(fresh) > 0 {
+			p.written[targetKey(target)] = fresh[len(fresh)-1].TimeUTC
 		}
 	}
 	return report, nil
+}
+
+// freshBars drops bars at or below the target's watermark. KIS returns the
+// same trailing page every poll; without this the JSONL file would grow
+// without bound and every repeated row would double count its minute.
+func (p *Poller) freshBars(target Target, bars []Bar) []Bar {
+	watermark, seen := p.written[targetKey(target)]
+	if !seen {
+		return bars
+	}
+	fresh := make([]Bar, 0, len(bars))
+	for _, bar := range bars {
+		if bar.TimeUTC.After(watermark) {
+			fresh = append(fresh, bar)
+		}
+	}
+	return fresh
+}
+
+func targetKey(target Target) string {
+	return target.Market + "|" + target.Venue + "|" + target.Symbol
 }
 
 func (p *Poller) write(ctx context.Context, bars []Bar) error {
@@ -284,8 +316,20 @@ func (p *Poller) pollOne(ctx context.Context, target Target) jobResult {
 	}
 }
 
+// localFailure reports a failure of this process's own inputs (no token, a
+// refused credential host), which must not change ratebudget's endpoint health.
+func localFailure(err error) bool {
+	return errors.Is(err, ErrTokenUnavailable) || errors.Is(err, errTokenExpired) || errors.Is(err, ErrCredentialHost)
+}
+
 func (p *Poller) fetch(ctx context.Context, target Target, key ratebudget.Key, observedBefore time.Time, result jobResult) jobResult {
 	response := p.config.Reader.Fetch(ctx, target)
+	if response.Err != nil && localFailure(response.Err) {
+		// A missing token or a refused credential host is not an upstream
+		// failure: recording it would open the endpoint circuit and blame KIS.
+		result.targetError = &TargetError{Market: target.Market, Symbol: target.Symbol, Venue: target.Venue, Class: ErrorClass(response.Err)}
+		return result
+	}
 	p.config.Limiter.Observe(key, ratebudget.Outcome{
 		StatusCode:  response.StatusCode,
 		Err:         response.Err,

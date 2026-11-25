@@ -779,7 +779,7 @@ fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fil
 
 ## 분봉 shadow 폴러 `market-tap` (기본 비활성화)
 
-`market-tap` 은 KIS 국내(KRX `J`·NTX `NX`)·해외 1분봉 GET 만 호출하는 shadow 폴러입니다. 결과는 JSONL 파일과 Redis Stream(`minute:kis:<symbol>`)에만 쓰고 research 표에는 ingest 하지 않습니다. 주문·원장 경로와 KIS 토큰 발급 경로를 링크하지 않으며, 토큰은 Redis 또는 gatewayd `/fetch` 에서 읽기만 합니다. `-enabled` 없이는 아무 요청도 보내지 않습니다. 실행 플래그, 대상 목록·달력 파일 형식, 행 규칙과 검증 방법은 [`docs/market-tap.md`](docs/market-tap.md)를 보세요.
+`market-tap` 은 KIS 국내(KRX `J`·NTX `NX`)·해외 1분봉 GET 만 호출하는 shadow 폴러입니다. 결과는 JSONL 파일과 Redis Stream(`minute:kis:<venue>:<symbol>`)에만 쓰고 research 표에는 ingest 하지 않습니다. 주문·원장 경로와 KIS 토큰 발급 경로를 링크하지 않으며, 토큰은 Redis 또는 gatewayd `/fetch` 에서 읽기만 합니다. `-enabled` 없이는 아무 요청도 보내지 않습니다. 실행 플래그, 대상 목록·달력 파일 형식, 행 규칙과 검증 방법은 [`docs/market-tap.md`](docs/market-tap.md)를 보세요.
 
 ## broker-edge 통합
 

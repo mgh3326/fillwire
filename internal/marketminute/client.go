@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/kst"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 )
 
 // Closed failure classes reported for a target. They never carry an upstream
@@ -23,6 +24,7 @@ const (
 	classTokenUnavailable  = "token_unavailable"
 	classMalformedResponse = "malformed_response"
 	classCanceled          = "canceled"
+	classCredentialHost    = "credential_host"
 )
 
 var (
@@ -34,6 +36,9 @@ var (
 	ErrMalformedResponse = errors.New("marketminute: KIS response is malformed")
 	// ErrTokenUnavailable reports that the read-only token source had no token.
 	ErrTokenUnavailable = errors.New("marketminute: KIS access token unavailable")
+	// ErrCredentialHost reports a host that would carry the KIS credentials
+	// over cleartext or to an unpinned destination.
+	ErrCredentialHost = errors.New("marketminute: credential host must be https or loopback")
 )
 
 // ErrorClass maps an error to the closed report vocabulary.
@@ -49,6 +54,8 @@ func ErrorClass(err error) string {
 		return classTokenUnavailable
 	case errors.Is(err, ErrMalformedResponse):
 		return classMalformedResponse
+	case errors.Is(err, ErrCredentialHost):
+		return classCredentialHost
 	default:
 		return classFetchError
 	}
@@ -72,6 +79,27 @@ const rateLimitMsgCode = "EGW00201"
 // read-only: Redis GET or gatewayd fetch, never issuance.
 type TokenSource func(context.Context) (string, error)
 
+// ValidateHost refuses a host that would send the KIS bearer token, app key
+// and app secret over cleartext or to an unsigned destination. https is
+// allowed anywhere an operator deliberately points it; http only to loopback
+// (local smoke and tests). Credentials, queries and fragments are refused.
+func ValidateHost(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ErrCredentialHost
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if netpolicy.IsLoopbackHost(parsed.Hostname()) {
+			return nil
+		}
+	}
+	return ErrCredentialHost
+}
+
 // Client is the minute-chart REST reader. It allows exactly two GET paths and
 // two transactions, the quotation checks quoted by Endpoint, and refuses every
 // other request before it reaches the network.
@@ -82,6 +110,10 @@ type Client struct {
 	HTTP      *http.Client
 	Host      string
 	Now       func() time.Time
+	// Reject is called with the token the broker rejected before the one
+	// retry. A gatewayd-fetch source uses it to ask for a reissue; a Redis
+	// source leaves it nil because every Token call reads a fresh value.
+	Reject func(context.Context, string) error
 }
 
 // Fetch performs one minute-chart GET.
@@ -89,9 +121,17 @@ func (c *Client) Fetch(ctx context.Context, target Target) FetchResult {
 	if err := target.validate(); err != nil {
 		return FetchResult{Err: ErrMalformedResponse}
 	}
+	if err := ValidateHost(c.host()); err != nil {
+		return FetchResult{Err: err}
+	}
 	for attempt := range 2 {
-		result := c.fetchOnce(ctx, target)
+		result, presented := c.fetchOnce(ctx, target)
 		if attempt == 0 && errors.Is(result.Err, errTokenExpired) {
+			if c.Reject != nil {
+				if err := c.Reject(ctx, presented); err != nil {
+					return FetchResult{Err: ErrTokenUnavailable}
+				}
+			}
 			continue
 		}
 		return result
@@ -101,25 +141,29 @@ func (c *Client) Fetch(ctx context.Context, target Target) FetchResult {
 
 var errTokenExpired = errors.New("marketminute: cached token expired")
 
-func (c *Client) fetchOnce(ctx context.Context, target Target) FetchResult {
-	host := c.Host
-	if host == "" {
-		host = DefaultHost
+func (c *Client) host() string {
+	if c.Host == "" {
+		return DefaultHost
 	}
+	return c.Host
+}
+
+func (c *Client) fetchOnce(ctx context.Context, target Target) (FetchResult, string) {
+	host := c.host()
 	query, path, tr := minuteRequest(target, c.now())
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(host, "/")+path+"?"+query.Encode(), nil)
 	if err != nil {
-		return FetchResult{Err: ErrMalformedResponse}
+		return FetchResult{Err: ErrMalformedResponse}, ""
 	}
 	if c.Token == nil {
-		return FetchResult{Err: ErrTokenUnavailable}
+		return FetchResult{Err: ErrTokenUnavailable}, ""
 	}
 	token, err := c.Token(ctx)
 	if err != nil || token == "" || strings.ContainsAny(token, "\r\n") {
-		return FetchResult{Err: ErrTokenUnavailable}
+		return FetchResult{Err: ErrTokenUnavailable}, ""
 	}
 	if c.AppKey == "" || c.AppSecret == "" || strings.ContainsAny(c.AppKey+c.AppSecret, "\r\n") {
-		return FetchResult{Err: ErrTokenUnavailable}
+		return FetchResult{Err: ErrTokenUnavailable}, ""
 	}
 	request.Header.Set("authorization", "Bearer "+token)
 	request.Header.Set("appkey", c.AppKey)
@@ -137,7 +181,7 @@ func (c *Client) fetchOnce(ctx context.Context, target Target) FetchResult {
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return FetchResult{Err: classedTransportError(ctx, err)}
+		return FetchResult{Err: classedTransportError(ctx, err)}, token
 	}
 	defer response.Body.Close()
 	retryAfter := parseRetryAfter(response.Header.Get("Retry-After"))
@@ -152,11 +196,11 @@ func (c *Client) fetchOnce(ctx context.Context, target Target) FetchResult {
 		default:
 			result.Err = ErrResponseRefused
 		}
-		return result
+		return result, token
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
-		return FetchResult{StatusCode: response.StatusCode, Err: ErrMalformedResponse}
+		return FetchResult{StatusCode: response.StatusCode, Err: ErrMalformedResponse}, token
 	}
 	envelope := struct {
 		RTCD    string           `json:"rt_cd"`
@@ -165,7 +209,7 @@ func (c *Client) fetchOnce(ctx context.Context, target Target) FetchResult {
 		Output2 []map[string]any `json:"output2"`
 	}{}
 	if json.Unmarshal(body, &envelope) != nil {
-		return FetchResult{StatusCode: response.StatusCode, Err: ErrMalformedResponse}
+		return FetchResult{StatusCode: response.StatusCode, Err: ErrMalformedResponse}, token
 	}
 	if envelope.RTCD != "0" {
 		result := FetchResult{StatusCode: response.StatusCode}
@@ -178,7 +222,7 @@ func (c *Client) fetchOnce(ctx context.Context, target Target) FetchResult {
 		default:
 			result.Err = ErrResponseRefused
 		}
-		return result
+		return result, token
 	}
 	rows := envelope.Output2
 	if len(rows) == 0 {
@@ -190,11 +234,11 @@ func (c *Client) fetchOnce(ctx context.Context, target Target) FetchResult {
 		frame, ok := frameFromRow(target, row)
 		if !ok {
 			result.Err = ErrMalformedResponse
-			return result
+			return result, token
 		}
 		result.Rows = append(result.Rows, frame)
 	}
-	return result
+	return result, token
 }
 
 func (c *Client) now() time.Time {
@@ -290,9 +334,9 @@ func frameFromRow(target Target, row map[string]any) (FrameRow, bool) {
 			Open:     number(row["open"]),
 			High:     number(row["high"]),
 			Low:      number(row["low"]),
-			Close:    number(row["close"]),
-			Volume:   number(row["volume"]),
-			Value:    number(row["value"]),
+			Close:    number(row["last"]),
+			Volume:   number(row["evol"]),
+			Value:    number(row["eamt"]),
 		}, label != ""
 	default:
 		return FrameRow{}, false

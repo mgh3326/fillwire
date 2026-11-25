@@ -58,10 +58,12 @@ type clockTime struct {
 // Calendar is the exchange calendar the shadow poller labels bars with.
 //
 // Go cannot reproduce auto_trader's exchange_calendars data, so the operator
-// supplies the closed days and US early closes from that same calendar. Every
-// date the file does not positively open is closed except weekends, and a
-// missing date is never guessed into a session (auto_trader's fail-closed
-// contract). LoadCalendar refuses any malformed entry.
+// supplies the closed days and US early closes from that same calendar. The
+// file carries closures, not an open-day list: weekends are closed, and every
+// other weekday is open unless named in the file. A closed day missing from
+// the file is therefore labelled as a session, so the operator must copy
+// every holiday from auto_trader's calendar. LoadCalendar refuses any
+// malformed entry.
 type Calendar struct {
 	krClosed     map[string]bool
 	usClosed     map[string]bool

@@ -28,6 +28,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/jsonx"
 	"github.com/mgh3326/fillwire/internal/kisread"
 	"github.com/mgh3326/fillwire/internal/marketminute"
+	"github.com/mgh3326/fillwire/internal/netpolicy"
 	"github.com/mgh3326/fillwire/internal/ratebudget"
 	"github.com/mgh3326/fillwire/internal/tokenfetch"
 	"github.com/redis/go-redis/v9"
@@ -60,6 +61,7 @@ type options struct {
 
 	tokenSource   string
 	tokenKey      string
+	tokenRedis    string
 	gatewaydURL   string
 	gatewaydToken string
 	gatewaydName  string
@@ -89,6 +91,7 @@ func parseFlags(args []string) (*options, error) {
 	flags.StringVar(&opts.appSecret, "app-secret-env", "KIS_APP_SECRET", "environment variable holding the KIS app secret")
 	flags.StringVar(&opts.tokenSource, "token-source", "redis", "redis (read kis:access_token) or gatewayd-fetch")
 	flags.StringVar(&opts.tokenKey, "token-key", kisread.AccessTokenLiveKey, "Redis key of the cached access token")
+	flags.StringVar(&opts.tokenRedis, "token-redis", "", "Redis URL holding the cached token when -token-source redis and no -redis sink is wanted")
 	flags.StringVar(&opts.gatewaydURL, "gatewayd-url", "", "gatewayd base URL for -token-source gatewayd-fetch")
 	flags.StringVar(&opts.gatewaydToken, "gatewayd-token-env", "", "environment variable holding the gatewayd credential")
 	flags.StringVar(&opts.gatewaydName, "gatewayd-provider", "kis-live", "gatewayd provider: kis-live or kis-mock")
@@ -122,6 +125,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	for _, raw := range []string{opts.redisURL, opts.tokenRedis} {
+		if raw == "" {
+			continue
+		}
+		if err := netpolicy.ValidateRedisURL(raw); err != nil {
+			fmt.Fprintf(stderr, "market-tap: %v\n", err)
+			return ExitConfiguration
+		}
+	}
+	if err := marketminute.ValidateHost(opts.host); err != nil {
+		fmt.Fprintf(stderr, "market-tap: %v\n", err)
+		return ExitConfiguration
+	}
+
 	targets, err := loadTargets(opts.targets)
 	if err != nil {
 		fmt.Fprintf(stderr, "market-tap: %v\n", err)
@@ -142,7 +159,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "market-tap: %v\n", err)
 		return ExitConfiguration
 	}
-	tokens, closeTokens, err := newTokenSource(opts)
+	tokens, reject, closeTokens, err := newTokenSource(opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "market-tap: %v\n", err)
 		return ExitConfiguration
@@ -151,6 +168,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	client := &marketminute.Client{
 		Token:     tokens,
+		Reject:    reject,
 		AppKey:    os.Getenv(opts.appKeyEnv),
 		AppSecret: os.Getenv(opts.appSecret),
 		Host:      opts.host,
@@ -294,22 +312,26 @@ func newSink(opts *options) (marketminute.Sink, func() error, func(), error) {
 	return sinks, flush, closeAll, nil
 }
 
-func newTokenSource(opts *options) (marketminute.TokenSource, func(), error) {
+func newTokenSource(opts *options) (marketminute.TokenSource, func(context.Context, string) error, func(), error) {
 	noop := func() {}
 	switch opts.tokenSource {
 	case "redis":
-		if opts.redisURL == "" {
-			return nil, noop, errors.New("redis token source needs -redis")
+		url := opts.tokenRedis
+		if url == "" {
+			url = opts.redisURL
 		}
-		parsed, err := redis.ParseURL(opts.redisURL)
+		if url == "" {
+			return nil, nil, noop, errors.New("redis token source needs -token-redis (or -redis)")
+		}
+		parsed, err := redis.ParseURL(url)
 		if err != nil {
-			return nil, noop, errors.New("redis URL is invalid")
+			return nil, nil, noop, errors.New("redis URL is invalid")
 		}
 		client := redis.NewClient(parsed)
 		cached, err := kisread.NewCachedToken(client, opts.tokenKey)
 		if err != nil {
 			client.Close()
-			return nil, noop, err
+			return nil, nil, noop, err
 		}
 		return func(ctx context.Context) (string, error) {
 			token, err := cached.Token(ctx)
@@ -317,34 +339,37 @@ func newTokenSource(opts *options) (marketminute.TokenSource, func(), error) {
 				return "", marketminute.ErrTokenUnavailable
 			}
 			return token, nil
-		}, func() { client.Close() }, nil
+		}, nil, func() { client.Close() }, nil
 	case "gatewayd-fetch":
 		if opts.gatewaydURL == "" {
-			return nil, noop, errors.New("gatewayd token source needs -gatewayd-url")
+			return nil, nil, noop, errors.New("gatewayd token source needs -gatewayd-url")
 		}
 		if opts.gatewaydToken == "" {
-			return nil, noop, errors.New("gatewayd token source needs -gatewayd-token-env")
+			return nil, nil, noop, errors.New("gatewayd token source needs -gatewayd-token-env")
 		}
 		credential := os.Getenv(opts.gatewaydToken)
 		if credential == "" {
-			return nil, noop, errors.New("gatewayd credential environment variable is unset")
+			return nil, nil, noop, errors.New("gatewayd credential environment variable is unset")
 		}
 		fetcher, err := tokenfetch.NewClient(opts.gatewaydURL, credential)
 		if err != nil {
-			return nil, noop, errors.New("gatewayd URL is invalid")
+			return nil, nil, noop, errors.New("gatewayd URL is invalid")
 		}
 		if opts.gatewaydName != "kis-live" && opts.gatewaydName != "kis-mock" {
-			return nil, noop, errors.New("gatewayd provider must be kis-live or kis-mock")
+			return nil, nil, noop, errors.New("gatewayd provider must be kis-live or kis-mock")
 		}
 		holder := tokenfetch.NewHolder(fetcher, opts.gatewaydName, time.Minute, false, time.Now)
 		return func(ctx context.Context) (string, error) {
-			token, _, err := holder.Current(ctx)
-			if err != nil {
-				return "", marketminute.ErrTokenUnavailable
-			}
-			return token.Value(), nil
-		}, noop, nil
+				token, _, err := holder.Current(ctx)
+				if err != nil {
+					return "", marketminute.ErrTokenUnavailable
+				}
+				return token.Value(), nil
+			}, func(ctx context.Context, rejected string) error {
+				_, err := holder.Reissue(ctx, rejected)
+				return err
+			}, noop, nil
 	default:
-		return nil, noop, errors.New("token source must be redis or gatewayd-fetch")
+		return nil, nil, noop, errors.New("token source must be redis or gatewayd-fetch")
 	}
 }
