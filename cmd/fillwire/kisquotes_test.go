@@ -44,7 +44,7 @@ func TestKisQuoteLaneDefaultOff(t *testing.T) {
 			if cfg.kisQuotes.enabled || cfg.kisQuotes.err != nil {
 				t.Fatalf("kisQuotes = %+v, want off", cfg.kisQuotes)
 			}
-			lane, stop := startKisQuotes(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			lane, stop := startKisQuotes(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 			if lane != nil {
 				t.Fatal("disabled lane started")
 			}
@@ -134,7 +134,7 @@ access_token_source = "redis"
 			if !cfg.kisQuotes.enabled || cfg.kisQuotes.err == nil {
 				t.Fatalf("kisQuotes = %+v, want enabled with a rejection", cfg.kisQuotes)
 			}
-			lane, stop := startKisQuotes(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+			lane, stop := startKisQuotes(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 			if lane != nil {
 				t.Fatal("rejected lane started")
 			}
@@ -179,7 +179,7 @@ func TestKisQuoteLaneWiringPublishes(t *testing.T) {
 		minHold: 15 * time.Minute, feedGap: time.Hour, maxLen: 100, buffer: 16,
 		tokenEnv: "KIS_QUOTE_TOKEN",
 	}
-	lane, stop := startKisQuotes(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	lane, stop := startKisQuotes(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 	if lane == nil {
 		t.Fatal("enabled lane did not start")
 	}

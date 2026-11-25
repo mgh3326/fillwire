@@ -92,6 +92,7 @@ type runtimeConfig struct {
 	alertRateLimit time.Duration
 	quotes         quoteSettings
 	kisQuotes      kisQuoteSettings
+	kisFutures     kisFuturesSettings
 	recording      recordingSettings
 	upbit          upbitSettings
 	reconcile      reconcileSettings
@@ -110,6 +111,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 	// credential checks: its REST recovery sends the app key and secret, and
 	// validateStatic and the env lookup must read the same settings.
 	cfg.kisQuotes = resolveKisQuoteSettings(contents)
+	if cfg.kisFutures, err = resolveKisFuturesSettings(contents); err != nil {
+		return runtimeConfig{}, err
+	}
 	if err := validateGatewaydTableKeys(contents); err != nil {
 		return runtimeConfig{}, err
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/decode"
+	"github.com/mgh3326/fillwire/internal/kisfutures"
 	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
@@ -91,6 +92,12 @@ type runDependencies struct {
 	quoteRetryMin time.Duration
 	quoteRetryMax time.Duration
 	quotePing     time.Duration
+
+	// Futures lane test seams. Nil or zero means the public KIS master, the
+	// wall clock and the default pacing.
+	futuresMaster   kisfutures.MasterSource
+	futuresNow      func() time.Time
+	futuresInterval time.Duration
 }
 
 type kisApprovalIssuer struct{ client *kis.Client }
@@ -214,13 +221,31 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	if cfg.Books.Enabled {
 		bookSymbols = []string{cfg.Books.Symbol}
 	}
-	kisQuotes, stopKisQuotes := startKisQuotes(ctx, cfg, logger, bookSymbols)
+	// The futures lane reserves its registrations before the quote lane admits
+	// any symbol, on the budget the two lanes then share.
+	futures, sessionSlots, stopFutures := startKisFutures(cfg, logger, dependencies)
+	defer stopFutures()
+	kisQuotes, stopKisQuotes := startKisQuotes(ctx, cfg, logger, bookSymbols, sessionSlots)
 	defer stopKisQuotes()
 	var onSession func(context.Context, reader.Session)
-	var onQuote func(ws.Event)
+	var onQuote, onFutures func(ws.Event)
+	if futures != nil {
+		onFutures = futures.Handle
+	}
 	if kisQuotes != nil {
-		onSession = func(sessionCtx context.Context, s reader.Session) { kisQuotes.Attach(sessionCtx, s) }
 		onQuote = kisQuotes.Handle
+	}
+	if futures != nil || kisQuotes != nil {
+		onSession = func(sessionCtx context.Context, s reader.Session) {
+			// Attach of the futures lane returns at once; the quote lane's
+			// returns after its registration pass.
+			if futures != nil {
+				futures.Attach(sessionCtx, s)
+			}
+			if kisQuotes != nil {
+				kisQuotes.Attach(sessionCtx, s)
+			}
+		}
 	}
 
 	counters := decode.NewCounters()
@@ -304,6 +329,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			OnBook:        bookEvent,
 			OnSession:     onSession,
 			OnQuote:       onQuote,
+			OnFutures:     onFutures,
 			Endpoint:      cfg.KIS.Endpoint,
 			HTSID:         cfg.KIS.HTSID,
 			Approval:      approvalSource,
@@ -350,6 +376,8 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	// still open; the fills socket is closed next. Handle after this point is
 	// a no-op because the lane holds no symbols.
 	stopKisQuotes()
+	// The same for the futures lane, which first writes its closed bars.
+	stopFutures()
 
 	// Stop the socket first. The bounded events and records channels remain
 	// live until the separate drain context expires, so a received fill gets an

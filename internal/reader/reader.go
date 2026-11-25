@@ -25,6 +25,13 @@ const ExitCodeCacheOnlyApprovalUnavailable = exitcode.Config
 // ExitCodeConfiguration is returned for invalid configuration.
 const ExitCodeConfiguration = exitcode.Config
 
+// The index futures trade transactions the reader routes to OnFutures. go-kis
+// does not name them; internal/kisfutures cites their source.
+const (
+	trFuturesDayTrade   = "H0IFCNT0"
+	trFuturesNightTrade = "H0MFCNT0"
+)
+
 // ErrEventsClosed reports that KIS stopped the event stream without a caller
 // initiated shutdown. Treating this as success would leave the process alive
 // after the feed has died.
@@ -44,6 +51,10 @@ type Config struct {
 	// frames the fills reader already routes to OnBook. It must not block the
 	// fills reader.
 	OnQuote func(ws.Event)
+	// OnFutures, if set, receives the index futures trade frames (H0IFCNT0
+	// day, H0MFCNT0 night); they never reach the fills channel. It must not
+	// block the fills reader.
+	OnFutures func(ws.Event)
 	// OnSubscribed runs once after the initial fills subscription is active.
 	// OnReconnected runs after each successful reconnect. Both run on the
 	// reader's own goroutines and must not block.
@@ -269,6 +280,11 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 			case ws.TRQuotePrice:
 				if r.cfg.OnQuote != nil {
 					r.cfg.OnQuote(event)
+					continue
+				}
+			case trFuturesDayTrade, trFuturesNightTrade:
+				if r.cfg.OnFutures != nil {
+					r.cfg.OnFutures(event)
 					continue
 				}
 			}

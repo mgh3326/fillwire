@@ -104,6 +104,11 @@ type Config struct {
 	REST              RESTReader
 	Now               func() time.Time
 	Logger            *slog.Logger
+	// Slots, if set, is the session budget shared with other lanes. Its
+	// capacity must be RegistrationLimit, and other lanes must have reserved
+	// their slots before this lane admits a symbol. Nil: the lane builds its
+	// own.
+	Slots *ratebudget.Slots
 }
 
 // Stats is the process-local counter set logged at shutdown.
@@ -154,6 +159,23 @@ type Lane struct {
 	gaps      atomic.Uint64
 }
 
+// ReserveSession takes the registrations a session holds before any other
+// consumer: the fixed lanes' slots and the safety margin. A lane that shares
+// the session budget (internal/kisfutures) reserves after this.
+func ReserveSession(slots *ratebudget.Slots, fixed []string) error {
+	for _, id := range fixed {
+		if _, err := slots.Reserve(id, 0); err != nil {
+			return fmt.Errorf("kisquote: reserve %s: %w", id, err)
+		}
+	}
+	for i := range safetyReserve {
+		if _, err := slots.Reserve("safety-"+strconv.Itoa(i+1), 0); err != nil {
+			return fmt.Errorf("kisquote: reserve safety margin: %w", err)
+		}
+	}
+	return nil
+}
+
 // New validates the configuration and builds the slot budget. It dials
 // nothing: Attach binds the lane to the session the fills reader already has.
 func New(cfg Config) (*Lane, error) {
@@ -178,19 +200,16 @@ func New(cfg Config) (*Lane, error) {
 	if len(cfg.Fixed) > cfg.RegistrationLimit {
 		return nil, errors.New("kisquote: fixed registrations exceed registration_limit")
 	}
-	slots, err := ratebudget.NewSlots(cfg.RegistrationLimit)
-	if err != nil {
-		return nil, fmt.Errorf("kisquote: %w", err)
-	}
-	for _, id := range cfg.Fixed {
-		if _, err := slots.Reserve(id, 0); err != nil {
-			return nil, fmt.Errorf("kisquote: reserve %s: %w", id, err)
+	slots := cfg.Slots
+	if slots == nil {
+		var err error
+		if slots, err = ratebudget.NewSlots(cfg.RegistrationLimit); err != nil {
+			return nil, fmt.Errorf("kisquote: %w", err)
 		}
 	}
-	for i := range safetyReserve {
-		if _, err := slots.Reserve("safety-"+strconv.Itoa(i+1), 0); err != nil {
-			return nil, fmt.Errorf("kisquote: reserve safety margin: %w", err)
-		}
+	// Reserving an id a shared budget already holds changes nothing.
+	if err := ReserveSession(slots, cfg.Fixed); err != nil {
+		return nil, err
 	}
 	reserved := make(map[string]bool, len(cfg.FixedSymbols))
 	for _, symbol := range cfg.FixedSymbols {

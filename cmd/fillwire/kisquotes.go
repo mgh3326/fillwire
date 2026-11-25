@@ -12,6 +12,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/bookfeed"
 	"github.com/mgh3326/fillwire/internal/kisquote"
 	"github.com/mgh3326/fillwire/internal/kisread"
+	"github.com/mgh3326/fillwire/internal/ratebudget"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -158,7 +159,9 @@ func resolveKisQuoteSettings(contents []byte) kisQuoteSettings {
 
 // startKisQuotes builds the promoted-quote lane. A rejected or failed lane
 // never stops the fills pipeline: it logs and returns nil.
-func startKisQuotes(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, bookSymbols []string) (*kisquote.Lane, func()) {
+// slots, when not nil, is the session budget the futures lane already reserved
+// from; nil leaves the lane to build its own.
+func startKisQuotes(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, bookSymbols []string, slots *ratebudget.Slots) (*kisquote.Lane, func()) {
 	settings := cfg.kisQuotes
 	if !settings.enabled {
 		return nil, func() {}
@@ -189,14 +192,11 @@ func startKisQuotes(ctx context.Context, cfg runtimeConfig, logger *slog.Logger,
 		AppSecret: cfg.appSecret,
 		Token:     token,
 	}
-	fixed := []string{"fills"}
-	if cfg.Books.Enabled {
-		fixed = append(fixed, "books")
-	}
 	lane, err := kisquote.New(kisquote.Config{
 		Symbols:           settings.symbols,
 		RegistrationLimit: settings.limit,
-		Fixed:             fixed,
+		Fixed:             fixedSessionSlots(cfg),
+		Slots:             slots,
 		FixedSymbols:      bookSymbols,
 		MinHold:           settings.minHold,
 		FeedGap:           settings.feedGap,
