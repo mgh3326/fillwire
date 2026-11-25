@@ -8,7 +8,7 @@ intents, with sending off by default.
 
 ## Scope
 
-PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only default KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`. Two optional read-only lanes add subscriptions on that same session and never open a second connection: `[books]` adds one `H0STASP0` symbol, and `[kis_quotes]` adds promoted trade and book symbols. The optional [quote reader](#quote-reader-off-by-default) is a separate lane on the Toss Securities websocket; it is off unless configured.
+PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only default KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`. Three optional read-only lanes add subscriptions on that same session and never open a second connection: `[books]` adds one `H0STASP0` symbol, `[kis_quotes]` adds promoted trade and book symbols, and [`[kis_futures]`](#kis-지수선물-1분봉-기본-비활성화) adds index futures trade streams. The optional [quote reader](#quote-reader-off-by-default) is a separate lane on the Toss Securities websocket; it is off unless configured.
 
 The pipeline is deliberately single-consumer at the sink:
 
@@ -687,6 +687,125 @@ redis-cli -u "$REDIS_URL" XLEN fills:kis
 
 At shutdown the lane logs `KIS 승격 시세` counters (published, dropped, gap
 detections) and removes its subscriptions on the same connection.
+
+## KIS 지수선물 1분봉 (기본 비활성화)
+
+`[kis_futures] enabled = true` 로 켜면 KOSPI200 선물(`F200`)과 미니 KOSPI200 선물(`MF200`)의
+근월·차월 **주간·야간 체결**을 받아 닫힌 1분봉을 Redis Stream 또는 JSONL 에 씁니다
+(hk 6424, 설계 `docs/design/6321-go-quote-collector.md`). 읽기 전용입니다. 주문·원장·
+research ingest 경로가 없으며, 정적 테스트(`internal/kisfutures/noorder_test.go`)가 링크하는
+소스에 주문 경로·주문 TR 이 없음을 검사합니다.
+
+### TR id 와 확인 상태
+
+공식 샘플 저장소 <https://github.com/koreainvestment/open-trading-api> (commit `b0a0d33`)의
+`examples_llm/domestic_futureoption/` 에서 확인했습니다.
+
+| 세션 | TR | 샘플 |
+|---|---|---|
+| 주간 | `H0IFCNT0` | `index_futures_realtime_conclusion` (지수선물 실시간체결가 [실시간-010]) |
+| 야간 | `H0MFCNT0` | `krx_ngt_futures_ccnl` (KRX야간선물 실시간종목체결 [실시간-064]) |
+
+두 샘플의 앞 11개 열(`futs_shrn_iscd`, `bsop_hour`, …, `futs_prpr`, …, `last_cnqn`,
+`acml_vol`)만 읽습니다. 주간 샘플은 실전 계좌만 지원한다고 적고 있어 레인은
+`kis.endpoint = "live"` 에서만 켜집니다.
+
+공식 근거로 확인하지 못해 **[unverified]** 이며, 켠 뒤 첫 smoke 에서 확인할 항목:
+
+- 야간 구독 `tr_key` 형식. 레인은 마스터 단축코드(예: `A01612`)를 씁니다. 야간 샘플의
+  예시 값은 `101W9000` 입니다.
+- 자정 이후 `bsop_hour` 표기(00~05 시와 24~29 시를 모두 받습니다).
+- `H0IFCNT0`/`H0MFCNT0` 가 미니 선물도 전달하는지, 모든 체결을 하나씩 보내는지.
+- 세션당 등록 상한 41 ([KIS 승격 레인](#kis-promoted-quote-lane-off-by-default) 과 같은 값).
+
+### 세션과 구독 예산
+
+기존 KIS 웹소켓 세션(`fills:kis` 와 같은 연결)에 등록하며 두 번째 세션을 열지 않습니다.
+등록은 4계약 × 2 TR = **8건**이고 `internal/ratebudget` 예산에서 예약합니다. 순서는 체결통보 →
+`[books]` → 안전 여유 2건 → 선물 8건 → 승격 종목이므로, 상한 41 에서 `[books]` 를 켜면 승격
+종목은 18개에서 14개가 됩니다. 상한은 `[kis_quotes] registration_limit` 을(그 레인이 꺼져
+있으면 41 을) 씁니다. 8건을 예약할 수 없으면 선물 레인만 꺼집니다.
+
+### 계약과 세션 규칙 (Python 과 동일)
+
+규칙은 auto_trader `68b7ca593` 의 `kis_futures_quotes/contracts.py` 와
+`research_candles/session_segment.py` 를 옮겼고, 그 Python 테스트의 사례를
+`internal/kisfutures/testdata/python_rules.golden.json` 에 두었습니다.
+
+- 계약은 공개 KIS 선물 마스터(`fo_idx_code_mts.mst.zip`, 인증 없음)에서만 정합니다. 계약
+  날짜가 바뀔 때마다 다시 읽고, 실패하면 이미 읽은 행을 쓰며 1분 뒤 다시 시도합니다.
+- 근월·차월을 정하는 날짜는 진행 중이거나 다음에 올 세션의 `session_date` 입니다. 주간 마감
+  (15:45) 뒤에는 다음 거래일이므로, 최종거래일 저녁에는 만기 계약을 해제한 다음 새 계약을
+  등록합니다.
+- `session_segment`: 거래일의 08:45~15:45 는 `FUT_DAY`(`session_date` 그날), 18:00~06:00 은
+  `FUT_NIGHT`(`session_date` 는 야간이 **시작한 날의 다음 XKRX 거래일**), 그 밖이나 판정할 수
+  없으면 `UNKNOWN`(`session_date` null).
+- `roll_state`: `front`·`next`·`expiring`·`expired`. 기준일은 `session_date`, 없으면 KST
+  날짜입니다. 세 번째 이후 계약의 봉은 Python 처럼 쓰지 않고 `no_roll_state` 로 셉니다.
+- 최종거래일의 휴장 보정 달력은 Python 과 같이 2026-11-23~2026-12-30 만 있고, 그 밖은 둘째
+  목요일입니다. Python `session_calendar.py` 를 넓힐 때 `contracts.go` 도 함께 넓힙니다.
+
+### 달력
+
+`calendar_file` 에 auto_trader 의 XKRX 달력에서 옮긴 **평일 휴장일 전부**(연말 휴장일 포함)를
+넣습니다. 주말은 자동 휴장입니다. `from`~`to` 밖의 날은 확인할 수 없으므로 `UNKNOWN` 입니다.
+빠뜨린 휴장일은 거래일로 처리됩니다.
+
+```json
+{"from": "2026-01-01", "to": "2026-12-31", "kr_closed": ["2026-12-25", "2026-12-31"]}
+```
+
+파일은 시작할 때 한 번 읽습니다.
+
+### 1분봉 규칙
+
+- `봉 시작 + 1분 + 10초 <= 현재 시각` 일 때만 씁니다. 종료할 때 형성 중인 봉은 버립니다.
+- `volume` 은 받은 체결 수량(`last_cnqn`)의 합입니다.
+- `volume_gap = true`: 누적 거래량(`acml_vol`)이 이어지지 않거나 세션 중간부터 받아, 그
+  봉이나 바로 앞에서 체결이 빠졌을 수 있습니다. 이미 쓴 봉 뒤의 누락은 다음 봉에만
+  표시됩니다.
+- 누적 거래량이 늘지 않은 반복 프레임은 버리고, 이미 닫힌 분의 늦은 체결도 버립니다(각각
+  `duplicate`, `late`).
+- 체결 시각에는 날짜가 없어 수신 시각에서 정합니다. 수신 시각과 5분 넘게 다르면 버립니다.
+
+### 설정과 출력
+
+```toml
+[kis_futures]
+enabled = true
+ingest = false     # true 는 설정 로드에서 거부(exit 78)
+calendar_file = "/etc/fillwire/krx-calendar.json"
+jsonl_path = ""    # 비우면 Redis Stream, 값이 있으면 그 파일에만 추가
+max_len = 100000   # XADD MAXLEN ~ N
+```
+
+`ingest` 는 `false` 만 허용합니다. auto_trader 의 research 분봉 ingest(hk 6343)는 `kr`·`us`
+만 받아 `research.kr_futures_candles_1m` 에 쓸 수 없습니다. 선물 ingest(hk 6430)가 머지된 뒤
+후속 PR 에서 POST 를 추가합니다.
+
+Redis Stream 키는 `minute:kis:futures:<symbol>`(예: `minute:kis:futures:F200.2612`)이며 JSONL
+도 같은 필드입니다: `time_utc`(봉 시작), `symbol`, `product`, `contract_month`(YYMM),
+`roll_state`, `session_segment`, `session_date`, `source`(`KIS`), `open`, `high`, `low`,
+`close`, `volume`, `received_at`(봉을 닫은 시각), `volume_gap`. Redis 에서는 알 수 없는
+`session_date` 필드를 생략하고 JSONL 에서는 `null` 입니다. 컨테이너에서 JSONL 을 쓰려면 쓰기
+가능한 볼륨이 필요합니다.
+
+설정이 거부되거나 달력·출력을 열 수 없으면 선물 레인만 꺼지고 체결 경로는 그대로입니다.
+출력 쓰기가 실패하면 닫힌 봉을 최대 2000개까지 보관했다가 순서대로 다시 씁니다.
+
+### 켠 뒤 확인
+
+```sh
+sudo journalctl -u fillwire.service -n 200 --no-pager | grep -E 'KIS 선물'
+# expected: "KIS 선물 구독 계약" contracts=[F200.… MF200.…]
+# investigate: "KIS 선물 구독 실패", "종목코드가 마스터의 계약과 다릅니다", "마스터를 읽지 못했습니다"
+redis-cli -u "$REDIS_URL" XREVRANGE minute:kis:futures:F200.2612 + - COUNT 3
+# 주간과 야간 각각: 늘어나는 봉, session_segment, session_date, volume_gap
+```
+
+첫 smoke 에서 주간 봉 몇 개를 거래소 화면 또는 Python 수집 행과 비교하고, 야간 봉이 실제로
+들어오는지 확인합니다. 한계: 재접속 뒤 KIS 가 어떤 선물 구독의 복원을 거절하면 그 스트림은
+프로세스를 재시작할 때까지 돌아오지 않습니다.
 
 ## Book recorder and replay (`bookrec`)
 

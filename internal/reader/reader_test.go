@@ -833,6 +833,46 @@ func TestBookSubscriptionSharesExecutionSession(t *testing.T) {
 	}
 }
 
+// Futures trade frames go to OnFutures on the fills connection and never to
+// the fills channel.
+func TestFuturesTradesNeverReachTheFillsChannel(t *testing.T) {
+	transport := newFakeTransport(func(tr *fakeTransport, raw []byte) {
+		successfulSubscribe(tr, raw)
+		if bytes.Contains(raw, []byte(ws.TRExecutionLive)) {
+			tr.push("0|H0IFCNT0|001|A01612^090005^0^0^0^400.10^0^0^0^1^1")
+			tr.push("0|H0MFCNT0|001|A01612^180005^0^0^0^400.10^0^0^0^1^1")
+			tr.push(kisExecutionFrame)
+		}
+	})
+	cfg := readerConfig(transport, &fakeApproval{})
+	futures := make(chan ws.Event, 2)
+	cfg.OnFutures = func(ev ws.Event) { futures <- ev }
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out := make(chan ws.Event, 3)
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, out) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case ev := <-out:
+		if ev.TR != ws.TRExecutionLive {
+			t.Fatalf("fills path received %q", ev.TR)
+		}
+	case <-ctx.Done():
+		t.Fatal("fills not delivered")
+	}
+	// The socket is read in order: both futures frames were routed before the
+	// fill arrived.
+	if len(futures) != 2 || (<-futures).TR != "H0IFCNT0" || (<-futures).TR != "H0MFCNT0" {
+		t.Fatal("futures frames not routed to OnFutures")
+	}
+}
+
 // A promoted quote lane adds its subscriptions on the fills connection: one
 // dial, and fills keep flowing to out while H0STCNT0 frames go to OnQuote.
 func TestPromotedQuoteSubscriptionsShareExecutionSession(t *testing.T) {

@@ -19,7 +19,7 @@ import (
 //	H0MFCNT0  krx_ngt_futures_ccnl               KRX야간선물 실시간종목체결 [실시간-064]
 //
 // Both samples list the same first eleven columns, which are all this package
-// reads. Execution notices (H0IFCNI0, H0MFCNI0) are account data and are not
+// reads. The futures execution notices are account data and are not
 // subscribed.
 const (
 	TRDayTrade   = "H0IFCNT0"
@@ -45,6 +45,7 @@ const (
 
 // Trade is one execution read from a realtime frame.
 type Trade struct {
+	TR      string // the stream that carried it
 	Code    string
 	At      time.Time // exchange time, KST
 	Price   Price
@@ -102,6 +103,7 @@ func ParseFrame(raw []byte, received time.Time) (trades []Trade, invalid int, er
 			invalid++
 			continue
 		}
+		trade.TR = parts[1]
 		trades = append(trades, trade)
 	}
 	return trades, invalid, nil

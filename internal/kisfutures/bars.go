@@ -89,12 +89,22 @@ type openBar struct {
 	gap                    bool
 }
 
-// feedState is what the builder remembers about one contract's trade feed.
+// feedKey is one trade stream: the day and the night transaction of a contract
+// count their cumulative volume apart.
+type feedKey struct{ tr, code string }
+
+// feedState is the last trade seen on one stream.
 type feedState struct {
-	seen    bool
+	day     time.Time // feedDay of that trade
 	acmlVol int64
 	at      time.Time
-	emitted time.Time // start of the newest bar already closed
+}
+
+// feedDay groups the trades that share one cumulative volume: seven hours
+// back, a night that runs to 06:00 stays on the date it started.
+func feedDay(at time.Time) time.Time {
+	day, _ := kstParts(at.Add(-7 * time.Hour))
+	return day
 }
 
 // addResult says what the builder did with a trade.
@@ -102,7 +112,7 @@ type addResult int
 
 const (
 	added addResult = iota
-	// duplicate: the cumulative volume and the clock did not move forward.
+	// duplicate: the cumulative volume did not advance.
 	duplicate
 	// late: the trade belongs to a minute that was already closed.
 	late
@@ -113,46 +123,46 @@ const (
 type builder struct {
 	calendar *Calendar
 	bars     map[barKey]*openBar
-	feeds    map[string]*feedState
+	feeds    map[feedKey]feedState
+	emitted  map[string]time.Time // code: start of the newest bar already closed
 }
 
 func newBuilder(calendar *Calendar) *builder {
-	return &builder{calendar: calendar, bars: map[barKey]*openBar{}, feeds: map[string]*feedState{}}
+	return &builder{calendar: calendar, bars: map[barKey]*openBar{}, feeds: map[feedKey]feedState{}, emitted: map[string]time.Time{}}
 }
 
 // add puts one trade into the bar of its exchange minute.
 func (b *builder) add(contract Contract, t Trade) addResult {
-	feed := b.feeds[t.Code]
-	if feed == nil {
-		feed = &feedState{}
-		b.feeds[t.Code] = feed
-	}
+	key := feedKey{t.TR, t.Code}
+	last, seen := b.feeds[key]
+	day := feedDay(t.At)
+	seen = seen && last.day.Equal(day)
 	var gap bool
 	switch {
-	case feed.seen && t.AcmlVol > feed.acmlVol:
-		gap = t.AcmlVol-t.Qty != feed.acmlVol
-	case feed.seen && !t.At.After(feed.at):
+	case seen && t.AcmlVol > last.acmlVol:
+		gap = t.AcmlVol-t.Qty != last.acmlVol
+	case seen && (t.AcmlVol == last.acmlVol || !t.At.After(last.at)):
 		return duplicate
 	default:
-		// The first trade seen, or the cumulative volume restarted with a
-		// new session: only a session's first trade is its own total.
+		// The first trade of the stream's day, or a cumulative volume that
+		// started over: only a first trade is its own total.
 		gap = t.AcmlVol != t.Qty
 	}
 	start := t.At.Truncate(time.Minute)
-	if gap && feed.seen {
+	if gap && seen {
 		// The missing trades may belong to the bar before this one.
-		if previous := b.bars[barKey{t.Code, feed.at.Truncate(time.Minute).Unix()}]; previous != nil {
+		if previous := b.bars[barKey{t.Code, last.at.Truncate(time.Minute).Unix()}]; previous != nil {
 			previous.gap = true
 		}
 	}
-	feed.seen, feed.acmlVol, feed.at = true, t.AcmlVol, t.At
-	if !feed.emitted.IsZero() && !start.After(feed.emitted) {
+	b.feeds[key] = feedState{day: day, acmlVol: t.AcmlVol, at: t.At}
+	if emitted, ok := b.emitted[t.Code]; ok && !start.After(emitted) {
 		return late
 	}
-	key := barKey{t.Code, start.Unix()}
-	bar := b.bars[key]
+	minute := barKey{t.Code, start.Unix()}
+	bar := b.bars[minute]
 	if bar == nil {
-		b.bars[key] = &openBar{
+		b.bars[minute] = &openBar{
 			contract: contract, start: start,
 			open: t.Price, high: t.Price, low: t.Price, close: t.Price,
 			volume: t.Qty, gap: gap,
@@ -181,8 +191,8 @@ func (b *builder) closed(now time.Time) (bars []Bar, skipped int) {
 			continue
 		}
 		delete(b.bars, key)
-		if feed := b.feeds[key.code]; open.start.After(feed.emitted) {
-			feed.emitted = open.start
+		if open.start.After(b.emitted[key.code]) {
+			b.emitted[key.code] = open.start
 		}
 		segment, sessionDate := b.calendar.Classify(open.start)
 		on := sessionDate

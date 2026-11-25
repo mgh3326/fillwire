@@ -166,12 +166,62 @@ func TestVolumeGap(t *testing.T) {
 			t.Fatalf("bars = %+v", bars)
 		}
 	})
-	t.Run("a new session restarts the total", func(t *testing.T) {
+	on := func(tr string, at time.Time, qty, acml int64) Trade {
+		x := trade(t, "A01612", at, "400.10", qty, acml)
+		x.TR = tr
+		return x
+	}
+	t.Run("the night stream counts apart from the day", func(t *testing.T) {
 		builder := newBuilder(goldenCalendar(t))
-		builder.add(testContract, trade(t, "A01612", kstAt(15, 0, 0), "400.10", 5, 5))
-		builder.add(testContract, trade(t, "A01612", kstAt(18, 0, 0), "400.10", 2, 2))
+		builder.add(testContract, on(TRDayTrade, kstAt(15, 0, 0), 2, 2))
+		// The same total as the day's: still the night's first trade.
+		if got := builder.add(testContract, on(TRNightTrade, kstAt(18, 0, 0), 2, 2)); got != added {
+			t.Fatalf("night trade = %v", got)
+		}
 		bars, _ := builder.closed(kstAt(18, 2, 0))
 		if len(bars) != 2 || bars[1].VolumeGap || bars[1].Volume != 2 || bars[1].SessionSegment != SegmentNight {
+			t.Fatalf("bars = %+v", bars)
+		}
+	})
+	t.Run("a new day restarts the total, equal or lower", func(t *testing.T) {
+		builder := newBuilder(goldenCalendar(t))
+		builder.add(testContract, on(TRDayTrade, kstAt(15, 0, 0), 1, 1))
+		if got := builder.add(testContract, on(TRDayTrade, kstAt(9, 0, 0).AddDate(0, 0, 1), 1, 1)); got != added {
+			t.Fatalf("next day's first trade = %v", got)
+		}
+		bars, _ := builder.closed(kstAt(9, 2, 0).AddDate(0, 0, 1))
+		if len(bars) != 2 || bars[1].VolumeGap {
+			t.Fatalf("bars = %+v", bars)
+		}
+	})
+	t.Run("midnight does not restart a night", func(t *testing.T) {
+		builder := newBuilder(goldenCalendar(t))
+		midnight := time.Date(2026, time.November, 25, 0, 0, 0, 0, kst.Zone)
+		builder.add(testContract, on(TRNightTrade, midnight.Add(-time.Second), 9, 9))
+		builder.add(testContract, on(TRNightTrade, midnight.Add(time.Second), 1, 10))
+		bars, _ := builder.closed(midnight.Add(2 * time.Minute))
+		if len(bars) != 2 || bars[1].VolumeGap {
+			t.Fatalf("bars = %+v", bars)
+		}
+	})
+	t.Run("an unchanged total is not a trade", func(t *testing.T) {
+		builder := newBuilder(goldenCalendar(t))
+		builder.add(testContract, on(TRDayTrade, kstAt(10, 0, 0), 3, 3))
+		if got := builder.add(testContract, on(TRDayTrade, kstAt(10, 0, 20), 3, 3)); got != duplicate {
+			t.Fatalf("repeat with a newer clock = %v", got)
+		}
+		if bars, _ := builder.closed(kstAt(10, 2, 0)); len(bars) != 1 || bars[0].Volume != 3 {
+			t.Fatalf("bars = %+v", bars)
+		}
+	})
+	t.Run("a total that starts over mid day is kept and marked", func(t *testing.T) {
+		builder := newBuilder(goldenCalendar(t))
+		builder.add(testContract, on(TRDayTrade, kstAt(10, 0, 0), 9, 9))
+		if got := builder.add(testContract, on(TRDayTrade, kstAt(10, 1, 0), 2, 5)); got != added {
+			t.Fatalf("restarted total = %v", got)
+		}
+		bars, _ := builder.closed(kstAt(10, 3, 0))
+		if len(bars) != 2 || !bars[1].VolumeGap || bars[1].Volume != 2 {
 			t.Fatalf("bars = %+v", bars)
 		}
 	})
