@@ -1,0 +1,842 @@
+{
+  "generated_by": "auto_trader session_segment.session_segment_of",
+  "calendar": {
+    "kr_closed": [
+      "2026-12-25"
+    ],
+    "us_closed": [
+      "2026-11-26"
+    ],
+    "us_early_close": {
+      "2026-11-27": "13:00"
+    }
+  },
+  "cases": [
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-23T22:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-23T22:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-24T22:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-24T22:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-23T23:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-23T23:00:00Z",
+      "naive": false,
+      "expected": "NXT_PRE"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-24T23:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-24T23:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-23T23:49:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-23T23:49:00Z",
+      "naive": false,
+      "expected": "NXT_PRE"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-24T23:49:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-24T23:49:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-23T23:50:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-23T23:50:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-24T23:50:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-24T23:50:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-23T23:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-23T23:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-24T23:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-24T23:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T00:00:00Z",
+      "naive": false,
+      "expected": "KRX_REGULAR"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T00:00:00Z",
+      "naive": false,
+      "expected": "NXT_OVERLAP"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T00:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T00:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T06:19:00Z",
+      "naive": false,
+      "expected": "KRX_REGULAR"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T06:19:00Z",
+      "naive": false,
+      "expected": "NXT_OVERLAP"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T06:19:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T06:19:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T06:20:00Z",
+      "naive": false,
+      "expected": "KRX_REGULAR"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T06:20:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T06:20:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T06:20:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T06:29:00Z",
+      "naive": false,
+      "expected": "KRX_REGULAR"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T06:29:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T06:29:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T06:29:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T06:30:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T06:30:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T06:30:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T06:30:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T06:39:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T06:39:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T06:39:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T06:39:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T06:40:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T06:40:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T06:40:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T06:40:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T06:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T06:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T06:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T06:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T07:00:00Z",
+      "naive": false,
+      "expected": "KRX_AFTER"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T07:00:00Z",
+      "naive": false,
+      "expected": "NXT_POST"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T07:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T07:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T10:59:00Z",
+      "naive": false,
+      "expected": "KRX_AFTER"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T10:59:00Z",
+      "naive": false,
+      "expected": "NXT_POST"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T10:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T10:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-24T11:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-11-24T11:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-12-25T11:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "NTX",
+      "at": "2026-12-25T11:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "KRX",
+      "at": "2026-11-21T01:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "kr",
+      "venue": "XXX",
+      "at": "2026-11-24T01:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-15T07:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-15T07:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-15T07:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-15T08:00:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-15T08:00:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-15T08:00:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-15T13:29:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-15T13:29:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-15T13:29:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-15T13:30:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-15T13:30:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-15T13:30:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-15T19:59:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-15T19:59:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-15T19:59:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-15T20:00:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-15T20:00:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-15T20:00:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-15T23:59:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-15T23:59:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-15T23:59:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-07-16T00:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-07-16T00:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-07-16T00:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-15T08:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-15T08:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-15T08:59:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-15T09:00:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-15T09:00:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-15T09:00:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-15T14:29:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-15T14:29:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-15T14:29:00Z",
+      "naive": false,
+      "expected": "US_PRE"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-15T14:30:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-15T14:30:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-15T14:30:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-15T20:59:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-15T20:59:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-15T20:59:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-15T21:00:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-15T21:00:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-15T21:00:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-16T00:59:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-16T00:59:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-16T00:59:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-12-16T01:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NYSE",
+      "at": "2026-12-16T01:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "AMEX",
+      "at": "2026-12-16T01:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-11-27T17:59:00Z",
+      "naive": false,
+      "expected": "US_REGULAR"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-11-27T18:00:00Z",
+      "naive": false,
+      "expected": "US_POST"
+    },
+    {
+      "market": "us",
+      "venue": "NASD",
+      "at": "2026-11-26T15:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    },
+    {
+      "market": "us",
+      "venue": "KRX",
+      "at": "2026-07-15T14:00:00Z",
+      "naive": false,
+      "expected": "UNKNOWN"
+    }
+  ]
+}

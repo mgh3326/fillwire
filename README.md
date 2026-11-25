@@ -897,6 +897,10 @@ fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fil
 
 `[reconcile] enabled = true`로 켜면 KIS 최초 구독 직후, 재연결 성공 직후, 그리고 `interval`(설정 시)마다 auto_trader의 `reconcile/trigger` 엔드포인트를 호출해 수 초의 체결 통지 공백을 바로 메웁니다. 토큰은 `[ingest]`와 같은 것을 쓰며 로그에 남지 않습니다. 호출은 체결 처리 경로와 분리되어 있어 느리거나 실패해도 처리·종료에 영향이 없습니다. 기본값 `dry_run = true`는 보고만 하며, `dry_run = false`(커밋) 전환과 auto_trader의 30분 TaskIQ 크론 해제는 별도 승인 후의 환경 변경입니다.
 
+## 분봉 shadow 폴러 `market-tap` (기본 비활성화)
+
+`market-tap` 은 KIS 국내(KRX `J`·NTX `NX`)·해외 1분봉 GET 만 호출하는 shadow 폴러입니다. 결과는 JSONL 파일과 Redis Stream(`minute:kis:<venue>:<symbol>`)에만 쓰고 research 표에는 ingest 하지 않습니다. 주문·원장 경로와 KIS 토큰 발급 경로를 링크하지 않으며, 토큰은 Redis 또는 gatewayd `/fetch` 에서 읽기만 합니다. `-enabled` 없이는 아무 요청도 보내지 않습니다. 실행 플래그, 대상 목록·달력 파일 형식, 행 규칙과 검증 방법은 [`docs/market-tap.md`](docs/market-tap.md)를 보세요.
+
 ## broker-edge 통합
 
-`broker-edge` 저장소(`mgh3326/broker-edge` @ `0bdec8e`)를 이력째 이 저장소로 들여왔습니다(hk 5872). 명령은 `cmd/{edge-canary,gatewayd,kis-mock-edge,kis-mock-read,market-tap}`, 패키지는 `internal/{canary,gatewayd,kislive,kismockedge,kismockread}`와 `execution_contracts/`에 있고 동작과 플래그는 바뀌지 않았습니다. 배포 전환(hk 5874) 전까지 `Dockerfile.edge`가 `broker-edge`가 게시하던 것과 같은 4개 바이너리 이미지를 만듭니다. 문서는 [`docs/edge/README.md`](docs/edge/README.md)와 `docs/edge/`, `deploy/edge/`, `scripts/edge/`, `fixtures/edge/`로 옮겼습니다.
+`broker-edge` 저장소(`mgh3326/broker-edge` @ `0bdec8e`)를 이력째 이 저장소로 들여왔습니다(hk 5872). 명령은 `cmd/{edge-canary,gatewayd,kis-mock-edge,kis-mock-read,market-tap}`, 패키지는 `internal/{canary,gatewayd,kislive,kismockedge,kismockread}`와 `execution_contracts/`에 있고 동작과 플래그는 바뀌지 않았습니다. 배포 전환(hk 5874) 전까지 `Dockerfile.edge`가 `broker-edge`가 게시하던 것과 같은 4개 바이너리 이미지를 만듭니다. 문서는 [`docs/edge/README.md`](docs/edge/README.md)와 `docs/edge/`, `deploy/edge/`, `scripts/edge/`, `fixtures/edge/`로 옮겼습니다. 예약 이름이던 `market-tap` 은 hk 6344에서 분봉 shadow 폴러로 구현되었습니다(위 절 참조).

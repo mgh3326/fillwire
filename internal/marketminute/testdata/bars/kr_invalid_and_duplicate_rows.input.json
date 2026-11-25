@@ -1,0 +1,40 @@
+{
+  "market": "kr",
+  "symbol": "123456",
+  "venue": "KRX",
+  "observed_before": "2026-11-24T06:00:00Z",
+  "frame": [
+    {
+      "datetime": "2026-11-24 09:00",
+      "open": "100",
+      "high": "101",
+      "low": "99",
+      "close": "100",
+      "volume": "10",
+      "value": "100"
+    },
+    {
+      "datetime": "2026-11-24 09:00",
+      "open": "100",
+      "high": "101",
+      "low": "99",
+      "close": "100",
+      "volume": "10",
+      "value": "100"
+    },
+    {
+      "datetime": "2026-11-24 09:01",
+      "open": "100",
+      "high": "101",
+      "low": "99",
+      "close": null,
+      "volume": "10",
+      "value": "250"
+    }
+  ],
+  "expect": {
+    "skipped_forming": 0,
+    "skipped_invalid": 1,
+    "null_value": 0
+  }
+}
