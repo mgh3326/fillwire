@@ -363,7 +363,8 @@ func TestMasterFailureRetriesAndKeepsReadRows(t *testing.T) {
 }
 
 func event(tr, code, price string, qty, acml int64, at time.Time) ws.Event {
-	return ws.Event{TR: tr, ReceivedAt: at, Raw: frame(tr, record(tr, code, at.Format("150405"), price, qty, acml))}
+	fields := record(tr, code, at.Format("150405"), price, qty, acml)
+	return ws.Event{TR: tr, ReceivedAt: at, Raw: frame(tr, fields), Fields: strings.Split(fields, "^")}
 }
 
 func TestSinkFailureKeepsBarsInOrder(t *testing.T) {

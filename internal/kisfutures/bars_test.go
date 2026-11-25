@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/kst"
+	"github.com/mgh3326/go-kis/kis/ws"
 )
 
 func kstAt(hour, minute, second int) time.Time {
@@ -46,6 +47,17 @@ func frame(tr string, records ...string) []byte {
 	return []byte("0|" + tr + "|" + strconv.Itoa(1000 + len(records))[1:] + "|" + strings.Join(records, "^"))
 }
 
+// parse reads raw as the event the websocket client makes of a plain frame: the
+// payload split at '^' in Fields.
+func parse(raw []byte, received time.Time) ([]Trade, int, error) {
+	text := strings.TrimRight(string(raw), "\r\n")
+	ev := ws.Event{Raw: []byte(text)}
+	if parts := strings.SplitN(text, "|", 4); len(parts) == 4 {
+		ev.TR, ev.Fields = parts[1], strings.Split(parts[3], "^")
+	}
+	return ParseEvent(ev, received)
+}
+
 var testContract = Contract{
 	Product: "F200", ShortCode: "A01612", Month: "2026-12", Symbol: "F200.2612", YYMM: "2612",
 	LastTrade: Date(2026, time.December, 10), Listed: []string{"2026-12", "2027-03"},
@@ -68,7 +80,7 @@ func TestBarsAcrossMinuteBoundaryAndGrace(t *testing.T) {
 	}
 	for _, f := range fixture {
 		received := kstAt(9, 2, 0)
-		trades, invalid, err := ParseFrame(frame(TRDayTrade, record(TRDayTrade, "A01612", f.hour, f.price, f.qty, f.acml)), received)
+		trades, invalid, err := parse(frame(TRDayTrade, record(TRDayTrade, "A01612", f.hour, f.price, f.qty, f.acml)), received)
 		if err != nil || invalid != 0 || len(trades) != 1 {
 			t.Fatalf("frame %s: %v, %d, %d", f.hour, err, invalid, len(trades))
 		}
@@ -238,12 +250,12 @@ func TestContractBeyondNextHasNoBar(t *testing.T) {
 	}
 }
 
-func TestParseFrame(t *testing.T) {
+func TestParseEvent(t *testing.T) {
 	received := kstAt(9, 0, 10)
 	two := frame(TRDayTrade,
 		record(TRDayTrade, "A01612", "090001", "400.10", 3, 3),
 		record(TRDayTrade, "A05612", "090002", "400.12", 1, 7))
-	trades, invalid, err := ParseFrame(append(two, '\n'), received)
+	trades, invalid, err := parse(append(two, '\n'), received)
 	if err != nil || invalid != 0 || len(trades) != 2 {
 		t.Fatalf("two records: %v, %d, %d", err, invalid, len(trades))
 	}
@@ -251,7 +263,7 @@ func TestParseFrame(t *testing.T) {
 	if got.Code != "A05612" || got.Price.Text != "400.12" || got.Qty != 1 || got.AcmlVol != 7 || !got.At.Equal(kstAt(9, 0, 2)) {
 		t.Fatalf("second record = %+v", got)
 	}
-	night, invalid, err := ParseFrame(frame(TRNightTrade, record(TRNightTrade, "A01612", "090001", "400.10", 3, 3)), received)
+	night, invalid, err := parse(frame(TRNightTrade, record(TRNightTrade, "A01612", "090001", "400.10", 3, 3)), received)
 	if err != nil || invalid != 0 || len(night) != 1 || night[0].Price.Text != "400.10" {
 		t.Fatalf("night record: %v, %d, %+v", err, invalid, night)
 	}
@@ -268,21 +280,21 @@ func TestParseFrame(t *testing.T) {
 		"future clock": record(TRDayTrade, "A01612", "091000", "400.10", 3, 3),
 		"no code":      record(TRDayTrade, "", "090001", "400.10", 3, 3),
 	} {
-		trades, invalid, err := ParseFrame(frame(TRDayTrade, bad), received)
+		trades, invalid, err := parse(frame(TRDayTrade, bad), received)
 		if err != nil || invalid != 1 || len(trades) != 0 {
 			t.Errorf("%s: %v, invalid %d, trades %+v", name, err, invalid, trades)
 		}
 	}
 	for name, bad := range map[string]string{
-		"notice TR": "0|H0IFCNI0|001|a^b",
-		"stock TR":  "0|H0STCNT0|001|a^b",
-		"encrypted": "1|H0IFCNT0|001|abc",
-		"count":     "0|H0IFCNT0|000|a",
-		"narrow":    "0|H0IFCNT0|001|A01612^090001",
-		"uneven":    "0|H0IFCNT0|002|" + record(TRDayTrade, "A01612", "090001", "400.10", 3, 3) + "^x",
-		"json":      `{"header":{}}`,
+		"notice TR":  "0|H0IFCNI0|001|a^b",
+		"stock TR":   "0|H0STCNT0|001|a^b",
+		"ciphertext": "1|H0IFCNT0|001|abc",
+		"count":      "0|H0IFCNT0|000|a",
+		"narrow":     "0|H0IFCNT0|001|A01612^090001",
+		"uneven":     "0|H0IFCNT0|002|" + record(TRDayTrade, "A01612", "090001", "400.10", 3, 3) + "^x",
+		"json":       `{"header":{}}`,
 	} {
-		if _, _, err := ParseFrame([]byte(bad), received); err == nil {
+		if _, _, err := parse([]byte(bad), received); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

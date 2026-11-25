@@ -320,6 +320,15 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		onSubscribed = func() { reconciler.Fire("startup") }
 		onReconnected = func() { reconciler.Fire("reconnect") }
 	}
+	if futures != nil {
+		trigger := onReconnected
+		onReconnected = func() {
+			futures.Reconnected()
+			if trigger != nil {
+				trigger()
+			}
+		}
+	}
 	go func() {
 		defer close(events)
 		readerDone <- reader.New(reader.Config{

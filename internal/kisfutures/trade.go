@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/kst"
+	"github.com/mgh3326/go-kis/kis/ws"
 )
 
 // Realtime trade transactions, from the official KIS sample repository
@@ -76,23 +77,25 @@ func (p Price) cmp(other Price) int { return p.value.Cmp(other.value) }
 
 var errFrame = errors.New("kisfutures: malformed frame")
 
-// ParseFrame parses one raw realtime frame,
+// ParseEvent reads the trades of one realtime event. The frame header,
 //
 //	<encrypted flag>|<tr_id>|<record count>|<payload>
 //
-// whose payload holds count records of equal width separated by '^'. received
-// places the date-less exchange clock. Records that cannot be read are counted
-// in invalid and the others are returned.
-func ParseFrame(raw []byte, received time.Time) (trades []Trade, invalid int, err error) {
-	parts := strings.SplitN(strings.TrimRight(string(raw), "\r\n"), "|", 4)
-	if len(parts) < 4 || parts[0] != "0" || !IsTradeTR(parts[1]) {
+// is clear in ev.Raw and gives the record count. The records are ev.Fields,
+// the payload the client has split at '^' and, for an encrypted frame,
+// decrypted first: count records of equal width. received places the
+// date-less exchange clock. Records that cannot be read are counted in invalid
+// and the others are returned.
+func ParseEvent(ev ws.Event, received time.Time) (trades []Trade, invalid int, err error) {
+	parts := strings.SplitN(string(ev.Raw), "|", 4)
+	if len(parts) < 4 || !IsTradeTR(parts[1]) {
 		return nil, 0, errFrame
 	}
-	count, convErr := strconv.Atoi(parts[2])
+	count, convErr := strconv.Atoi(strings.TrimSpace(parts[2]))
 	if convErr != nil || count <= 0 {
 		return nil, 0, errFrame
 	}
-	fields := strings.Split(parts[3], "^")
+	fields := ev.Fields
 	if len(fields)%count != 0 || len(fields)/count < minColumns {
 		return nil, 0, errFrame
 	}

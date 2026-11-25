@@ -112,7 +112,7 @@ type addResult int
 
 const (
 	added addResult = iota
-	// duplicate: the cumulative volume did not advance.
+	// duplicate: a replay, or a cumulative volume that did not advance.
 	duplicate
 	// late: the trade belongs to a minute that was already closed.
 	late
@@ -139,10 +139,12 @@ func (b *builder) add(contract Contract, t Trade) addResult {
 	seen = seen && last.day.Equal(day)
 	var gap bool
 	switch {
+	// An older clock is a replay whatever its total: after a total started
+	// over, an earlier trade carries a larger one.
+	case seen && (t.At.Before(last.at) || t.AcmlVol == last.acmlVol || (t.AcmlVol < last.acmlVol && t.At.Equal(last.at))):
+		return duplicate
 	case seen && t.AcmlVol > last.acmlVol:
 		gap = t.AcmlVol-t.Qty != last.acmlVol
-	case seen && (t.AcmlVol == last.acmlVol || !t.At.After(last.at)):
-		return duplicate
 	default:
 		// The first trade of the stream's day, or a cumulative volume that
 		// started over: only a first trade is its own total.

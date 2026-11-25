@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -352,5 +353,118 @@ func TestRuntimeSharesOneSessionAndBudgetWithTheFuturesLane(t *testing.T) {
 	removed := requests("2")
 	if len(removed["H0IFCNT0"]) < 4 || len(removed["H0MFCNT0"]) < 4 {
 		t.Fatalf("futures registrations removed at shutdown = %v", removed)
+	}
+}
+
+// kisServer answers like KIS: it holds each socket's registrations, refuses a
+// repeated subscription and the removal of one it does not hold, and refuses
+// once the restore of refuse on the second socket.
+type kisServer struct {
+	mu      sync.Mutex
+	sockets []map[string]bool
+	refuse  string
+	refused bool
+}
+
+func (s *kisServer) dialer() *isoDialer {
+	return &isoDialer{dial: func(d *isoDialer) (ws.Transport, error) {
+		s.mu.Lock()
+		socket := len(s.sockets)
+		s.sockets = append(s.sockets, map[string]bool{})
+		s.mu.Unlock()
+		return d.add(newIsoTransport(func(transport *isoTransport, req isoRequest) {
+			s.mu.Lock()
+			held, id := s.sockets[socket], req.tr+"|"+req.key
+			ok := held[id] == (req.trType == "2")
+			if socket == 1 && req.trType == "1" && id == s.refuse && !s.refused {
+				s.refused, ok = true, false
+			}
+			if ok && req.trType == "1" {
+				held[id] = true
+			}
+			if req.trType == "2" {
+				delete(held, id)
+			}
+			s.mu.Unlock()
+			if ok {
+				transport.push(isoAck(req.tr, "0", "OPSP0000"))
+			} else {
+				transport.push(isoAck(req.tr, "1", "OPSP0002"))
+			}
+		})), nil
+	}}
+}
+
+func (s *kisServer) futures(socket int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if socket >= len(s.sockets) {
+		return 0
+	}
+	n := 0
+	for id := range s.sockets[socket] {
+		if strings.HasPrefix(id, "H0IFCNT0|") || strings.HasPrefix(id, "H0MFCNT0|") {
+			n++
+		}
+	}
+	return n
+}
+
+// After a reconnect in which KIS refuses to restore one futures stream, which
+// the websocket client drops without a report, the lane registers it again.
+func TestFuturesStreamRefusedOnRestoreIsRegisteredAgain(t *testing.T) {
+	mainRedis := miniredis.RunT(t)
+	approvalRedis := miniredis.RunT(t)
+	approvalRedis.Set("kis:websocket:approval_key", "fills-cached-key")
+	approvalRedis.SetTTL("kis:websocket:approval_key", 20*time.Hour)
+	approval := redis.NewClient(&redis.Options{Addr: approvalRedis.Addr()})
+	t.Cleanup(func() { _ = approval.Close() })
+	ingest := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(ingest.Close)
+	cfg := cacheOnlyRuntimeConfig(mainRedis.Addr(), ingest.URL)
+	cfg.KIS.Endpoint, cfg.KIS.AccountMode = "live", "live"
+	cfg.Channel.Buffer, cfg.KIS.EventBuffer, cfg.KIS.DupTrackMax = 16, 16, 100
+	now := time.Now()
+	cfg.kisFutures = kisFuturesSettings{enabled: true, calendarFile: calendarPath(t, now), maxLen: 100}
+	server := &kisServer{refuse: "H0IFCNT0|" + upcomingMaster(now)[0].ShortCode}
+	dialer := server.dialer()
+	deps := runDependencies{
+		approvalRedis: approval, approvalFallback: &runApprovalFallback{}, dialer: dialer,
+		futuresMaster: upcomingMaster(now), futuresInterval: 2 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runWithDependencies(ctx, cfg, quietLogger(), deps) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("fillwire returned %v", err)
+		}
+	}()
+	wait := func(what string, ready func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(8 * time.Second)
+		for !ready() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	wait("registrations", func() bool { return server.futures(0) == kisfutures.Registrations })
+	dialer.mu.Lock()
+	first := dialer.transports[0]
+	dialer.mu.Unlock()
+	_ = first.Close() // the server drops the socket
+	wait("the refused restore", func() bool {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		return server.refused
+	})
+	wait("every futures stream on the new socket", func() bool { return server.futures(1) == kisfutures.Registrations })
+	// And they stay registered.
+	time.Sleep(50 * time.Millisecond)
+	if got := server.futures(1); got != kisfutures.Registrations || dialer.count() != 2 {
+		t.Fatalf("registrations = %d on %d sockets", got, dialer.count())
 	}
 }

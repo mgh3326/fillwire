@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/ratebudget"
@@ -101,6 +102,8 @@ type Lane struct {
 	session Session
 	cancel  context.CancelFunc
 	workers sync.WaitGroup
+	// redialed is set by Reconnected and taken by the next reconcile pass.
+	redialed atomic.Bool
 
 	// Owned by the subscription loop (and by Close after it stopped).
 	date       time.Time
@@ -188,6 +191,11 @@ func (l *Lane) loop(ctx context.Context, step func(context.Context)) {
 	}
 }
 
+// Reconnected tells the lane that the client dialed again and restored its
+// subscriptions. The client drops a restoration the server refuses and reports
+// nothing, so the next pass registers every stream anew. It does not block.
+func (l *Lane) Reconnected() { l.redialed.Store(true) }
+
 // Handle takes one realtime frame. It is called on the fills reader's
 // goroutine and does no I/O.
 func (l *Lane) Handle(ev ws.Event) {
@@ -198,7 +206,7 @@ func (l *Lane) Handle(ev ws.Event) {
 	if received.IsZero() {
 		received = l.now()
 	}
-	trades, invalid, err := ParseFrame(ev.Raw, received)
+	trades, invalid, err := ParseEvent(ev, received)
 	if err != nil {
 		invalid = 1
 	}
@@ -245,6 +253,14 @@ func (l *Lane) Stats() Stats {
 // session's registrations to them. One pass runs at a time.
 func (l *Lane) reconcile(ctx context.Context) {
 	l.resolve(ctx)
+	if l.redialed.Swap(false) {
+		// What the new socket holds is unknown: nothing counts as confirmed
+		// and nothing waits for an earlier retry time.
+		for sub := range l.registered {
+			l.registered[sub] = false
+		}
+		clear(l.retryAt)
+	}
 	desired := make(map[subscription]bool, len(l.desired))
 	for _, sub := range l.desired {
 		desired[sub] = true
@@ -270,6 +286,15 @@ func (l *Lane) reconcile(ctx context.Context) {
 		}
 		if !held && len(l.registered) >= len(l.slots) {
 			continue // a removal still occupies the reserved registration
+		}
+		if held {
+			// The server may or may not hold it and refuses a repeat, so it
+			// is cleared first: the Subscribe is then a fresh registration.
+			if err := l.unsubscribe(ctx, sub); err != nil {
+				l.retryAt[sub] = l.now().Add(subscribeRetry)
+				l.warn("KIS 선물 구독 해제 실패", "tr", sub.tr, "code", sub.code, "reason", err.Error())
+				continue
+			}
 		}
 		l.subscribe(ctx, sub)
 	}
