@@ -91,6 +91,7 @@ type runtimeConfig struct {
 	refreshMargin  time.Duration
 	alertRateLimit time.Duration
 	quotes         quoteSettings
+	kisQuotes      kisQuoteSettings
 	recording      recordingSettings
 	upbit          upbitSettings
 	reconcile      reconcileSettings
@@ -156,6 +157,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if cfg.alertRateLimit, err = time.ParseDuration(cfg.Alerts.RateLimit); err != nil || cfg.alertRateLimit <= 0 {
 		return runtimeConfig{}, errors.New("config: invalid alerts rate_limit")
 	}
+	// The promoted KIS quote lane resolves before the credential checks: its
+	// REST recovery sends the app key and secret, so enabling it requires them.
+	cfg.kisQuotes = resolveKisQuoteSettings(contents)
 	var ok bool
 	if cfg.ingestToken, ok = os.LookupEnv(cfg.Ingest.TokenEnv); !ok || cfg.ingestToken == "" {
 		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.Ingest.TokenEnv)
@@ -200,7 +204,8 @@ func (cfg runtimeConfig) usesGatewayd() bool {
 // with books off neither credential is needed; configured names are then
 // optional and their values are never read.
 func (cfg runtimeConfig) kisCredentialsRequired() bool {
-	return cfg.KIS.ApprovalMode == "" || cfg.Books.Enabled
+	quotes := cfg.kisQuotes.enabled && cfg.kisQuotes.err == nil
+	return cfg.KIS.ApprovalMode == "" || cfg.Books.Enabled || quotes
 }
 
 func (cfg runtimeConfig) validateStatic() error {

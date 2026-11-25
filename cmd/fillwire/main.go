@@ -214,6 +214,14 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	if cfg.Books.Enabled {
 		bookSymbols = []string{cfg.Books.Symbol}
 	}
+	kisQuotes, stopKisQuotes := startKisQuotes(ctx, cfg, logger, bookSymbols)
+	defer stopKisQuotes()
+	var onSession func(context.Context, reader.Session)
+	var onQuote func(ws.Event)
+	if kisQuotes != nil {
+		onSession = func(sessionCtx context.Context, s reader.Session) { kisQuotes.Attach(sessionCtx, s) }
+		onQuote = kisQuotes.Handle
+	}
 
 	counters := decode.NewCounters()
 	decoder := decode.New(decode.Config{
@@ -294,6 +302,8 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			OnReconnected: onReconnected,
 			BookSymbols:   bookSymbols,
 			OnBook:        bookEvent,
+			OnSession:     onSession,
+			OnQuote:       onQuote,
 			Endpoint:      cfg.KIS.Endpoint,
 			HTSID:         cfg.KIS.HTSID,
 			Approval:      approvalSource,
@@ -335,6 +345,11 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 
 	quotes.halt()
 	quotesDeadline := time.Now().Add(quoteStopTimeout)
+
+	// The promoted lane removes its subscriptions while the connection is
+	// still open; the fills socket is closed next. Handle after this point is
+	// a no-op because the lane holds no symbols.
+	stopKisQuotes()
 
 	// Stop the socket first. The bounded events and records channels remain
 	// live until the separate drain context expires, so a received fill gets an

@@ -30,8 +30,9 @@ type Client struct {
 
 func (c *Client) Read(ctx context.Context, path, tr string, query map[string]string, out any) error {
 	quotation := path == "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn" && tr == "FHKST01010200"
+	ccnl := path == "/uapi/domestic-stock/v1/quotations/inquire-ccnl" && tr == "FHKST01010300"
 	history := c.Mock && path == "/uapi/domestic-stock/v1/trading/inquire-daily-ccld" && tr == "VTTC0081R"
-	if !quotation && !history {
+	if !quotation && !ccnl && !history {
 		return errors.New("kisread: read endpoint refused")
 	}
 	// Reserve at most one request per second from this mock read client,

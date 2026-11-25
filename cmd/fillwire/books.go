@@ -25,19 +25,25 @@ type bookSettings struct {
 	AccessTokenSource string `toml:"access_token_source"`
 }
 
-// booksToken resolves the per-call access token source. The env source reads
-// the named variable lazily, matching the historical behavior; the redis
-// source performs one GET of the token_keys.py cache key per call and treats
-// a missing, malformed, or near-expiry entry as absent.
+// booksToken resolves the per-call access token source for the book producer.
 func booksToken(ctx context.Context, cfg runtimeConfig, r redis.UniversalClient) (func() string, error) {
-	if strings.TrimSpace(cfg.Books.AccessTokenSource) != "redis" {
-		return func() string { return os.Getenv(cfg.Books.AccessTokenEnv) }, nil
+	return kisReadToken(ctx, cfg.KIS.Endpoint, cfg.appKey, cfg.Books.AccessTokenEnv, cfg.Books.AccessTokenSource, r)
+}
+
+// kisReadToken resolves the per-call access token source shared by the KIS
+// read-only lanes. The env source reads the named variable lazily, matching the
+// historical behavior; the redis source performs one GET of the token_keys.py
+// cache key per call and treats a missing, malformed, or near-expiry entry as
+// absent.
+func kisReadToken(ctx context.Context, endpoint, appKey, env, source string, r redis.UniversalClient) (func() string, error) {
+	if strings.TrimSpace(source) != "redis" {
+		return func() string { return os.Getenv(env) }, nil
 	}
 	host := kis.HostLive
-	if cfg.KIS.Endpoint == "mock" {
+	if endpoint == "mock" {
 		host = kis.HostVTS
 	}
-	key, err := kisread.AccessTokenKey(cfg.KIS.Endpoint == "mock", host, cfg.appKey)
+	key, err := kisread.AccessTokenKey(endpoint == "mock", host, appKey)
 	if err != nil {
 		return nil, errors.New("books: invalid KIS token cache key")
 	}

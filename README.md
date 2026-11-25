@@ -8,7 +8,7 @@ intents, with sending off by default.
 
 ## Scope
 
-PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`. The KIS websocket carries fills only. The optional [quote reader](#quote-reader-off-by-default) is a separate lane on the Toss Securities websocket; it is off unless configured.
+PR1 implements the KIS execution reader, validation and normalization, a bounded hot-path channel, Redis Streams durability, and the execution-ledger ingest sink. The only default KIS websocket subscription is the matched pair selected by configuration: live uses `EndpointLive` with `H0STCNI0`, and mock uses `EndpointVTS` with `H0STCNI9`. Two optional read-only lanes add subscriptions on that same session and never open a second connection: `[books]` adds one `H0STASP0` symbol, and `[kis_quotes]` adds promoted trade and book symbols. The optional [quote reader](#quote-reader-off-by-default) is a separate lane on the Toss Securities websocket; it is off unless configured.
 
 The pipeline is deliberately single-consumer at the sink:
 
@@ -572,6 +572,117 @@ Set `enabled = false`, or delete the `[quotes]` table, and restart fillwire.
 The mount can stay or go. Existing `quotes:toss` entries remain until trimmed
 by `MAXLEN` or deleted by the desk (`DEL quotes:toss`).
 
+## KIS promoted quote lane (off by default)
+
+The promoted quote lane registers the KIS realtime trade (`H0STCNT0`) and
+order-book (`H0STASP0`) streams for a configured list of promoted symbols and
+appends every tick to `quotes:kis:<symbol>`. It **shares the existing KIS
+websocket session** that carries `fills:kis`; it never dials a second
+connection, so the `OPSP8996` session-occupancy contract is unchanged. It
+places no orders and writes nothing to the execution ledger. It is off unless
+`[kis_quotes] enabled = true`.
+
+### Registration limit (KIS realtime subscriptions)
+
+Design 6321 §3.2 left the per-session registration limit unverified, and this
+change could not confirm a number from an official KIS source either: the KIS
+Developers portal (<https://apiportal.koreainvestment.com/docs>) requires a
+login, and the public sample repository
+(<https://github.com/koreainvestment/open-trading-api>) states no limit. The
+default is therefore the conservative widely reported value **41
+registrations per session**, marked **[unverified]**. Treat
+`registration_limit` as a ceiling this process must not exceed, not as a
+confirmed broker figure, until an official source states the number.
+
+The lane spends that ceiling through the shared subscription budget in
+`internal/ratebudget`:
+
+```text
+registration_limit 41  [unverified]
+  - 1  execution notices (H0STCNI0, fixed)
+  - 1  [books] H0STASP0, only when that lane is enabled (fixed)
+  - 2  safety margin (always reserved)
+  = 37 free registrations -> 18 promoted symbols (2 registrations each)
+```
+
+Fixed consumers reserve first and are never removed. A promoted symbol takes
+two registrations; when the free slots cannot take another symbol, the
+lowest-priority promoted symbol is removed first, and only after `min_hold`
+has elapsed since its own admission. With no eligible symbol the promotion is
+refused with `budget_cut` and nothing changes. The configured `symbols` order
+is the priority order: the first entry is admitted first and survives longest.
+
+### Feed-gap recovery
+
+When a held symbol produces no websocket frame for `feed_gap`, the lane reads
+the read-only REST quotations once per window and publishes the recovered
+tick with `source = rest`:
+
+- trades: `GET /uapi/domestic-stock/v1/quotations/inquire-ccnl`, transaction
+  `FHKST01010300`, market `J` (the official sample:
+  `examples_llm/domestic_stock/inquire_ccnl`).
+- books: the same `FHKST01010200` asking-price read the book lane uses.
+
+The exchange's own clock is kept; a REST response is not restamped as fresh.
+A failed read publishes nothing.
+
+### Configuration
+
+```toml
+[kis_quotes]
+enabled = true
+symbols = ["005930", "000660"]   # priority order, first = highest
+registration_limit = 41           # [unverified] ceiling, default 41
+min_hold = "15m"                  # default
+feed_gap = "30s"                  # default
+max_len = 100000                  # default, XADD MAXLEN ~ N
+buffer = 1024                     # default, at most 65536
+access_token_env = "KIS_MOCK_ACCESS_TOKEN"
+# or: access_token_source = "redis"
+```
+
+As with `[books]`, exactly one token source is required: `access_token_env`
+names an environment variable read on each REST recovery, or
+`access_token_source = "redis"` reads the token auto_trader publishes under
+the `token_keys.py` contract. The lane never issues a token. Both
+`app_key_env` and `app_secret_env` are then required, because the REST reads
+send them. `[kis_quotes]` is decoded strictly; a rejected table or a lane that
+cannot start logs one error and leaves the fills pipeline running. NXT and the
+combined-venue TRs are out of scope until their transaction IDs are confirmed.
+
+### Stream entries
+
+Each tick is one `XADD quotes:kis:<symbol> MAXLEN ~ <max_len> *` entry. Every
+entry carries this fixed field set; fields that do not apply are empty.
+
+| field | value |
+|---|---|
+| `symbol` | six-character KR issue code |
+| `kind` | `trade` or `book` |
+| `source` | `ws` or `rest` |
+| `feed` | transaction that carried it: `H0STCNT0`, `H0STASP0`, `FHKST01010300`, `FHKST01010200` |
+| `venue` | `KRX` |
+| `ts_exchange` | exchange clock, RFC 3339 with offset, nearest KST day (KIS sends HHMMSS only) |
+| `ts_received` | receive instant, RFC 3339 with offset |
+| `price`, `qty`, `acml_vol` | trade ticks only, exact decimal strings; `side` is `buy`, `sell`, `auction`, or empty on REST ticks |
+| `bid_price_1`…`bid_qty_5`, `ask_price_1`…`ask_qty_5` | book ticks only, best first, exact decimal strings |
+
+Under backpressure the lane drops ticks from its bounded queue and counts
+them; the fills path is never blocked by a quote write.
+
+### Verifying
+
+```sh
+redis-cli -u "$REDIS_URL" XLEN quotes:kis:005930
+redis-cli -u "$REDIS_URL" XREVRANGE quotes:kis:005930 + - COUNT 3
+# expected during a session: a growing length; the fixed fields above
+redis-cli -u "$REDIS_URL" XLEN fills:kis
+# fills keep flowing exactly as before
+```
+
+At shutdown the lane logs `KIS 승격 시세` counters (published, dropped, gap
+detections) and removes its subscriptions on the same connection.
+
 ## Book recorder and replay (`bookrec`)
 
 `internal/book` records KIS domestic order-book (`H0STASP0`) and trade
@@ -742,6 +853,10 @@ go test ./cmd/execmock ./internal/book -update
 ## Internal observations
 
 PR1 exposes a named in-process counter snapshot for validation drops, duplicate suspects, successful XADDs, successful XACKs, and failed ingest attempts. It deliberately has no Prometheus dependency or endpoint.
+
+## KIS 승격 종목 시세 (기본 비활성화)
+
+`[kis_quotes] enabled = true`로 켜면 승격 종목의 체결(`H0STCNT0`)·호가(`H0STASP0`)를 기존 KIS 웹소켓 세션에 등록하고 `quotes:kis:<symbol>` Redis Stream으로 출력합니다. 두 번째 세션을 열지 않으며 주문 경로가 없습니다. 세션당 실시간 등록 상한은 공식 문서(`https://apiportal.koreainvestment.com/docs`, 로그인 필요)와 공개 샘플 저장소에서 숫자를 확인하지 못해 보수값 41을 `[unverified]`로 두었습니다. 체결통보 1건과 `[books]` 1건, 안전 여유 2건을 먼저 예약하고 남는 등록만 승격 종목(종목당 2건)에 주며, 슬롯이 모자라면 `min_hold`(기본 15분)가 지난 가장 낮은 우선순위 종목을 먼저 해제합니다. 수신 공백이 `feed_gap`(기본 30초)을 넘으면 읽기 전용 REST 시세로 한 번 복구하며, 실패하면 아무것도 쓰지 않습니다.
 
 ## broker-edge now lives here
 

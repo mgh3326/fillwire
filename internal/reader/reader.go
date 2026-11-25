@@ -34,6 +34,15 @@ var ErrEventsClosed = errors.New("reader: KIS event stream closed unexpectedly")
 type Config struct {
 	BookSymbols []string       // optional read-only subscriptions on this same session
 	OnBook      func(ws.Event) // must not block the fills reader
+	// OnSession, if set, receives the live session and the reader's run
+	// context once the fills and book subscriptions are active. A promoted
+	// quote lane uses it to add and remove subscriptions on the same
+	// connection; the session stays valid across reconnects. It must not dial.
+	OnSession func(context.Context, Session)
+	// OnQuote receives H0STCNT0 frames and, when set, also the H0STASP0
+	// frames the fills reader already routes to OnBook. It must not block the
+	// fills reader.
+	OnQuote func(ws.Event)
 	// OnSubscribed runs once after the initial fills subscription is active.
 	// OnReconnected runs after each successful reconnect. Both run on the
 	// reader's own goroutines and must not block.
@@ -60,6 +69,13 @@ type session interface {
 	Events() <-chan ws.Event
 	Subscribe(context.Context, string, string) error
 	Close() error
+}
+
+// Session is the subscription view of the live connection handed to
+// Config.OnSession. It carries no dial or close path.
+type Session interface {
+	Subscribe(ctx context.Context, tr, key string) error
+	Unsubscribe(ctx context.Context, tr, key string) error
 }
 
 type dialFunc func(context.Context, ws.Config) (session, error)
@@ -199,6 +215,13 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 			r.cfg.Logger.Warn("KIS book subscription unavailable; mock REST fallback remains active")
 		}
 	}
+	if r.cfg.OnSession != nil {
+		// The promoted quote lane subscribes on this same connection. A fake
+		// session without Unsubscribe is left alone rather than failed.
+		if promoted, ok := conn.(Session); ok {
+			r.cfg.OnSession(ctx, promoted)
+		}
+	}
 	if r.cfg.Logger != nil {
 		r.cfg.Logger.Info("KIS websocket initial subscription active")
 	}
@@ -232,11 +255,20 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 				}
 				return reconnect.stoppedError()
 			}
-			if event.TR == "H0STASP0" {
+			switch event.TR {
+			case ws.TRQuoteBook:
 				if r.cfg.OnBook != nil {
 					r.cfg.OnBook(event)
 				}
+				if r.cfg.OnQuote != nil {
+					r.cfg.OnQuote(event)
+				}
 				continue
+			case ws.TRQuotePrice:
+				if r.cfg.OnQuote != nil {
+					r.cfg.OnQuote(event)
+					continue
+				}
 			}
 			select {
 			case out <- event:
