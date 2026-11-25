@@ -32,9 +32,12 @@ type tick struct {
 	price    int64
 	qty      int64
 	acmlVol  int64
-	side     string
-	bids     [5]book.Level
-	asks     [5]book.Level
+	// hasAcml is false for a REST trade read, which carries no cumulative
+	// volume; values() then emits an empty acml_vol rather than a false zero.
+	hasAcml bool
+	side    string
+	bids    [5]book.Level
+	asks    [5]book.Level
 }
 
 // values renders the fixed field set. Every field is present on every entry;
@@ -56,7 +59,7 @@ func (t tick) values() map[string]any {
 		"ts_received": t.received.Format(time.RFC3339Nano),
 		"price":       text(t.price, t.kind == "trade"),
 		"qty":         text(t.qty, t.kind == "trade"),
-		"acml_vol":    text(t.acmlVol, t.kind == "trade"),
+		"acml_vol":    text(t.acmlVol, t.kind == "trade" && t.hasAcml),
 		"side":        t.side,
 	}
 	for i := range 5 {
@@ -95,7 +98,7 @@ func ticksFromEvent(ev ws.Event, owned func(string) bool) ([]tick, error) {
 		}
 		out = append(out, tick{
 			symbol: record.Symbol, kind: "trade", source: "ws", feed: book.TRTrade,
-			exchange: exchange, received: received,
+			exchange: exchange, received: received, hasAcml: true,
 			price: record.Price, qty: record.Qty, acmlVol: record.AcmlVol, side: record.Side,
 		})
 	}

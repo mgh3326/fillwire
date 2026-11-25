@@ -53,6 +53,21 @@ func TestKisQuoteLaneDefaultOff(t *testing.T) {
 	}
 }
 
+func TestKisQuoteLaneRequiresNamedCredentials(t *testing.T) {
+	// cache-only approval, books off: the only reason the app key is needed is
+	// the enabled [kis_quotes] lane, and the static check must name the env
+	// variable instead of failing on an unnamed empty one.
+	t.Setenv("EXECUTION_LEDGER_INGEST_TOKEN", "fixture-ingest")
+	shipped := shippedConfig(t)
+	text := strings.Replace(shipped, `approval_mode = ""`, `approval_mode = "cache-only"`, 1)
+	text = strings.Replace(text, `app_key_env = "KIS_APP_KEY"`, `app_key_env = ""`, 1)
+	text = withKisQuotes(t, text, "[kis_quotes]\nenabled = true\nsymbols = [\"005930\"]\naccess_token_env = \"KIS_QUOTE_TOKEN\"\n")
+	_, err := loadConfig(writeTemp(t, "fillwire.toml", text))
+	if err == nil || !strings.Contains(err.Error(), "KIS app_key_env is required") {
+		t.Fatalf("loadConfig error = %v, want the named KIS app_key_env requirement", err)
+	}
+}
+
 func TestKisQuoteSettingsResolution(t *testing.T) {
 	setFillsEnv(t)
 	shipped := shippedConfig(t)

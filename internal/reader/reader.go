@@ -35,9 +35,10 @@ type Config struct {
 	BookSymbols []string       // optional read-only subscriptions on this same session
 	OnBook      func(ws.Event) // must not block the fills reader
 	// OnSession, if set, receives the live session and the reader's run
-	// context once the fills and book subscriptions are active. A promoted
-	// quote lane uses it to add and remove subscriptions on the same
-	// connection; the session stays valid across reconnects. It must not dial.
+	// context once the fills and book subscriptions are active. It runs on
+	// its own goroutine: a promoted quote lane adds and removes subscriptions
+	// on the same connection, and a slow server ACK must never keep this
+	// loop from draining fills. The session stays valid across reconnects.
 	OnSession func(context.Context, Session)
 	// OnQuote receives H0STCNT0 frames and, when set, also the H0STASP0
 	// frames the fills reader already routes to OnBook. It must not block the
@@ -216,10 +217,11 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 		}
 	}
 	if r.cfg.OnSession != nil {
-		// The promoted quote lane subscribes on this same connection. A fake
-		// session without Unsubscribe is left alone rather than failed.
+		// The promoted quote lane subscribes on this same connection. It runs
+		// beside the drain loop, not in front of it: Subscribe waits for the
+		// server ACK, and a lost ACK would otherwise stop fills from flowing.
 		if promoted, ok := conn.(Session); ok {
-			r.cfg.OnSession(ctx, promoted)
+			go r.cfg.OnSession(ctx, promoted)
 		}
 	}
 	if r.cfg.Logger != nil {

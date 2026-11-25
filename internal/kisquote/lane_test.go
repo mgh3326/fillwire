@@ -63,14 +63,33 @@ func frame(tr string, records ...string) []byte {
 }
 
 type fakeSession struct {
-	mu    sync.Mutex
-	subs  map[string]bool
-	trace []string
+	mu         sync.Mutex
+	subs       map[string]bool
+	trace      []string
+	failUnsub  bool
+	blockSub   chan struct{} // when non-nil, Subscribe waits for close or ctx end
+	subStarted chan struct{} // receives once when blockSub is set
 }
 
 func newFakeSession() *fakeSession { return &fakeSession{subs: map[string]bool{}} }
 
-func (f *fakeSession) Subscribe(_ context.Context, tr, key string) error {
+func (f *fakeSession) Subscribe(ctx context.Context, tr, key string) error {
+	f.mu.Lock()
+	block, started := f.blockSub, f.subStarted
+	f.mu.Unlock()
+	if block != nil {
+		if started != nil {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.subs[tr+"|"+key] = true
@@ -81,6 +100,9 @@ func (f *fakeSession) Subscribe(_ context.Context, tr, key string) error {
 func (f *fakeSession) Unsubscribe(_ context.Context, tr, key string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failUnsub {
+		return errors.New("fake session: unsubscribe failed")
+	}
 	delete(f.subs, tr+"|"+key)
 	f.trace = append(f.trace, "unsub "+tr+"|"+key)
 	return nil
@@ -218,18 +240,45 @@ func TestDemotionWaitsForMinHoldThenTakesTheLowestPriority(t *testing.T) {
 	}
 }
 
-func TestReservedSymbolIsNotSubscribedTwice(t *testing.T) {
+// A symbol whose book stream the fixed [books] lane already holds gains only
+// its trade registration, and still publishes both trade and book ticks.
+func TestReservedSymbolAddsOnlyItsTradeStream(t *testing.T) {
 	cfg := baseConfig(t)
 	cfg.Fixed = []string{"fills", "books"}
 	cfg.FixedSymbols = []string{"005930"}
+	now := at(0)
+	var mu sync.Mutex
+	cfg.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	lane := newLane(t, cfg)
 	session := newFakeSession()
 	lane.Attach(context.Background(), session)
 	if err := lane.Promote(context.Background(), "005930", 10); err != nil {
 		t.Fatalf("Promote reserved symbol: %v", err)
 	}
+	held := session.held()
+	if len(held) != 1 || !held["H0STCNT0|005930"] {
+		t.Fatalf("held = %v, want only the trade stream", held)
+	}
+	received := at(5000)
+	lane.Handle(ws.Event{TR: book.TRTrade, ReceivedAt: received,
+		Raw: frame(book.TRTrade, tradeRecord("005930", "090005", 71000, 10, 1000, "1"))})
+	// The book frame comes from the fixed [books] subscription and is still
+	// published for the promoted symbol.
+	lane.Handle(ws.Event{TR: book.TRBook, ReceivedAt: received,
+		Raw: frame(book.TRBook, bookRecord("005930", "090005", 71000, 70900, 12))})
+	rows := waitRows(t, cfg.Redis.(*redis.Client), StreamPrefix+"005930", 2)
+	if rows[0].Values["kind"] != "trade" || rows[1].Values["kind"] != "book" {
+		t.Fatalf("published rows = %v / %v", rows[0].Values, rows[1].Values)
+	}
+	mu.Lock()
+	now = at(int(16 * time.Minute / time.Millisecond))
+	mu.Unlock()
+	removed, err := lane.Demote(context.Background(), "005930")
+	if err != nil || !removed {
+		t.Fatalf("Demote = %v, %v", removed, err)
+	}
 	if held := session.held(); len(held) != 0 {
-		t.Fatalf("reserved symbol subscribed again: %v", held)
+		t.Fatalf("demote left a subscription behind: %v", held)
 	}
 }
 
@@ -341,6 +390,9 @@ func TestFeedGapRecoversFromREST(t *testing.T) {
 	if rows[0].Values["source"] != "rest" || rows[0].Values["feed"] != tradeRESTTR || rows[0].Values["price"] != "71000" {
 		t.Fatalf("REST trade tick = %v", rows[0].Values)
 	}
+	if rows[0].Values["acml_vol"] != "" {
+		t.Fatalf("REST trade tick claims a cumulative volume: %v", rows[0].Values)
+	}
 	if rows[1].Values["source"] != "rest" || rows[1].Values["kind"] != "book" || rows[1].Values["bid_price_1"] != "70900" {
 		t.Fatalf("REST book tick = %v", rows[1].Values)
 	}
@@ -354,6 +406,161 @@ func TestFeedGapRecoversFromREST(t *testing.T) {
 	}
 	if got := lane.Stats().Gaps; got != 1 {
 		t.Fatalf("gaps counter = %d, want 1", got)
+	}
+}
+
+// A slow Subscribe must not hold the state mutex: Handle (the fills reader
+// goroutine) keeps working while a promotion is in flight.
+func TestHandleRunsWhileSubscriptionIsBlocked(t *testing.T) {
+	cfg := baseConfig(t)
+	lane := newLane(t, cfg)
+	session := newFakeSession()
+	lane.Attach(context.Background(), session)
+	if err := lane.Promote(context.Background(), "005930", 10); err != nil {
+		t.Fatal(err)
+	}
+
+	block := make(chan struct{})
+	started := make(chan struct{}, 1)
+	session.mu.Lock()
+	session.blockSub, session.subStarted = block, started
+	session.mu.Unlock()
+	promoted := make(chan error, 1)
+	go func() { promoted <- lane.Promote(context.Background(), "000660", 10) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second promotion never reached Subscribe")
+	}
+
+	handled := make(chan struct{})
+	go func() {
+		lane.Handle(ws.Event{TR: book.TRTrade, ReceivedAt: at(5000),
+			Raw: frame(book.TRTrade, tradeRecord("005930", "090005", 71000, 10, 1000, "1"))})
+		close(handled)
+	}()
+	select {
+	case <-handled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handle blocked behind an in-flight Subscribe")
+	}
+	waitRows(t, cfg.Redis.(*redis.Client), StreamPrefix+"005930", 1)
+
+	close(block)
+	if err := <-promoted; err != nil {
+		t.Fatalf("blocked promotion: %v", err)
+	}
+}
+
+// A lost subscribe ACK is bounded by the lane's subscribe timeout, so Attach
+// cannot wait on the session for the life of the process.
+func TestAttachBoundsSubscribeWait(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.Symbols = []string{"005930"}
+	lane := newLane(t, cfg)
+	session := newFakeSession()
+	session.blockSub = make(chan struct{})
+	start := time.Now()
+	lane.Attach(context.Background(), session)
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("Attach took %s; Subscribe is not bounded", elapsed)
+	}
+	if held := session.held(); len(held) != 0 {
+		t.Fatalf("timed-out subscription was recorded: %v", held)
+	}
+	lane.mu.Lock()
+	states := len(lane.states)
+	lane.mu.Unlock()
+	if states != 0 {
+		t.Fatalf("timed-out symbol left %d states", states)
+	}
+}
+
+// A failed unsubscribe keeps the state and the slot: the server may still hold
+// the registration, so the lane must not admit a replacement over the limit.
+func TestFailedUnsubscribeKeepsTheSlot(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.RegistrationLimit = 4 // safety 2 + one symbol
+	cfg.Fixed = nil
+	now := at(0)
+	var mu sync.Mutex
+	cfg.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	lane := newLane(t, cfg)
+	session := newFakeSession()
+	lane.Attach(context.Background(), session)
+	if err := lane.Promote(context.Background(), "005930", 10); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	now = at(int(16 * time.Minute / time.Millisecond))
+	mu.Unlock()
+
+	session.mu.Lock()
+	session.failUnsub = true
+	session.mu.Unlock()
+	if removed, err := lane.Demote(context.Background(), "005930"); err == nil || removed {
+		t.Fatalf("Demote with failing unsubscribe = %v, %v; want false, error", removed, err)
+	}
+	lane.mu.Lock()
+	_, stillHeld := lane.states["005930"]
+	lane.mu.Unlock()
+	if !stillHeld {
+		t.Fatal("failed unsubscribe dropped the state")
+	}
+	// The slot is still counted, so a higher-priority promotion cannot exceed
+	// the limit while the server registration exists.
+	if err := lane.Promote(context.Background(), "000660", 20); err == nil {
+		t.Fatal("promotion succeeded over a still-registered symbol")
+	}
+	if held := session.held(); !held["H0STCNT0|005930"] {
+		t.Fatalf("session registration lost: %v", held)
+	}
+
+	session.mu.Lock()
+	session.failUnsub = false
+	session.mu.Unlock()
+	if removed, err := lane.Demote(context.Background(), "005930"); err != nil || !removed {
+		t.Fatalf("Demote after recovery = %v, %v", removed, err)
+	}
+}
+
+// hangingRedis blocks every XADD until its context ends. Only XAdd is used by
+// the lane, so the embedded nil interface is never called.
+type hangingRedis struct {
+	redis.Cmdable
+}
+
+func (h *hangingRedis) XAdd(ctx context.Context, _ *redis.XAddArgs) *redis.StringCmd {
+	<-ctx.Done()
+	cmd := redis.NewStringCmd(ctx)
+	cmd.SetErr(ctx.Err())
+	return cmd
+}
+
+// Close is bounded by the drain timeout even when Redis never answers.
+func TestCloseIsBoundedWhenRedisHangs(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.Redis = &hangingRedis{}
+	cfg.Buffer = 4
+	lane := newLane(t, cfg)
+	session := newFakeSession()
+	lane.Attach(context.Background(), session)
+	if err := lane.Promote(context.Background(), "005930", 10); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		lane.Handle(ws.Event{TR: book.TRTrade, ReceivedAt: at(5000),
+			Raw: frame(book.TRTrade, tradeRecord("005930", "090005", 71000, 10, 1000, "1"))})
+	}
+	closed := make(chan struct{})
+	go func() { lane.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(4 * time.Second):
+		t.Fatal("Close did not return; the drain is not bounded")
+	}
+	if got := lane.Stats().Dropped; got == 0 {
+		t.Fatal("unpublished ticks were not counted as dropped")
 	}
 }
 

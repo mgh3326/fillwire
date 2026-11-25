@@ -903,3 +903,51 @@ func TestPromotedQuoteSubscriptionsShareExecutionSession(t *testing.T) {
 		t.Fatalf("subscription frames = %d, want 3 on the one session", writes)
 	}
 }
+
+// OnSession waits for server ACKs; a blocked one must not stop fills. On the
+// previous head the hook ran in front of the drain loop, so no fill arrived
+// until it returned.
+func TestBlockedOnSessionDoesNotStallFills(t *testing.T) {
+	transport := newFakeTransport(func(tr *fakeTransport, raw []byte) {
+		successfulSubscribe(tr, raw)
+		if bytes.Contains(raw, []byte(ws.TRExecutionLive)) {
+			tr.push(kisExecutionFrame)
+		}
+	})
+	cfg := readerConfig(transport, &fakeApproval{})
+	release := make(chan struct{})
+	attached := make(chan struct{})
+	var attach atomic.Int32
+	cfg.OnSession = func(context.Context, fillreader.Session) {
+		attach.Add(1)
+		close(attached)
+		<-release
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	out := make(chan ws.Event, 1)
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, out) }()
+	defer func() {
+		close(release)
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case ev := <-out:
+		if ev.TR != ws.TRExecutionLive {
+			t.Fatalf("event TR = %q", ev.TR)
+		}
+	case <-ctx.Done():
+		t.Fatal("fills stopped while OnSession was blocked")
+	}
+	select {
+	case <-attached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnSession never started")
+	}
+	if attach.Load() != 1 {
+		t.Fatalf("OnSession calls = %d, want 1", attach.Load())
+	}
+}

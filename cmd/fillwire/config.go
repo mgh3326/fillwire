@@ -106,6 +106,10 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if err := toml.Unmarshal(contents, &cfg.fileConfig); err != nil {
 		return runtimeConfig{}, errors.New("config: invalid TOML")
 	}
+	// The promoted KIS quote lane resolves before validation and before the
+	// credential checks: its REST recovery sends the app key and secret, and
+	// validateStatic and the env lookup must read the same settings.
+	cfg.kisQuotes = resolveKisQuoteSettings(contents)
 	if err := validateGatewaydTableKeys(contents); err != nil {
 		return runtimeConfig{}, err
 	}
@@ -157,9 +161,6 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if cfg.alertRateLimit, err = time.ParseDuration(cfg.Alerts.RateLimit); err != nil || cfg.alertRateLimit <= 0 {
 		return runtimeConfig{}, errors.New("config: invalid alerts rate_limit")
 	}
-	// The promoted KIS quote lane resolves before the credential checks: its
-	// REST recovery sends the app key and secret, so enabling it requires them.
-	cfg.kisQuotes = resolveKisQuoteSettings(contents)
 	var ok bool
 	if cfg.ingestToken, ok = os.LookupEnv(cfg.Ingest.TokenEnv); !ok || cfg.ingestToken == "" {
 		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.Ingest.TokenEnv)

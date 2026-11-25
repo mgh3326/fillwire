@@ -3,11 +3,12 @@
 // to one Redis Stream per symbol, quotes:kis:<symbol>.
 //
 // The lane never dials a websocket. It adds and removes subscriptions on the
-// existing session, so a promoted symbol costs two registrations (H0STCNT0 and
-// H0STASP0) on that session and never a second session. Registration capacity
-// is the shared subscription budget in internal/ratebudget: the fixed lanes
-// (execution notices and the optional book producer) reserve their slots first,
-// a safety margin stays reserved, and promoted symbols take what is left.
+// existing session, so a promoted symbol costs at most two registrations
+// (H0STCNT0 and H0STASP0) on that session and never a second session. A symbol
+// whose book stream the fixed [books] lane already holds costs only the trade
+// registration. Registration capacity is the shared subscription budget in
+// internal/ratebudget: the fixed lanes reserve their slots first, a safety
+// margin stays reserved, and promoted symbols take what is left.
 //
 // A symbol keeps its slots for at least MinHold. When a higher-priority
 // promotion needs the last slots, the lowest-priority symbol whose hold has
@@ -17,6 +18,10 @@
 // A symbol that stops producing websocket frames for FeedGap falls back to the
 // read-only REST quotation endpoints and publishes the recovered tick with
 // source=rest, keeping the exchange's own clock.
+//
+// No network call runs under the state mutex: promotion and demotion are
+// serialized by a separate operation mutex, so Handle (called on the fills
+// reader goroutine) keeps running while a subscription is in flight.
 package kisquote
 
 import (
@@ -42,8 +47,8 @@ const (
 	// quotes:kis:005930.
 	StreamPrefix = "quotes:kis:"
 
-	// registrationsPerSymbol is the number of session registrations one
-	// promoted symbol costs: H0STCNT0 and H0STASP0.
+	// registrationsPerSymbol is the maximum number of session registrations
+	// one promoted symbol costs: H0STCNT0 and H0STASP0.
 	registrationsPerSymbol = 2
 
 	// safetyReserve is the margin kept free below the session's registration
@@ -54,6 +59,21 @@ const (
 	DefaultMaxLen = 100000
 	DefaultBuffer = 1024
 	maxBuffer     = 65536
+
+	// subscribeTimeout bounds one Subscribe or Unsubscribe round trip.
+	// ws.Conn waits for the server ACK without its own deadline, so the lane
+	// must supply one; otherwise a lost ACK would hold the promotion pass.
+	subscribeTimeout = 2 * time.Second
+
+	// drainTimeout bounds the shutdown flush of the publish queue.
+	drainTimeout = 2 * time.Second
+)
+
+var (
+	// ErrClosed is returned once the lane has been closed.
+	ErrClosed = errors.New("kisquote: lane closed")
+	// ErrNotAttached is returned by Promote before Attach has bound a session.
+	ErrNotAttached = errors.New("kisquote: lane not attached")
 )
 
 // Session is one KIS websocket connection. The lane only subscribes and
@@ -99,6 +119,10 @@ type state struct {
 	admitted time.Time
 	lastWS   time.Time
 	lastRest time.Time
+	// trs are the registrations this lane added for the symbol. A fixed
+	// [books] symbol carries only TRTrade here; its book stream belongs to
+	// that lane and is never removed by this one.
+	trs []string
 }
 
 // Lane is a started promoted-quote lane. The zero value is not usable.
@@ -108,6 +132,10 @@ type Lane struct {
 	slots           *ratebudget.Slots
 	capacity        int
 	reservedSymbols map[string]bool
+
+	// ops serializes promotion and demotion. It is never taken by Handle, so
+	// a slow subscription cannot stall the fills reader.
+	ops sync.Mutex
 
 	mu      sync.Mutex
 	session Session
@@ -193,9 +221,9 @@ func New(cfg Config) (*Lane, error) {
 }
 
 // Attach binds the lane to the live session and registers the configured
-// promoted symbols in priority order. Symbols that do not fit are reported and
-// left unregistered; the fills path is never failed. It is called once, from
-// the reader after the fills subscription is active.
+// promoted symbols in priority order. It runs off the fills reader goroutine
+// and returns after the pass; symbols that do not fit or cannot be registered
+// are reported and left unregistered. The fills path is never failed.
 func (l *Lane) Attach(ctx context.Context, session Session) {
 	if session == nil {
 		return
@@ -215,79 +243,108 @@ func (l *Lane) Attach(ctx context.Context, session Session) {
 	go func() { defer l.workers.Done(); l.gapLoop(runCtx) }()
 
 	for i, symbol := range symbols {
-		if err := l.Promote(ctx, symbol, len(symbols)-i); err != nil && l.cfg.Logger != nil {
+		if err := l.Promote(runCtx, symbol, len(symbols)-i); err != nil {
+			if l.cfg.Logger == nil {
+				continue
+			}
+			if errors.Is(err, ErrClosed) || ctx.Err() != nil {
+				return
+			}
 			l.cfg.Logger.Warn("KIS 승격 종목 등록 실패", "symbol", symbol, "reason", err.Error())
 		}
 	}
 }
 
-// Promote registers one symbol at priority (higher keeps its slots). When the
-// budget is full it removes the lowest-priority promoted symbol whose MinHold
-// has elapsed, and only if that symbol's priority is below priority. Otherwise
-// it returns a ratebudget budget_cut refusal and changes nothing.
+// Promote registers one symbol at priority (higher keeps its slots). A symbol
+// whose book stream the fixed lane already owns adds only its trade stream.
+// When the budget is full it removes the lowest-priority promoted symbol whose
+// MinHold has elapsed, and only if that symbol's priority is below priority.
+// Otherwise it returns a ratebudget budget_cut refusal and changes nothing.
 func (l *Lane) Promote(ctx context.Context, symbol string, priority int) error {
 	if !bookfeed.SymbolOK(symbol) {
 		return errors.New("kisquote: invalid promoted symbol")
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.promoteLocked(ctx, symbol, priority)
-}
+	l.ops.Lock()
+	defer l.ops.Unlock()
 
-func (l *Lane) promoteLocked(ctx context.Context, symbol string, priority int) error {
+	l.mu.Lock()
 	if l.closed {
-		return errors.New("kisquote: lane closed")
+		l.mu.Unlock()
+		return ErrClosed
 	}
-	if l.session == nil {
-		return errors.New("kisquote: lane not attached")
-	}
-	if l.reservedSymbols[symbol] {
-		return nil
+	session := l.session
+	if session == nil {
+		l.mu.Unlock()
+		return ErrNotAttached
 	}
 	if st, held := l.states[symbol]; held {
 		st.priority = priority
-		l.slots.Admit(tradeID(symbol), priority)
-		l.slots.Admit(bookID(symbol), priority)
+		for _, tr := range st.trs {
+			l.slots.Admit(slotID(tr, symbol), priority)
+		}
+		l.mu.Unlock()
 		return nil
 	}
-	if l.freeLocked() < registrationsPerSymbol {
-		victim := l.victimLocked(priority)
+	trs := []string{book.TRTrade}
+	if !l.reservedSymbols[symbol] {
+		trs = append(trs, book.TRBook)
+	}
+	victim := ""
+	if l.freeLocked() < len(trs) {
+		victim = l.victimLocked(priority)
 		if victim == "" {
+			l.mu.Unlock()
 			return &ratebudget.Refusal{Code: ratebudget.CodeBudgetCut}
 		}
-		if err := l.dropLocked(ctx, victim); err != nil {
+	}
+	l.mu.Unlock()
+
+	if victim != "" {
+		// The budget is only freed after the server confirms the removal, so
+		// a failed unsubscribe can never push the session over its limit.
+		if err := l.detach(ctx, session, victim); err != nil {
 			return err
 		}
 	}
-	if err := subscribeSymbol(ctx, l.session, symbol); err != nil {
+	if err := l.add(ctx, session, symbol, trs); err != nil {
 		return err
 	}
-	if _, err := l.slots.Admit(tradeID(symbol), priority); err != nil {
-		_ = unsubscribeSymbol(ctx, l.session, symbol)
-		return err
+
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		_ = l.remove(context.WithoutCancel(ctx), session, symbol, trs)
+		return ErrClosed
 	}
-	if _, err := l.slots.Admit(bookID(symbol), priority); err != nil {
-		l.slots.Release(tradeID(symbol))
-		_ = unsubscribeSymbol(ctx, l.session, symbol)
-		return err
+	now := l.now()
+	l.states[symbol] = &state{symbol: symbol, priority: priority, admitted: now, lastWS: now, lastRest: now, trs: trs}
+	for _, tr := range trs {
+		l.slots.Admit(slotID(tr, symbol), priority)
 	}
-	l.states[symbol] = &state{symbol: symbol, priority: priority, admitted: l.now(), lastWS: l.now()}
+	l.mu.Unlock()
 	return nil
 }
 
 // Demote removes one promoted symbol if its MinHold has elapsed. A reserved
-// symbol is never removed. It reports whether the symbol was removed.
+// symbol's fixed stream is never removed; only what this lane added is. It
+// reports whether the symbol was removed. A failed unsubscribe leaves the
+// symbol held and returns the error.
 func (l *Lane) Demote(ctx context.Context, symbol string) (bool, error) {
+	l.ops.Lock()
+	defer l.ops.Unlock()
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	st, held := l.states[symbol]
 	if !held || l.closed {
+		l.mu.Unlock()
 		return false, nil
 	}
 	if l.now().Sub(st.admitted) < l.cfg.MinHold {
+		l.mu.Unlock()
 		return false, nil
 	}
-	if err := l.dropLocked(ctx, symbol); err != nil {
+	session := l.session
+	l.mu.Unlock()
+	if err := l.detach(ctx, session, symbol); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -295,7 +352,7 @@ func (l *Lane) Demote(ctx context.Context, symbol string) (bool, error) {
 
 // Handle routes one realtime frame. It is called on the fills reader's
 // goroutine, so it never blocks: parsed ticks go to a bounded queue and are
-// dropped (counted) under backpressure.
+// dropped (counted) under backpressure. No network call runs under the mutex.
 func (l *Lane) Handle(ev ws.Event) {
 	owned := func(symbol string) bool {
 		l.mu.Lock()
@@ -309,14 +366,15 @@ func (l *Lane) Handle(ev ws.Event) {
 	}
 	for _, t := range ticks {
 		l.mu.Lock()
-		if st, held := l.states[t.symbol]; held {
+		st, held := l.states[t.symbol]
+		if held {
 			st.lastWS = t.received
-		} else {
-			l.mu.Unlock()
-			continue
 		}
 		closed := l.closed
 		l.mu.Unlock()
+		if !held {
+			continue
+		}
 		if closed {
 			return
 		}
@@ -335,8 +393,9 @@ func (l *Lane) Stats() Stats {
 	return Stats{Published: l.published.Load(), Dropped: l.dropped.Load(), Gaps: l.gaps.Load()}
 }
 
-// Close stops the loops, drains the queue, and removes every promoted
-// subscription from the session. The fills subscription is not touched.
+// Close stops the loops, flushes the queue for at most drainTimeout, and
+// removes every subscription this lane added. The fills subscription and the
+// fixed book stream are not touched.
 func (l *Lane) Close() {
 	l.mu.Lock()
 	if l.closed {
@@ -344,33 +403,45 @@ func (l *Lane) Close() {
 		return
 	}
 	l.closed = true
-	cancel, session := l.cancel, l.session
-	symbols := make([]string, 0, len(l.states))
-	for symbol := range l.states {
-		symbols = append(symbols, symbol)
-	}
-	l.states = make(map[string]*state)
+	cancel := l.cancel
 	l.mu.Unlock()
-
 	if cancel != nil {
 		cancel()
 	}
+
+	l.ops.Lock()
+	defer l.ops.Unlock()
 	l.workers.Wait()
 	if l.cfg.Logger != nil {
 		stats := l.Stats()
 		l.cfg.Logger.Info("KIS 승격 시세 종료", "published", stats.Published, "dropped", stats.Dropped, "gaps", stats.Gaps)
 	}
+
+	l.mu.Lock()
+	type removal struct {
+		symbol string
+		trs    []string
+	}
+	removals := make([]removal, 0, len(l.states))
+	for symbol, st := range l.states {
+		removals = append(removals, removal{symbol, append([]string(nil), st.trs...)})
+		for _, tr := range st.trs {
+			l.slots.Release(slotID(tr, symbol))
+		}
+	}
+	l.states = make(map[string]*state)
+	session := l.session
+	l.mu.Unlock()
+
 	if session == nil {
 		return
 	}
-	ctx, stop := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, stop := context.WithTimeout(context.Background(), subscribeTimeout)
 	defer stop()
-	for _, symbol := range symbols {
-		_ = unsubscribeSymbol(ctx, session, symbol)
-	}
-	for _, symbol := range symbols {
-		l.slots.Release(tradeID(symbol))
-		l.slots.Release(bookID(symbol))
+	for _, r := range removals {
+		if err := l.remove(ctx, session, r.symbol, r.trs); err != nil && l.cfg.Logger != nil {
+			l.cfg.Logger.Warn("KIS 승격 종목 해제 실패", "symbol", r.symbol, "reason", err.Error())
+		}
 	}
 }
 
@@ -398,43 +469,123 @@ func (l *Lane) victimLocked(belowPriority int) string {
 	return victim
 }
 
-func (l *Lane) dropLocked(ctx context.Context, symbol string) error {
-	if _, held := l.states[symbol]; !held {
+// detach removes the symbol from the live session first and from the budget
+// only after the server confirms it, so the real registration count never
+// exceeds the configured limit.
+func (l *Lane) detach(ctx context.Context, session Session, symbol string) error {
+	l.mu.Lock()
+	st, held := l.states[symbol]
+	if !held {
+		l.mu.Unlock()
 		return nil
 	}
-	delete(l.states, symbol)
-	l.slots.Release(tradeID(symbol))
-	l.slots.Release(bookID(symbol))
-	if err := unsubscribeSymbol(ctx, l.session, symbol); err != nil && l.cfg.Logger != nil {
-		l.cfg.Logger.Warn("KIS 승격 종목 해제 실패", "symbol", symbol, "reason", err.Error())
+	trs := append([]string(nil), st.trs...)
+	l.mu.Unlock()
+
+	if err := l.remove(ctx, session, symbol, trs); err != nil {
+		return fmt.Errorf("kisquote: unsubscribe %s: %w", symbol, err)
+	}
+
+	l.mu.Lock()
+	if _, held := l.states[symbol]; held {
+		delete(l.states, symbol)
+		for _, tr := range trs {
+			l.slots.Release(slotID(tr, symbol))
+		}
+	}
+	l.mu.Unlock()
+	return nil
+}
+
+// add subscribes trs in order, removing the ones already added when a later
+// one fails. Each call carries its own deadline.
+func (l *Lane) add(ctx context.Context, session Session, symbol string, trs []string) error {
+	for i, tr := range trs {
+		callCtx, cancel := context.WithTimeout(ctx, subscribeTimeout)
+		err := session.Subscribe(callCtx, tr, symbol)
+		cancel()
+		if err != nil {
+			_ = l.remove(context.WithoutCancel(ctx), session, symbol, trs[:i])
+			return fmt.Errorf("kisquote: subscribe %s: %w", tr, err)
+		}
 	}
 	return nil
+}
+
+// remove unsubscribes trs, reporting the first failure.
+func (l *Lane) remove(ctx context.Context, session Session, symbol string, trs []string) error {
+	var first error
+	for _, tr := range trs {
+		callCtx, cancel := context.WithTimeout(ctx, subscribeTimeout)
+		err := session.Unsubscribe(callCtx, tr, symbol)
+		cancel()
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 func (l *Lane) publishLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain what is already queued, then stop. The queue is never
-			// closed, so a late Handle send cannot panic.
-			for {
-				select {
-				case t := <-l.queue:
-					l.publishOne(ctx, t)
-				default:
-					return
-				}
-			}
+			l.drain()
+			return
 		case t := <-l.queue:
 			l.publishOne(ctx, t)
 		}
 	}
 }
 
+// drain flushes the queue for at most drainTimeout, then drops and counts the
+// remainder. It is bounded by time, not by queue length times a Redis timeout.
+func (l *Lane) drain() {
+	deadline := time.Now().Add(drainTimeout)
+	for {
+		select {
+		case t := <-l.queue:
+			if !time.Now().Before(deadline) {
+				l.dropRemaining()
+				return
+			}
+			drainCtx, cancel := context.WithDeadline(context.Background(), deadline)
+			err := l.publish(drainCtx, t)
+			cancel()
+			if err != nil {
+				l.dropped.Add(1)
+				continue
+			}
+			l.published.Add(1)
+		default:
+			return
+		}
+	}
+}
+
+// dropRemaining counts the ticks still queued after the drain deadline.
+func (l *Lane) dropRemaining() {
+	remaining := uint64(0)
+drain:
+	for {
+		select {
+		case <-l.queue:
+			remaining++
+		default:
+			break drain
+		}
+	}
+	if remaining == 0 {
+		return
+	}
+	l.dropped.Add(remaining)
+	if l.cfg.Logger != nil {
+		l.cfg.Logger.Warn("KIS 승격 시세 종료 드레인 초과, 남은 틱을 버립니다", "dropped", remaining)
+	}
+}
+
 func (l *Lane) publishOne(ctx context.Context, t tick) {
-	// The shutdown drain still writes: the queue is bounded, so this is a
-	// short, finite flush rather than an unbounded wait.
-	if err := l.publish(context.WithoutCancel(ctx), t); err != nil {
+	if err := l.publish(ctx, t); err != nil {
 		if l.cfg.Logger != nil {
 			l.cfg.Logger.Warn("KIS 승격 시세 발행 실패", "symbol", t.symbol, "reason", err.Error())
 		}
@@ -447,9 +598,8 @@ func (l *Lane) publish(ctx context.Context, t tick) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	stream := StreamPrefix + t.symbol
 	return l.cfg.Redis.XAdd(ctx, &redis.XAddArgs{
-		Stream: stream,
+		Stream: StreamPrefix + t.symbol,
 		MaxLen: l.cfg.MaxLen,
 		Approx: true,
 		Values: t.values(),
@@ -487,8 +637,8 @@ func (l *Lane) recoverGaps(ctx context.Context) {
 	for symbol := range l.states {
 		symbols = append(symbols, symbol)
 	}
-	sort.Strings(symbols)
 	l.mu.Unlock()
+	sort.Strings(symbols)
 	for _, symbol := range symbols {
 		if ctx.Err() != nil {
 			return
@@ -529,25 +679,4 @@ func (l *Lane) send(ctx context.Context, t tick) {
 	}
 }
 
-func tradeID(symbol string) string { return book.TRTrade + "|" + symbol }
-func bookID(symbol string) string  { return book.TRBook + "|" + symbol }
-
-func subscribeSymbol(ctx context.Context, session Session, symbol string) error {
-	if err := session.Subscribe(ctx, book.TRTrade, symbol); err != nil {
-		return fmt.Errorf("kisquote: subscribe %s: %w", book.TRTrade, err)
-	}
-	if err := session.Subscribe(ctx, book.TRBook, symbol); err != nil {
-		_ = session.Unsubscribe(ctx, book.TRTrade, symbol)
-		return fmt.Errorf("kisquote: subscribe %s: %w", book.TRBook, err)
-	}
-	return nil
-}
-
-func unsubscribeSymbol(ctx context.Context, session Session, symbol string) error {
-	tradeErr := session.Unsubscribe(ctx, book.TRTrade, symbol)
-	bookErr := session.Unsubscribe(ctx, book.TRBook, symbol)
-	if tradeErr != nil {
-		return tradeErr
-	}
-	return bookErr
-}
+func slotID(tr, symbol string) string { return tr + "|" + symbol }

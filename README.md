@@ -606,11 +606,16 @@ registration_limit 41  [unverified]
 ```
 
 Fixed consumers reserve first and are never removed. A promoted symbol takes
-two registrations; when the free slots cannot take another symbol, the
+two registrations, except a symbol whose book stream `[books]` already holds:
+for that symbol the lane adds only its trade stream and still publishes both
+trade and book ticks to `quotes:kis:<symbol>` (the book frame arrives through
+the fixed subscription). When the free slots cannot take another symbol, the
 lowest-priority promoted symbol is removed first, and only after `min_hold`
 has elapsed since its own admission. With no eligible symbol the promotion is
-refused with `budget_cut` and nothing changes. The configured `symbols` order
-is the priority order: the first entry is admitted first and survives longest.
+refused with `budget_cut` and nothing changes. A failed unsubscribe keeps the
+symbol and its slot, so the lane never counts a server registration it no
+longer holds as free. The configured `symbols` order is the priority order:
+the first entry is admitted first and survives longest.
 
 ### Feed-gap recovery
 
@@ -664,7 +669,7 @@ entry carries this fixed field set; fields that do not apply are empty.
 | `venue` | `KRX` |
 | `ts_exchange` | exchange clock, RFC 3339 with offset, nearest KST day (KIS sends HHMMSS only) |
 | `ts_received` | receive instant, RFC 3339 with offset |
-| `price`, `qty`, `acml_vol` | trade ticks only, exact decimal strings; `side` is `buy`, `sell`, `auction`, or empty on REST ticks |
+| `price`, `qty`, `acml_vol` | trade ticks only, exact decimal strings; `acml_vol` is empty on a REST-recovered trade because that read carries no cumulative volume; `side` is `buy`, `sell`, `auction`, or empty on REST ticks |
 | `bid_price_1`…`bid_qty_5`, `ask_price_1`…`ask_qty_5` | book ticks only, best first, exact decimal strings |
 
 Under backpressure the lane drops ticks from its bounded queue and counts
