@@ -91,6 +91,7 @@ type runtimeConfig struct {
 	refreshMargin  time.Duration
 	alertRateLimit time.Duration
 	quotes         quoteSettings
+	kisQuotes      kisQuoteSettings
 	recording      recordingSettings
 	upbit          upbitSettings
 	reconcile      reconcileSettings
@@ -105,6 +106,10 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if err := toml.Unmarshal(contents, &cfg.fileConfig); err != nil {
 		return runtimeConfig{}, errors.New("config: invalid TOML")
 	}
+	// The promoted KIS quote lane resolves before validation and before the
+	// credential checks: its REST recovery sends the app key and secret, and
+	// validateStatic and the env lookup must read the same settings.
+	cfg.kisQuotes = resolveKisQuoteSettings(contents)
 	if err := validateGatewaydTableKeys(contents); err != nil {
 		return runtimeConfig{}, err
 	}
@@ -200,7 +205,8 @@ func (cfg runtimeConfig) usesGatewayd() bool {
 // with books off neither credential is needed; configured names are then
 // optional and their values are never read.
 func (cfg runtimeConfig) kisCredentialsRequired() bool {
-	return cfg.KIS.ApprovalMode == "" || cfg.Books.Enabled
+	quotes := cfg.kisQuotes.enabled && cfg.kisQuotes.err == nil
+	return cfg.KIS.ApprovalMode == "" || cfg.Books.Enabled || quotes
 }
 
 func (cfg runtimeConfig) validateStatic() error {

@@ -832,3 +832,122 @@ func TestBookSubscriptionSharesExecutionSession(t *testing.T) {
 		t.Fatalf("dials %d subscriptions %d", dials.Load(), transport.writes.Load())
 	}
 }
+
+// A promoted quote lane adds its subscriptions on the fills connection: one
+// dial, and fills keep flowing to out while H0STCNT0 frames go to OnQuote.
+func TestPromotedQuoteSubscriptionsShareExecutionSession(t *testing.T) {
+	const tradeFrame = "0|H0STCNT0|001|005930^090005^71000^0^0^0^0^0^0^0^0^0^10^10^0^0^0^0^0^0^0^1^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0^0\n"
+	transport := newFakeTransport(func(tr *fakeTransport, raw []byte) {
+		successfulSubscribe(tr, raw)
+		if bytes.Contains(raw, []byte("H0STASP0")) {
+			tr.push(tradeFrame)
+			tr.push(kisExecutionFrame)
+		}
+	})
+	var dials atomic.Int32
+	cfg := readerConfig(transport, &fakeApproval{})
+	cfg.Dialer = ws.DialerFunc(func(context.Context, string) (ws.Transport, error) {
+		dials.Add(1)
+		return transport, nil
+	})
+	var attach atomic.Int32
+	cfg.OnSession = func(ctx context.Context, s fillreader.Session) {
+		attach.Add(1)
+		if err := s.Subscribe(ctx, ws.TRQuotePrice, "005930"); err != nil {
+			t.Errorf("promoted trade subscribe: %v", err)
+		}
+		if err := s.Subscribe(ctx, ws.TRQuoteBook, "005930"); err != nil {
+			t.Errorf("promoted book subscribe: %v", err)
+		}
+		// The promoted book frame arrives before the fills frame above.
+		transport.push(tradeFrame)
+	}
+	quotes := make(chan ws.Event, 2)
+	cfg.OnQuote = func(ev ws.Event) { quotes <- ev }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out := make(chan ws.Event, 2)
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, out) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case ev := <-quotes:
+		if ev.TR != ws.TRQuotePrice {
+			t.Fatalf("promoted event TR = %q", ev.TR)
+		}
+	case <-ctx.Done():
+		t.Fatal("promoted tick not routed")
+	}
+	select {
+	case ev := <-out:
+		if ev.TR != ws.TRExecutionLive {
+			t.Fatalf("fills path received %q", ev.TR)
+		}
+	case <-ctx.Done():
+		t.Fatal("fills stopped flowing")
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want exactly one connection", dials.Load())
+	}
+	if attach.Load() != 1 {
+		t.Fatalf("OnSession calls = %d, want 1", attach.Load())
+	}
+	// fills 1 + promoted trade 1 + promoted book 1.
+	if writes := transport.writes.Load(); writes != 3 {
+		t.Fatalf("subscription frames = %d, want 3 on the one session", writes)
+	}
+}
+
+// OnSession waits for server ACKs; a blocked one must not stop fills. On the
+// previous head the hook ran in front of the drain loop, so no fill arrived
+// until it returned.
+func TestBlockedOnSessionDoesNotStallFills(t *testing.T) {
+	transport := newFakeTransport(func(tr *fakeTransport, raw []byte) {
+		successfulSubscribe(tr, raw)
+		if bytes.Contains(raw, []byte(ws.TRExecutionLive)) {
+			tr.push(kisExecutionFrame)
+		}
+	})
+	cfg := readerConfig(transport, &fakeApproval{})
+	release := make(chan struct{})
+	attached := make(chan struct{})
+	var attach atomic.Int32
+	cfg.OnSession = func(context.Context, fillreader.Session) {
+		attach.Add(1)
+		close(attached)
+		<-release
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	out := make(chan ws.Event, 1)
+	done := make(chan error, 1)
+	go func() { done <- fillreader.New(cfg).Run(ctx, out) }()
+	defer func() {
+		close(release)
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case ev := <-out:
+		if ev.TR != ws.TRExecutionLive {
+			t.Fatalf("event TR = %q", ev.TR)
+		}
+	case <-ctx.Done():
+		t.Fatal("fills stopped while OnSession was blocked")
+	}
+	select {
+	case <-attached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnSession never started")
+	}
+	if attach.Load() != 1 {
+		t.Fatalf("OnSession calls = %d, want 1", attach.Load())
+	}
+}
