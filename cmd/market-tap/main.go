@@ -278,6 +278,9 @@ func newSink(opts *options) (marketminute.Sink, func() error, func(), error) {
 		sinks = append(sinks, jsonl)
 	}
 	if opts.redisURL != "" {
+		if err := netpolicy.ValidateRedisURL(opts.redisURL); err != nil {
+			return nil, nil, nil, err
+		}
 		parsed, err := redis.ParseURL(opts.redisURL)
 		if err != nil {
 			if file != nil {
@@ -322,6 +325,9 @@ func newTokenSource(opts *options) (marketminute.TokenSource, func(context.Conte
 		}
 		if url == "" {
 			return nil, nil, noop, errors.New("redis token source needs -token-redis (or -redis)")
+		}
+		if err := netpolicy.ValidateRedisURL(url); err != nil {
+			return nil, nil, noop, err
 		}
 		parsed, err := redis.ParseURL(url)
 		if err != nil {

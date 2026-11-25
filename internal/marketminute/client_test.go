@@ -172,3 +172,30 @@ func TestFetchRefusesAnUnknownVenueBeforeTheNetwork(t *testing.T) {
 		t.Fatal("an unknown venue was accepted")
 	}
 }
+
+type recordingTransport struct {
+	called bool
+}
+
+func (t *recordingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.called = true
+	return nil, errors.New("transport must not run")
+}
+
+func TestFetchRefusesACredentialHostBeforeTheTransport(t *testing.T) {
+	transport := &recordingTransport{}
+	client := &marketminute.Client{
+		Token:     fixedToken("fixture-token"),
+		AppKey:    "fixture-app-key",
+		AppSecret: "fixture-app-secret",
+		Host:      "http://kis.example.invalid:9443",
+		HTTP:      &http.Client{Transport: transport},
+	}
+	result := client.Fetch(context.Background(), marketminute.Target{Market: "kr", Symbol: "005930", Venue: "KRX"})
+	if !errors.Is(result.Err, marketminute.ErrCredentialHost) {
+		t.Fatalf("err = %v, want ErrCredentialHost", result.Err)
+	}
+	if transport.called {
+		t.Fatal("the KIS credentials were sent to a non-TLS, non-loopback host")
+	}
+}

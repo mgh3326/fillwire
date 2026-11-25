@@ -50,6 +50,9 @@ func TestEnabledRefusesMissingConfiguration(t *testing.T) {
 	if code != ExitConfiguration {
 		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitConfiguration, stderr.String())
 	}
+	if !strings.Contains(stderr.String(), "app key and secret") {
+		t.Fatalf("stderr = %q, want the credential refusal (the token source must accept -token-redis)", stderr.String())
+	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatal("a refused configuration created the output file")
 	}
@@ -72,6 +75,9 @@ func TestRefusesRemotePlaintextRedis(t *testing.T) {
 	}, &stdout, &stderr)
 	if code != ExitConfiguration {
 		t.Fatalf("exit = %d, want %d (stderr %q)", code, ExitConfiguration, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "not permitted") {
+		t.Fatalf("stderr = %q, want the Redis scheme refusal", stderr.String())
 	}
 }
 
