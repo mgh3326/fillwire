@@ -82,6 +82,8 @@ func TestKisFuturesIngestRefusedAtConfigLoad(t *testing.T) {
 		"lane on":       "[kis_futures]\nenabled = true\ningest = true\ncalendar_file = \"c.json\"\n",
 		"lane omitted":  "[kis_futures]\ningest = true\n",
 		"not a boolean": "[kis_futures]\ningest = \"false\"\n",
+		// The TOML decoder matches struct keys without regard to case.
+		"other case": "[kis_futures]\nenabled = true\nIngest = true\ncalendar_file = \"c.json\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := loadConfig(writeTemp(t, "fillwire.toml", withKisFutures(t, shipped, body)))

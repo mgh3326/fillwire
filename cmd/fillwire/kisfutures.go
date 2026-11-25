@@ -59,8 +59,11 @@ func resolveKisFuturesSettings(contents []byte) (kisFuturesSettings, error) {
 	if !ok {
 		return reject("[kis_futures] is not a table")
 	}
-	if ingest, set := table["ingest"]; set && ingest != false {
-		return kisFuturesSettings{}, errKisFuturesIngest
+	// Any spelling of the key counts: the decoder below would accept it.
+	for key, value := range table {
+		if strings.EqualFold(key, "ingest") && value != false {
+			return kisFuturesSettings{}, errKisFuturesIngest
+		}
 	}
 	switch enabled := table["enabled"].(type) {
 	case nil:
