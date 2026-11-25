@@ -2,6 +2,7 @@ package ratebudget_test
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -31,28 +32,24 @@ func TestBucketsNeedBothTokens(t *testing.T) {
 	mustAcquire(t, l, k)
 }
 
-func TestGlobalBucketRefusesAndRefundsEndpoint(t *testing.T) {
+func TestProviderWaitDominatesRetryAfter(t *testing.T) {
 	clock := newTestClock()
-	// The provider bucket has one token; the endpoint has room but refills
-	// slowly, so a double charge would still be visible a second later.
+	// The provider needs a whole second for its next token; the endpoint only
+	// half of one. Retrying after the endpoint's wait would fail again.
 	l := newLimiter(t, clock, 1, ratebudget.Limit{Rate: 1, Burst: 1},
-		ratebudget.Endpoint{Name: testQuote, Limit: ratebudget.Limit{Rate: 0.5, Burst: 2}})
+		ratebudget.Endpoint{Name: testQuote, Limit: ratebudget.Limit{Rate: 2, Burst: 1}})
 	k := quoteKey()
 
 	mustAcquire(t, l, k)
 
-	// The endpoint token is taken, then the provider bucket refuses; the
-	// endpoint token must come back.
 	clock.advance(10 * time.Millisecond)
 	r := mustRefuse(t, l.Acquire(k), ratebudget.CodeRateLimited)
 	if !near(r.RetryAfter, 990*time.Millisecond, 2*time.Millisecond) {
-		t.Fatalf("provider wait = %s, want 990ms", r.RetryAfter)
+		t.Fatalf("refusal wait = %s, want the provider's 990ms", r.RetryAfter)
 	}
 
-	// Without the refund the endpoint keeps only the 0.5 token it refilled
-	// since the failed attempt and refuses; with it, 1.5 tokens remain and
-	// this request passes.
-	clock.advance(1010 * time.Millisecond)
+	// A refusal spends neither token, so the provider's next token is enough.
+	clock.advance(990 * time.Millisecond)
 	mustAcquire(t, l, k)
 }
 
@@ -179,6 +176,7 @@ func TestConfigRejectsInvalidInput(t *testing.T) {
 		"negative window":   {Providers: []ratebudget.Provider{validProvider}, ResearchShare: 1, Circuit: ratebudget.Circuit{OpenFor: -time.Second}},
 		"base above max":    {Providers: []ratebudget.Provider{validProvider}, ResearchShare: 1, Backoff: ratebudget.Backoff{Base: 2 * time.Second, Max: time.Second}},
 		"jitter above one":  {Providers: []ratebudget.Provider{validProvider}, ResearchShare: 1, Backoff: ratebudget.Backoff{Jitter: 1.5}},
+		"jitter NaN":        {Providers: []ratebudget.Provider{validProvider}, ResearchShare: 1, Backoff: ratebudget.Backoff{Jitter: math.NaN()}},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {

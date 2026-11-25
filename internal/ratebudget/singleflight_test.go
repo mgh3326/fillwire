@@ -2,6 +2,7 @@ package ratebudget_test
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -96,6 +97,23 @@ func TestGroupRunsAgainAfterCompletion(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("fn ran %d times, want 2", calls.Load())
+	}
+}
+
+func TestGroupCleansUpAfterGoexit(t *testing.T) {
+	var g ratebudget.Group
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		g.Do("k", func() (any, error) {
+			runtime.Goexit()
+			return nil, nil
+		})
+	}()
+	<-exited
+	v, err := g.Do("k", func() (any, error) { return 11, nil })
+	if err != nil || v != 11 {
+		t.Fatalf("after Goexit: %v, %v; want 11, nil", v, err)
 	}
 }
 

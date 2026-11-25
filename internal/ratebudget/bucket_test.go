@@ -21,17 +21,31 @@ func TestBucketTakeRefillAndRefund(t *testing.T) {
 	if want := 500 * time.Millisecond; wait != want {
 		t.Fatalf("wait = %s, want %s", wait, want)
 	}
-	b.refund()
-	if ok, _ := b.take(now); !ok {
-		t.Fatal("refund did not give the token back")
-	}
-
 	// A fractional deficit is rounded up so a retry at the reported time
 	// cannot find the bucket still empty.
 	b = newBucket(Limit{Rate: 3, Burst: 1}, now)
 	b.take(now)
 	if ok, wait := b.take(now); ok || wait != 333333334*time.Nanosecond {
 		t.Fatalf("fractional wait = %s (ok=%v), want 333333334ns", wait, ok)
+	}
+}
+
+func TestBucketReadyDoesNotSpend(t *testing.T) {
+	now := time.Unix(0, 0)
+	b := newBucket(Limit{Rate: 2, Burst: 1}, now)
+	if wait := b.ready(now); wait != 0 {
+		t.Fatalf("full bucket ready = %s, want 0", wait)
+	}
+	if wait := b.ready(now); wait != 0 {
+		t.Fatalf("second ready = %s, want 0 (ready must not spend)", wait)
+	}
+	b.take(now)
+	want := 500 * time.Millisecond
+	if wait := b.ready(now); wait != want {
+		t.Fatalf("empty bucket ready = %s, want %s", wait, want)
+	}
+	if wait := b.ready(now); wait != want {
+		t.Fatalf("repeated ready = %s, want %s (ready must not spend)", wait, want)
 	}
 }
 

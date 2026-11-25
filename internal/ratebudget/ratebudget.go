@@ -117,7 +117,8 @@ type Circuit struct {
 }
 
 // Backoff configures retry delays. Zero values take the defaults 1s base, 30s
-// cap and ±20% jitter.
+// cap and ±20% jitter. A deterministic delay uses Config.Jitter, because a zero
+// Backoff.Jitter means the default jitter, not none.
 type Backoff struct {
 	Base   time.Duration
 	Max    time.Duration
@@ -198,13 +199,16 @@ func New(cfg Config) (*Limiter, error) {
 	if backoff.Max == 0 {
 		backoff.Max = 30 * time.Second
 	}
+	if backoff.Jitter == 0 {
+		backoff.Jitter = 0.2
+	}
 	if backoff.Base < 0 || backoff.Max < 0 {
 		return nil, configf("backoff base %s and max %s must not be negative", backoff.Base, backoff.Max)
 	}
 	if backoff.Base > backoff.Max {
 		return nil, configf("backoff base %s exceeds max %s", backoff.Base, backoff.Max)
 	}
-	if backoff.Jitter < 0 || backoff.Jitter > 1 {
+	if math.IsNaN(backoff.Jitter) || backoff.Jitter < 0 || backoff.Jitter > 1 {
 		return nil, configf("backoff jitter %v must be in [0,1]", backoff.Jitter)
 	}
 
@@ -296,8 +300,9 @@ func (l *Limiter) lookup(k Key) (*endpointState, *providerState, error) {
 }
 
 // Acquire takes one request slot for k. It returns nil when the request may
-// run, or a *Refusal with one of the closed codes. On refusal the buckets keep
-// the tokens they had before the call.
+// run, or a *Refusal with one of the closed codes. A refusal spends no token:
+// both buckets must be ready before either is spent, and the refusal's
+// RetryAfter is the longer of the two waits.
 func (l *Limiter) Acquire(k Key) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -316,15 +321,14 @@ func (l *Limiter) Acquire(k Key) error {
 			return &Refusal{Code: CodeCircuitOpen, RetryAfter: wait}
 		}
 	}
-	if ok, wait := ep.bucket.take(now); !ok {
+	endpointWait := ep.bucket.ready(now)
+	providerWait := ps.global.ready(now)
+	if wait := max(endpointWait, providerWait); wait > 0 {
 		ep.breaker.abandonProbe()
 		return &Refusal{Code: CodeRateLimited, RetryAfter: wait}
 	}
-	if ok, wait := ps.global.take(now); !ok {
-		ep.bucket.refund()
-		ep.breaker.abandonProbe()
-		return &Refusal{Code: CodeRateLimited, RetryAfter: wait}
-	}
+	ep.bucket.take(now)
+	ps.global.take(now)
 	return nil
 }
 
@@ -366,6 +370,7 @@ func (l *Limiter) Observe(k Key, o Outcome) time.Duration {
 			retry = l.retryDelay(ep.failures)
 		}
 		ep.bucket.close(now.Add(retry))
+		ep.breaker.releaseProbe()
 		return retry
 	case o.Err != nil || o.StatusCode >= 500:
 		ep.failures++

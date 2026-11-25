@@ -125,11 +125,18 @@ func TestDefaultJitterStaysInsideTwentyPercent(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	k := quoteKey()
+	var jittered bool
 	for range 50 {
 		l.Observe(k, ratebudget.Outcome{StatusCode: 400}) // reset the failure count
 		got := l.Observe(k, ratebudget.Outcome{StatusCode: 500})
 		if got < 800*time.Millisecond || got > 1200*time.Millisecond {
 			t.Fatalf("jittered backoff %s outside [800ms,1200ms]", got)
 		}
+		if got != time.Second {
+			jittered = true
+		}
+	}
+	if !jittered {
+		t.Fatal("zero Backoff.Jitter produced the unjittered 1s delay every time; the ±20% default is missing")
 	}
 }

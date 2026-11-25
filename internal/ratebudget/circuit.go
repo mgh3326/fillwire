@@ -58,6 +58,15 @@ func (b *breaker) abandonProbe() {
 	}
 }
 
+// releaseProbe frees a reservation whose request came back rate-limited rather
+// than failed: a 429 is not a circuit failure, and holding the reservation
+// would delay recovery by the rest of the probe window.
+func (b *breaker) releaseProbe() {
+	if b.state == breakerHalfOpen {
+		b.probing = false
+	}
+}
+
 // success closes the circuit and clears the consecutive-failure count.
 func (b *breaker) success() {
 	b.state = breakerClosed

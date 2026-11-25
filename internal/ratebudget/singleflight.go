@@ -1,6 +1,13 @@
 package ratebudget
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
+
+// errAbandoned reaches callers that joined a call whose function ended its own
+// goroutine (runtime.Goexit) without returning.
+var errAbandoned = errors.New("ratebudget: coalesced call ended its goroutine")
 
 // Group coalesces identical in-flight requests: the first caller runs fn and
 // every caller with the same key waits for and shares its result. A key is
@@ -41,18 +48,22 @@ func (g *Group) Do(key string, fn func() (any, error)) (any, error) {
 	g.mu.Unlock()
 
 	func() {
+		completed := false
 		defer func() {
 			if r := recover(); r != nil {
 				c.panic = r
 			}
+			if !completed && c.panic == nil && c.err == nil {
+				c.err = errAbandoned
+			}
+			g.mu.Lock()
+			delete(g.m, key)
+			g.mu.Unlock()
+			close(c.done)
 		}()
 		c.value, c.err = fn()
+		completed = true
 	}()
-
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
-	close(c.done)
 
 	if c.panic != nil {
 		panic(c.panic)

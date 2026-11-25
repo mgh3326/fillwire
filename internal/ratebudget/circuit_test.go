@@ -86,6 +86,22 @@ func TestSuccessResetsConsecutiveFailures(t *testing.T) {
 	mustAcquire(t, l, k)
 }
 
+func TestRateLimitedProbeReleasesItsReservation(t *testing.T) {
+	clock := newTestClock()
+	global, endpoint := highLimits()
+	l := newLimiter(t, clock, 1, global, endpoint)
+	k := quoteKey()
+
+	tripEndpoint(t, l, k)
+	clock.advance(30 * time.Second)
+	mustAcquire(t, l, k) // probe
+	l.Observe(k, ratebudget.Outcome{StatusCode: 429, RetryAfter: time.Second})
+	clock.advance(time.Second)
+	// A 429 is not a circuit failure; the probe reservation is gone, so the
+	// endpoint can be probed again instead of waiting out the old window.
+	mustAcquire(t, l, k)
+}
+
 func TestLostProbeExpires(t *testing.T) {
 	clock := newTestClock()
 	global, endpoint := highLimits()

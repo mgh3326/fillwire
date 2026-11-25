@@ -13,8 +13,8 @@
 //     same shape as auto_trader's kis_api_rate_limits.
 //   - Hierarchical token buckets: one provider+account bucket, then one bucket
 //     per endpoint below it. A request needs one token from both. A refusal
-//     gives back the token it had already taken, so a request never spends
-//     budget it did not use.
+//     spends neither, and reports the longer of the two waits, so a retry at
+//     that wait passes both layers.
 //   - Research share: the provider+account bucket is scaled to Config.
 //     ResearchShare (default 0.25) because a separate research process spends
 //     the same broker limit. The share is fixed, not adaptive; endpoint buckets
