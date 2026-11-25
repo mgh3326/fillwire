@@ -155,6 +155,43 @@ func TestKisFuturesRejectedLaneIsNotFatal(t *testing.T) {
 	}
 }
 
+// The enabled book lane keeps its registration out of both lanes' budget.
+func TestBookStreamCountsAgainstTheSharedBudget(t *testing.T) {
+	t.Setenv("KIS_QUOTE_TOKEN", "fixture-token")
+	mr := miniredis.RunT(t)
+	for books, want := range map[bool]int{false: 4, true: 2} {
+		var cfg runtimeConfig
+		cfg.Redis.URL = "redis://" + mr.Addr()
+		cfg.KIS.Endpoint = "live"
+		cfg.Books.Enabled = books
+		cfg.kisFutures = kisFuturesSettings{enabled: true, calendarFile: calendarPath(t, time.Now()), maxLen: 100}
+		// 15 - fills 1 - safety 2 - futures 8 = 4 free, 3 with books: two
+		// promoted symbols, or one.
+		cfg.kisQuotes = kisQuoteSettings{
+			enabled: true, symbols: []string{"000001", "000002"}, limit: 15,
+			minHold: time.Hour, feedGap: time.Hour, maxLen: 100, buffer: 4, tokenEnv: "KIS_QUOTE_TOKEN",
+		}
+		futures, slots, stopFutures := startKisFutures(cfg, quietLogger(), runDependencies{futuresMaster: fixedMaster{}})
+		if futures == nil {
+			t.Fatalf("books %v: futures lane did not start", books)
+		}
+		quotes, stopQuotes := startKisQuotes(t.Context(), cfg, quietLogger(), nil, slots)
+		if quotes == nil {
+			t.Fatalf("books %v: quote lane did not start", books)
+		}
+		session := &quoteSession{subs: map[string]bool{}}
+		quotes.Attach(t.Context(), session)
+		session.mu.Lock()
+		got := len(session.subs)
+		session.mu.Unlock()
+		if got != want {
+			t.Errorf("books %v: promoted registrations = %d, want %d", books, got, want)
+		}
+		stopQuotes()
+		stopFutures()
+	}
+}
+
 type fixedMaster []kisfutures.MasterRow
 
 func (m fixedMaster) Master(context.Context) ([]kisfutures.MasterRow, error) { return m, nil }
