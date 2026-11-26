@@ -571,6 +571,32 @@ Set `enabled = false`, or delete the `[quotes]` table, and restart fillwire.
 The mount can stay or go. Existing `quotes:toss` entries remain until trimmed
 by `MAXLEN` or deleted by the desk (`DEL quotes:toss`).
 
+## NHPLUG 모의 WebSocket 기록 (기본 비활성화)
+
+`fillwire nhplug-ws -config fillwire.toml`은 NHPLUG 모의 WebSocket 한 세션에서
+시세와 d0–d3 통보 프레임을 JSONL로 기록합니다. 이 명령은 주문이나 원장 경로를
+호출하지 않습니다. 사용자 ID와 시세 채널은 설정에 두고, 앱 키와 시크릿은
+`NHPLUG_APP_KEY`, `NHPLUG_APP_SECRET` 환경 변수에서 읽습니다. WebSocket 주소는
+`wss://moapi.nhplug.com:17070/websocket`으로 고정되며 운영 WebSocket 포트는 거부합니다.
+인증 토큰은 NH SDK 방식으로 발급하고 메모리에만 유지합니다.
+
+```toml
+[nhplug_ws]
+enabled = false
+user_id = "NHPLUG_USER_ID"
+directory = "./recordings"
+app_key_env = "NHPLUG_APP_KEY"
+app_secret_env = "NHPLUG_APP_SECRET"
+
+[[nhplug_ws.quotes]]
+tr_cd = "mc"
+tr_key = "005930"
+```
+
+serve 모듈 레지스트리가 아직 통합되지 않은 상태에서는 명령을 직접 실행합니다.
+레지스트리 연결은 `[nhplug_ws]`를 읽고 `runNHPlugWS(ctx, cfg, tokens.Token)`을
+실행하는 모듈 팩토리 한 줄로 연결할 수 있습니다.
+
 ## KIS promoted quote lane (off by default)
 
 The promoted quote lane registers the KIS realtime trade (`H0STCNT0`) and

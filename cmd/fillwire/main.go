@@ -33,6 +33,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "nhplug-ws" {
+		if err := runNHPlugWSCommand(os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) && !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "alpaca" {
 		os.Exit(runAlpacaCLI(os.Args[2:]))
 	}
