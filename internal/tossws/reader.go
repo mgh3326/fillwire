@@ -281,7 +281,12 @@ func (r *Reader) ack(ctx context.Context, conn Socket, id, topic string) error {
 		}
 		switch frame["type"] {
 		case "error":
-			if err := serverError(frame); err != nil {
+			err := serverError(frame)
+			if err == errServer {
+				// Before acknowledgement, other server errors reject the declaration.
+				return ErrAck
+			}
+			if err != nil {
 				return err
 			}
 			r.dropMalformed()
