@@ -363,12 +363,46 @@ func TestServeKISFailureAlerts(t *testing.T) {
 	ctx := context.Background()
 	fake := &failingAlerter{}
 	for _, failure := range []error{reader.ErrApprovalConfig, errors.New("fixture transient"), ws.ErrSessionOccupied, errSharedKISStopped} {
-		run := alertKISFailures(func(context.Context, func()) error { return failure }, fake)
+		run := alertKISFailures("kis_session", func(context.Context, func()) error { return failure }, fake)
 		if err := run(ctx, func() {}); !errors.Is(err, failure) {
 			t.Fatalf("alert wrapper lost original failure: %v", err)
 		}
 	}
-	if want := []string{"configuration", "transient", "session-occupied"}; !reflect.DeepEqual(fake.classes, want) {
+	for _, name := range []string{"kis_quotes", "kis_futures", "kis_fills"} {
+		for _, failure := range []error{reader.ErrApprovalConfig, errors.New("fixture transient"), errSharedKISStopped} {
+			run := alertKISFailures(name, func(context.Context, func()) error { return failure }, fake)
+			if err := run(ctx, func() {}); !errors.Is(err, failure) {
+				t.Fatalf("%s alert wrapper lost original failure: %v", name, err)
+			}
+		}
+	}
+	if want := []string{"configuration", "transient", "session-occupied",
+		"kis_quotes-configuration", "kis_quotes-transient", "kis_futures-configuration", "kis_futures-transient",
+		"configuration", "transient"}; !reflect.DeepEqual(fake.classes, want) {
 		t.Fatalf("alerts = %v, want %v", fake.classes, want)
+	}
+}
+
+func TestKISAuxiliaryInvalidSettingsArePermanent(t *testing.T) {
+	hub := newKISHub()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"quotes", func() error {
+			return runKISQuotes(ctx, []byte("[kis_quotes]\nenabled = true\n"), hub, logger, false, func() {})
+		}},
+		{"futures", func() error {
+			return runKISFutures(ctx, []byte("[kis_futures]\nenabled = true\n"), hub, logger, false, func() {})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); reader.ProcessExitCode(err) != reader.ExitCodeConfiguration {
+				t.Fatalf("invalid settings should stop the module, got %v", err)
+			}
+		})
 	}
 }
