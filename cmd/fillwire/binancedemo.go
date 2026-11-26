@@ -13,6 +13,36 @@ import (
 	"github.com/mgh3326/fillwire/internal/binancedemo"
 )
 
+type binanceDemoFileConfig struct {
+	Enabled    bool     `toml:"enabled"`
+	Symbols    []string `toml:"symbols"`
+	Directory  string   `toml:"directory"`
+	UserStream *bool    `toml:"user_stream"`
+}
+
+func resolveBinanceDemoSettings(contents []byte) (binanceDemoFileConfig, error) {
+	var cfg binanceDemoFileConfig
+	if _, err := strictTable(contents, "binance_demo", &cfg); err != nil {
+		return binanceDemoFileConfig{}, err
+	}
+	if cfg.Enabled && (len(cfg.Symbols) == 0 || strings.TrimSpace(cfg.Directory) == "") {
+		return binanceDemoFileConfig{}, errors.New("binance_demo: 활성화하려면 symbols와 directory가 필요합니다")
+	}
+	return cfg, nil
+}
+
+func newBinanceDemo(settings binanceDemoFileConfig, logger *slog.Logger) (*binancedemo.Reader, error) {
+	userStream := settings.UserStream == nil || *settings.UserStream
+	cfg, err := binancedemo.FromEnvironment(binancedemo.Config{
+		Symbols: append([]string(nil), settings.Symbols...), RecordingRoot: settings.Directory,
+		EnableUserStream: userStream, Logger: logger.With("lane", "binance_demo"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return binancedemo.New(cfg)
+}
+
 func runBinanceDemoCommand(args []string) error {
 	fs := flag.NewFlagSet("binance-demo", flag.ContinueOnError)
 	symbols := fs.String("symbols", "", "Binance Spot Demo symbols separated by commas")

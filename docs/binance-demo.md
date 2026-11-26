@@ -9,6 +9,16 @@ BINANCE_SPOT_DEMO_STREAMS_ENABLED=true \
   fillwire binance-demo --symbols BTCUSDT,ETHUSDT --record-dir <기록-디렉터리>
 ```
 
+`fillwire serve`에서 사용하려면 설정에 다음 표를 추가합니다. 표는 `enabled = true` 전까지 비활성이고, 사용자 스트림은 `user_stream`을 생략하면 켜집니다.
+
+```toml
+[binance_demo]
+enabled = false
+symbols = ["BTCUSDT", "ETHUSDT"]
+directory = "/var/lib/fillwire/recordings"
+user_stream = true
+```
+
 사용자 스트림을 끄면 자격 증명 없이 시세만 기록합니다.
 
 ```bash

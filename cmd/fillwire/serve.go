@@ -190,6 +190,18 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 		},
 	}
 	modules := map[string]Module{
+		"binance_demo": &streamModule{name: "binance_demo", start: func(ctx context.Context, observe func(func() bool)) error {
+			settings, err := resolveBinanceDemoSettings(contents)
+			if err != nil {
+				return err
+			}
+			module, err := newBinanceDemo(settings, logger)
+			if err != nil {
+				return err
+			}
+			observe(func() bool { return module.Health().MarketConnected })
+			return module.Run(ctx)
+		}},
 		"alpaca": &streamModule{name: "alpaca", start: func(ctx context.Context, observe func(func() bool)) error {
 			settings, err := resolveAlpacaSettings(contents)
 			if err != nil {

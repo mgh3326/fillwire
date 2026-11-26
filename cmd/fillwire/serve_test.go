@@ -22,7 +22,7 @@ import (
 
 func TestCommandHelp(t *testing.T) {
 	for _, command := range []string{
-		"fillwire", "run", "serve", "upbit", "upbit-fills", "alpaca", "nhplug-ws", "coverage", "bookrec", "edge-canary",
+		"fillwire", "run", "serve", "binance-demo", "upbit", "upbit-fills", "alpaca", "nhplug-ws", "coverage", "bookrec", "edge-canary",
 		"execmock", "execsim", "execupbit", "gatewayd", "kis-mock-edge", "kis-mock-read", "market-tap",
 	} {
 		t.Run(command, func(t *testing.T) {
@@ -71,11 +71,11 @@ func TestServeRegistryIsOptInAndHasNoOrderModules(t *testing.T) {
 			t.Errorf("%s enabled by default", slot.name)
 		}
 	}
-	want := []string{"alpaca", "gatewayd", "kis_fills", "kis_futures", "kis_quotes", "quotes", "toss_ws", "upbit", "upbit_fills"}
+	want := []string{"alpaca", "binance_demo", "gatewayd", "kis_fills", "kis_futures", "kis_quotes", "quotes", "toss_ws", "upbit", "upbit_fills"}
 	if !reflect.DeepEqual(sections, want) {
 		t.Fatalf("serve registered %v, want %v", sections, want)
 	}
-	for _, section := range []string{"alpaca", "upbit_fills", "gatewayd", "kis_fills", "kis_futures", "kis_quotes", "books", "quotes", "toss_ws", "upbit", "execmock", "execsim", "execupbit", "kis-mock-edge"} {
+	for _, section := range []string{"alpaca", "binance_demo", "upbit_fills", "gatewayd", "kis_fills", "kis_futures", "kis_quotes", "books", "quotes", "toss_ws", "upbit", "execmock", "execsim", "execupbit", "kis-mock-edge"} {
 		t.Run(section, func(t *testing.T) {
 			slots, _, err := serveModules([]byte("["+section+"]\nenabled = true"), logger)
 			if err != nil {
@@ -93,7 +93,7 @@ func TestServeRegistryIsOptInAndHasNoOrderModules(t *testing.T) {
 				expected = []string{section, "kis_session"}
 			case "books":
 				expected = []string{"kis_quotes", "kis_session"}
-			case "alpaca", "upbit_fills", "gatewayd", "quotes", "toss_ws", "upbit":
+			case "alpaca", "binance_demo", "upbit_fills", "gatewayd", "quotes", "toss_ws", "upbit":
 				expected = []string{section}
 			}
 			if !reflect.DeepEqual(active, expected) {
