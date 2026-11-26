@@ -301,11 +301,13 @@ websocket stays dedicated to `fills:kis`; the quote reader never uses KIS.
 `fillwire serve`에서 `[toss_ws] enabled = true`로 켜며, 개인 주문과 시세
 구독은 같은 Toss 연결을 사용합니다.
 
-수신 프레임은 `directory/toss-order/<UTC 날짜>/<account_seq>.jsonl`에
+주문 프레임은 `directory/toss-order/<UTC 날짜>/<account_seq>.jsonl`에,
+시세 프레임은 `directory/toss-quote/<UTC 날짜>/<account_seq>.jsonl`에
 `received_at`(로컬 수신 시각), `kind`, `topic`, 세션 ID, 원본 JSON과 함께
-추가됩니다. 구문이 잘못됐거나 구독 심볼과 맞지 않는 프레임은 버리고
-malformed 카운터를 올립니다. 이 기능은 Redis 시세 스트림이나 원장에 쓰지
-않고 주문도 내지 않습니다.
+추가됩니다. 시세 기록은 별도 bounded queue와 기록기를 사용해 날짜 압축이
+주문 프레임 수신을 막지 않게 합니다. 구문이 잘못됐거나 구독 심볼과 맞지 않는
+프레임은 버리고 malformed 카운터를 올립니다. 이 기능은 Redis 시세 스트림이나
+원장에 쓰지 않고 주문도 내지 않습니다.
 
 Protocol source: the Toss Open API realtime AsyncAPI document, version 1.2.2
 (`https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json`). The

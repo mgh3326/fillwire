@@ -16,6 +16,7 @@ import (
 )
 
 const tossOrderStream = "toss-order"
+const tossQuoteStream = "toss-quote"
 
 type tossWSFileConfig struct {
 	Enabled     bool   `toml:"enabled"`
@@ -89,13 +90,21 @@ func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger
 	if err != nil {
 		return errors.New("Toss WS gatewayd client setup failed")
 	}
-	sink, err := recording.NewSink(settings.Directory, tossOrderStream)
+	orderSink, err := recording.NewSink(settings.Directory, tossOrderStream)
 	if err != nil {
 		return err
 	}
+	quoteSink, err := recording.NewSink(settings.Directory, tossQuoteStream)
+	if err != nil {
+		_ = orderSink.Close()
+		return err
+	}
 	defer func() {
-		if err := sink.Close(); err != nil {
-			logger.Error("Toss WS JSONL recorder close failed", "reason", err)
+		if err := orderSink.Close(); err != nil {
+			logger.Error("Toss WS order recorder close failed", "reason", err)
+		}
+		if err := quoteSink.Close(); err != nil {
+			logger.Error("Toss WS quote recorder close failed", "reason", err)
 		}
 	}()
 	reader, err := tossws.New(tossws.Config{
@@ -103,7 +112,10 @@ func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger
 		Symbols:    settings.symbols,
 		Tokens:     tokenfetch.NewHolder(client, string(gatewayd.ProviderToss), 2*time.Minute, false, nil),
 		Append: func(r tossws.Record) error {
-			return sink.Append(tossOrderStream, settings.AccountSeq, r.ReceivedAt, r)
+			return orderSink.Append(tossOrderStream, settings.AccountSeq, r.ReceivedAt, r)
+		},
+		AppendQuote: func(r tossws.Record) error {
+			return quoteSink.Append(tossQuoteStream, settings.AccountSeq, r.ReceivedAt, r)
 		},
 		Logger: logger,
 	})

@@ -27,6 +27,7 @@ const (
 	ioTimeout        = 10 * time.Second
 	readIdle         = 3 * pingInterval
 	authWindow       = 10 * time.Minute
+	quoteQueueSize   = 2048
 )
 
 var (
@@ -75,22 +76,26 @@ func (wallClock) Now() time.Time                         { return time.Now() }
 func (wallClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 type Config struct {
-	AccountSeq string
-	Symbols    []quote.Symbol
-	Tokens     TokenSource
-	Append     func(Record) error
-	Dial       Dialer
-	Clock      Clock
-	Logger     *slog.Logger
+	AccountSeq  string
+	Symbols     []quote.Symbol
+	Tokens      TokenSource
+	Append      func(Record) error
+	AppendQuote func(Record) error
+	Dial        Dialer
+	Clock       Clock
+	Logger      *slog.Logger
 }
 
 type Reader struct {
-	cfg       Config
-	decoder   *quote.Decoder
-	topics    []string
-	running   atomic.Bool
-	healthy   atomic.Bool
-	malformed atomic.Uint64
+	cfg            Config
+	decoder        *quote.Decoder
+	topics         []string
+	running        atomic.Bool
+	healthy        atomic.Bool
+	malformed      atomic.Uint64
+	rejectedQuotes atomic.Uint64
+	droppedQuotes  atomic.Uint64
+	quoteRecords   chan Record
 }
 
 // Health reports whether this reader has an acknowledged live connection.
@@ -112,6 +117,9 @@ func New(cfg Config) (*Reader, error) {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.AppendQuote == nil {
+		cfg.AppendQuote = cfg.Append
 	}
 	return &Reader{cfg: cfg, decoder: quote.NewDecoder(cfg.Symbols), topics: topics}, nil
 }
@@ -184,6 +192,21 @@ func (r *Reader) Run(ctx context.Context) error {
 		return errors.New("Toss WS reader is already running")
 	}
 	defer r.running.Store(false)
+	r.quoteRecords = make(chan Record, quoteQueueSize)
+	quoteWriterDone := make(chan struct{})
+	go func() {
+		defer close(quoteWriterDone)
+		for record := range r.quoteRecords {
+			if err := r.cfg.AppendQuote(record); err != nil {
+				r.dropQuote("append failed")
+			}
+		}
+	}()
+	defer func() {
+		close(r.quoteRecords)
+		<-quoteWriterDone
+		r.quoteRecords = nil
+	}()
 	var rejected string
 	var recoveryStarted time.Time
 	delay := time.Second
@@ -379,8 +402,11 @@ func (r *Reader) recordQuote(raw []byte, topic string, at time.Time, id, token s
 	if frame.Kind != quote.FrameMessage || (frame.Drop != "" && frame.Drop != quote.DropOutOfSession && frame.Drop != quote.DropEmptyBook && frame.Drop != quote.DropNoTimestamp) || containsToken(raw, token) {
 		return false, nil
 	}
-	if err := r.cfg.Append(Record{Kind: strings.SplitN(topic, ":", 2)[0], ReceivedAt: at, SessionID: id, Topic: topic, Raw: raw}); err != nil {
-		return false, ErrRecord
+	record := Record{Kind: strings.SplitN(topic, ":", 2)[0], ReceivedAt: at, SessionID: id, Topic: topic, Raw: raw}
+	select {
+	case r.quoteRecords <- record:
+	default:
+		r.dropQuote("queue full")
 	}
 	return true, nil
 }
@@ -416,21 +442,33 @@ func (r *Reader) ack(ctx context.Context, conn Socket, id string, topics []strin
 			if frame["id"] != id || !subOK || !rejectOK {
 				return ErrAck
 			}
-			for _, item := range rejected {
-				rejection, _ := item.(object)
-				if rejection["code"] == "account-not-found" {
-					return ErrAccountNotFound
-				}
-			}
-			if len(rejected) != 0 {
-				return ErrRejected
-			}
-			if len(subscribed) != len(topics) {
-				return ErrAck
-			}
 			want := make(map[string]struct{}, len(topics))
 			for _, topic := range topics {
 				want[topic] = struct{}{}
+			}
+			seen := make(map[string]struct{}, len(topics))
+			for _, item := range rejected {
+				rejection, _ := item.(object)
+				topic, topicOK := rejection["target"].(string)
+				code, codeOK := rejection["code"].(string)
+				if !topicOK || !codeOK || code == "" {
+					return ErrAck
+				}
+				if _, expected := want[topic]; !expected {
+					return ErrAck
+				}
+				if _, duplicate := seen[topic]; duplicate {
+					return ErrAck
+				}
+				seen[topic] = struct{}{}
+				if topic == channel+":"+r.cfg.AccountSeq && code == "account-not-found" {
+					return ErrAccountNotFound
+				}
+				if topic == channel+":"+r.cfg.AccountSeq {
+					return ErrRejected
+				}
+				count := r.rejectedQuotes.Add(1)
+				r.cfg.Logger.Warn("Toss quote subscription rejected", "target", topic, "code", code, "rejected_quotes", count)
 			}
 			for _, item := range subscribed {
 				topic, ok := item.(string)
@@ -440,9 +478,16 @@ func (r *Reader) ack(ctx context.Context, conn Socket, id string, topics []strin
 				if _, ok := want[topic]; !ok {
 					return ErrAck
 				}
-				delete(want, topic)
+				if _, duplicate := seen[topic]; duplicate {
+					return ErrAck
+				}
+				seen[topic] = struct{}{}
 			}
-			if len(want) != 0 {
+			personalOrder := channel + ":" + r.cfg.AccountSeq
+			if _, ok := seen[personalOrder]; !ok {
+				return ErrAck
+			}
+			if len(seen) != len(want) {
 				return ErrAck
 			}
 			return nil
@@ -495,6 +540,13 @@ func (r *Reader) dropMalformed() {
 	// Log early and at powers of two during a sustained malformed burst.
 	if count&(count-1) == 0 {
 		r.cfg.Logger.Warn("Toss WS malformed frame dropped", "malformed_frames", count)
+	}
+}
+
+func (r *Reader) dropQuote(reason string) {
+	count := r.droppedQuotes.Add(1)
+	if count == 1 || count&(count-1) == 0 {
+		r.cfg.Logger.Warn("Toss quote record dropped", "reason", reason, "dropped_quotes", count)
 	}
 }
 

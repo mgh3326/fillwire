@@ -118,9 +118,9 @@ type level struct {
 }
 
 type orderbookData struct {
-	Timestamp *string `json:"timestamp"`
-	Asks      []level `json:"asks"`
-	Bids      []level `json:"bids"`
+	Timestamp *string         `json:"timestamp"`
+	Asks      json.RawMessage `json:"asks"`
+	Bids      json.RawMessage `json:"bids"`
 }
 
 // Decoder turns Toss frames into ticks for a fixed symbol set.
@@ -195,14 +195,26 @@ func (d *Decoder) decodeMessage(wire wireFrame) (Tick, Symbol, DropReason) {
 		if json.Unmarshal(wire.Data, &data) != nil {
 			return Tick{}, Symbol{}, DropMalformed
 		}
+		if !jsonArray(data.Asks) || !jsonArray(data.Bids) {
+			return Tick{}, Symbol{}, DropMalformed
+		}
+		var asks, bids []level
+		if json.Unmarshal(data.Asks, &asks) != nil || json.Unmarshal(data.Bids, &bids) != nil {
+			return Tick{}, Symbol{}, DropMalformed
+		}
+		if data.Timestamp != nil {
+			if _, err := time.Parse(time.RFC3339Nano, *data.Timestamp); err != nil {
+				return Tick{}, Symbol{}, DropMalformed
+			}
+		}
 		var ok bool
-		if tick.Ask1, tick.AskQty, ok = best(data.Asks); !ok {
+		if tick.Ask1, tick.AskQty, ok = best(asks); !ok {
 			return Tick{}, Symbol{}, DropMalformed
 		}
-		if tick.Bid1, tick.BidQty, ok = best(data.Bids); !ok {
+		if tick.Bid1, tick.BidQty, ok = best(bids); !ok {
 			return Tick{}, Symbol{}, DropMalformed
 		}
-		if len(data.Asks) == 0 && len(data.Bids) == 0 {
+		if len(asks) == 0 && len(bids) == 0 {
 			// Nothing to quote: an entry with only symbol, ts, and session
 			// would read as a quote with no usable value.
 			return Tick{}, Symbol{}, DropEmptyBook
@@ -225,6 +237,11 @@ func (d *Decoder) decodeMessage(wire wireFrame) (Tick, Symbol, DropReason) {
 	}
 	tick.Session = session
 	return tick, symbol, ""
+}
+
+func jsonArray(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && trimmed[0] == '['
 }
 
 // best returns the first level of one side. An empty side is valid and
