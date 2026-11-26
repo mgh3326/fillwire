@@ -42,7 +42,7 @@ func runUpbitFillsCommand(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return runUpbitFills(ctx, cfg.Directory, func() {})
+	return runUpbitFills(ctx, cfg.Directory, func(func() bool) {})
 }
 
 func resolveUpbitFillsSettings(contents []byte) (upbitFillsConfig, error) {
@@ -56,7 +56,7 @@ func resolveUpbitFillsSettings(contents []byte) (upbitFillsConfig, error) {
 	return cfg, nil
 }
 
-func runUpbitFills(ctx context.Context, directory string, ready func()) (runErr error) {
+func runUpbitFills(ctx context.Context, directory string, observe func(func() bool)) (runErr error) {
 	var sink *recording.Sink
 	reader, err := upbitpriv.New(upbitpriv.Config{
 		AccessKey: os.Getenv("UPBIT_ACCESS_KEY"),
@@ -73,7 +73,7 @@ func runUpbitFills(ctx context.Context, directory string, ready func()) (runErr 
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
-	ready()
+	observe(func() bool { return reader.Health().Connected })
 	err = reader.Run(ctx)
 	if errors.Is(err, context.Canceled) {
 		return nil

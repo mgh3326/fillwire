@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,38 +88,32 @@ func TestRunnerNeverRedialsAnyRefusedToken(t *testing.T) {
 }
 
 func TestDeclareLimiterAdmitsAtMostFivePerRollingSecond(t *testing.T) {
-	clock := newLaneClock(wednesdayMidday)
+	clock := &fixedClock{now: wednesdayMidday}
 	limiter := newDeclareLimiter(clock)
-	const callers = 12
-	var mu sync.Mutex
-	var admitted []time.Time
-	var wg sync.WaitGroup
-	for index := 0; index < callers; index++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := limiter.Wait(context.Background()); err != nil {
-				t.Error(err)
-				return
-			}
-			mu.Lock()
-			admitted = append(admitted, clock.Now())
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
-	sort.Slice(admitted, func(i, j int) bool { return admitted[i].Before(admitted[j]) })
-	if len(admitted) != callers {
-		t.Fatalf("admitted %d of %d", len(admitted), callers)
-	}
-	for index := declareLimit; index < len(admitted); index++ {
-		if gap := admitted[index].Sub(admitted[index-declareLimit]); gap < declareWindow {
-			t.Fatalf("declarations %d and %d are %s apart: more than %d in one second", index-declareLimit, index, gap, declareLimit)
+	for _, step := range []struct {
+		elapsed time.Duration
+		want    int32
+	}{
+		{0, 5},
+		{declareWindow - time.Nanosecond, 0},
+		{declareWindow, 5},
+		{2*declareWindow - time.Nanosecond, 0},
+		{2 * declareWindow, 5},
+	} {
+		clock.now = wednesdayMidday.Add(step.elapsed)
+		var admitted atomic.Int32
+		var wg sync.WaitGroup
+		for range 12 {
+			wg.Go(func() {
+				if _, ok := limiter.reserve(); ok {
+					admitted.Add(1)
+				}
+			})
 		}
-	}
-	// Twelve admissions at five per second need at least two full windows.
-	if span := admitted[len(admitted)-1].Sub(admitted[0]); span < 2*declareWindow {
-		t.Fatalf("12 declarations admitted within %s", span)
+		wg.Wait()
+		if got := admitted.Load(); got != step.want {
+			t.Errorf("at %s admitted %d concurrent declarations, want %d", step.elapsed, got, step.want)
+		}
 	}
 }
 

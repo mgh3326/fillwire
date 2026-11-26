@@ -70,27 +70,24 @@ func runAlpacaCLI(args []string) int {
 		return 2
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	module, err := newAlpaca(settings, logger)
+	if err != nil {
+		logger.Error("Alpaca 설정 오류", "reason", err.Error())
+		return 2
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	code, err := runAlpaca(ctx, settings, logger, func() {})
-	if err != nil {
+	if err := module.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("Alpaca 기록 모듈이 중지되었습니다", "reason", err.Error())
+		return 1
 	}
-	return code
+	return 0
 }
 
-func runAlpaca(ctx context.Context, settings alpacaFileConfig, logger *slog.Logger, ready func()) (int, error) {
-	module, err := alpaca.New(alpaca.Config{
+func newAlpaca(settings alpacaFileConfig, logger *slog.Logger) (*alpaca.Module, error) {
+	return alpaca.New(alpaca.Config{
 		PaperKeyEnv: alpacaPaperKeyEnv, PaperSecretEnv: alpacaPaperSecretEnv,
 		DataKeyEnv: alpacaDataKeyEnv, DataSecretEnv: alpacaDataSecretEnv,
 		Symbols: settings.Symbols, Root: settings.Directory, Logger: logger,
 	})
-	if err != nil {
-		return 2, err
-	}
-	ready()
-	if err := module.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return 1, err
-	}
-	return 0, nil
 }

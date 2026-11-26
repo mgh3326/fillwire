@@ -101,5 +101,12 @@ func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger
 	if ready != nil {
 		ready()
 	}
-	return reader.Run(ctx)
+	err = reader.Run(ctx)
+	// Reader.Run retries transport failures itself. Preserve its deliberate
+	// authentication stops and subscription rejections under the supervisor.
+	if ready != nil && err != nil && ctx.Err() == nil &&
+		(!errors.Is(err, tossws.ErrRecord) || errors.Is(err, tossws.ErrAuthRevokedStop)) {
+		return errors.Join(errModuleStopped, err)
+	}
+	return err
 }

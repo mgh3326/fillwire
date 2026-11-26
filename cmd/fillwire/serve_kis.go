@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/alert"
@@ -23,15 +24,19 @@ import (
 // kisHub publishes each generation of the single KIS socket. Module attempts
 // own their registrations and stop using the socket when that generation ends.
 type kisHub struct {
-	mu      sync.Mutex
-	changed chan struct{}
-	current *kisSession
+	mu       sync.Mutex
+	changed  chan struct{}
+	current  *kisSession
+	terminal error
 }
 
 type kisSession struct {
 	reader.Session
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx      context.Context
+	cancel   context.CancelFunc
+	occupied atomic.Bool
+	finished chan struct{}
+	terminal error
 
 	mu               sync.RWMutex
 	fills            *kisFillSubscription
@@ -57,11 +62,32 @@ func (h *kisHub) publish(session *kisSession) {
 	h.changed = make(chan struct{})
 }
 
+var errSharedKISStopped = errors.New("shared KIS session stopped")
+
+func (h *kisHub) finish(session *kisSession, err error) {
+	code := reader.ProcessExitCode(err)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.current = nil
+	if code == reader.ExitCodeSessionOccupied || code == reader.ExitCodeConfiguration {
+		h.terminal = errors.Join(errModuleStopped, errSharedKISStopped)
+	}
+	close(h.changed)
+	h.changed = make(chan struct{})
+	if session != nil {
+		session.terminal = h.terminal
+		close(session.finished)
+	}
+}
+
 func (h *kisHub) wait(ctx context.Context) (*kisSession, error) {
 	for ctx.Err() == nil {
 		h.mu.Lock()
-		session, changed := h.current, h.changed
+		session, changed, terminal := h.current, h.changed, h.terminal
 		h.mu.Unlock()
+		if terminal != nil {
+			return nil, terminal
+		}
 		if session != nil && session.ctx.Err() == nil {
 			return session, nil
 		}
@@ -121,21 +147,27 @@ func (s *kisSession) onReconnect() {
 	}
 }
 
-func (h *kisHub) run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, ready func()) error {
+func (h *kisHub) run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, alerter alert.Alerter, ready func()) (runErr error) {
+	var session *kisSession
+	defer func() {
+		if session != nil && session.occupied.Load() {
+			runErr = errors.Join(runErr, ws.ErrSessionOccupied)
+		}
+		h.finish(session, runErr)
+	}()
 	options, err := redis.ParseURL(cfg.Redis.URL)
 	if err != nil {
-		return errors.New("config: invalid Redis URL")
+		return fmt.Errorf("%w: invalid Redis URL", reader.ErrApprovalConfig)
 	}
 	client := redis.NewClient(options)
 	defer client.Close()
-	approvalSource, approval, err := newKISApproval(cfg, logger, runDependencies{}, client)
+	approvalSource, approval, err := newKISApproval(cfg, logger, runDependencies{alerter: alerter}, client)
 	if err != nil {
 		return err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	session := &kisSession{ctx: ctx, cancel: cancel}
-	defer h.publish(nil)
+	session = &kisSession{ctx: ctx, cancel: cancel, finished: make(chan struct{})}
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
@@ -164,8 +196,7 @@ func (h *kisHub) run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger
 		return err
 	case err := <-refreshDone:
 		cancel()
-		<-done
-		return err
+		return errors.Join(err, <-done)
 	}
 }
 
@@ -259,9 +290,21 @@ func (s *kisSession) wait(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-s.ctx.Done():
+	case <-s.finished:
+		if s.terminal != nil {
+			return s.terminal
+		}
 		return reader.ErrEventsClosed
 	}
+}
+
+func (s *kisSession) Subscribe(ctx context.Context, tr, key string) error {
+	err := s.Session.Subscribe(ctx, tr, key)
+	if errors.Is(err, ws.ErrSessionOccupied) {
+		s.occupied.Store(true)
+		s.cancel()
+	}
+	return err
 }
 
 func (s *kisSession) add(ctx context.Context, tr, key string) error {
@@ -280,8 +323,12 @@ func (s *kisSession) remove(tr, key string) {
 	if s.ctx.Err() == nil {
 		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 		defer cancel()
-		if s.Unsubscribe(ctx, tr, key) != nil && s.ctx.Err() == nil {
-			// The next fill attempt must not silently reuse a stale registration.
+		err := s.Unsubscribe(ctx, tr, key)
+		// An ACK timeout can leave a fills registration on the current
+		// socket. Reconnection already drops registrations removed from
+		// go-kis's restore list. Book cleanup must never interrupt fills.
+		if (tr == ws.TRExecutionLive || tr == ws.TRExecutionVTS) &&
+			errors.Is(err, context.DeadlineExceeded) && s.ctx.Err() == nil {
 			s.cancel()
 		}
 	}
@@ -290,10 +337,9 @@ func (s *kisSession) remove(tr, key string) {
 func runKISFills(ctx context.Context, contents []byte, h *kisHub, logger *slog.Logger, ready func()) error {
 	cfg, err := parseConfig(contents, false)
 	if err != nil {
-		return err
+		return errors.Join(reader.ErrApprovalConfig, err)
 	}
-	alerter := alert.FromEnv(logger, cfg.alertRateLimit)
-	return runWithDependencies(ctx, cfg, logger, runDependencies{alerter: alerter, sharedFills: h.fills(cfg, ready)})
+	return runWithDependencies(ctx, cfg, logger, runDependencies{sharedFills: h.fills(cfg, ready)})
 }
 
 func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.Logger, reserveFutures bool, ready func()) error {
@@ -306,8 +352,9 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 		return errors.New("config: invalid KIS quote settings")
 	}
 	cfg := runtimeConfig{fileConfig: fileConfig{KIS: input.KIS, Redis: input.Redis, Books: input.Books}, kisQuotes: resolveKisQuoteSettings(contents)}
-	if cfg.kisQuotes.err != nil {
-		return cfg.kisQuotes.err
+	quoteErr := cfg.kisQuotes.err
+	if quoteErr != nil && !cfg.Books.Enabled {
+		return quoteErr
 	}
 	if err := cfg.loadKISCredentials(); err != nil {
 		return err
@@ -341,8 +388,14 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 	}
 	lane, stopQuotes := startKisQuotes(ctx, cfg, logger, symbols, nil)
 	defer stopQuotes()
-	if cfg.kisQuotes.enabled && lane == nil {
-		return errors.New("KIS 승격 호가 모듈을 초기화하지 못했습니다")
+	if quoteErr == nil && cfg.kisQuotes.enabled && lane == nil {
+		quoteErr = errors.New("KIS 승격 호가 모듈을 초기화하지 못했습니다")
+	}
+	if quoteErr != nil {
+		if !cfg.Books.Enabled {
+			return quoteErr
+		}
+		logger.Error("KIS 승격 호가 초기화 실패, 고정 종목 호가는 계속 실행합니다", "reason", safeRuntimeError(quoteErr))
 	}
 	session.mu.Lock()
 	session.quotes = func(event ws.Event) {
@@ -369,7 +422,9 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 	if lane != nil {
 		lane.Attach(ctx, session)
 	}
-	ready()
+	if quoteErr == nil {
+		ready()
+	}
 	return session.wait(ctx)
 }
 

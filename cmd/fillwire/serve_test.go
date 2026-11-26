@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/go-kis/kis/ws"
 )
 
@@ -162,18 +163,24 @@ func TestSupervisorRestartsOnlyFailedModule(t *testing.T) {
 }
 
 type fakeKISSession struct {
-	subscribed   chan string
-	unsubscribed chan string
+	subscribed     chan string
+	unsubscribed   chan string
+	unsubscribeErr error
+	subscribeErr   error
 }
 
 func (f fakeKISSession) Subscribe(_ context.Context, tr, key string) error {
-	f.subscribed <- tr + ":" + key
-	return nil
+	if f.subscribed != nil {
+		f.subscribed <- tr + ":" + key
+	}
+	return f.subscribeErr
 }
 
 func (f fakeKISSession) Unsubscribe(_ context.Context, tr, key string) error {
-	f.unsubscribed <- tr + ":" + key
-	return nil
+	if f.unsubscribed != nil {
+		f.unsubscribed <- tr + ":" + key
+	}
+	return f.unsubscribeErr
 }
 
 func TestSharedKISFillAttachmentLeavesQuoteAndFuturesAttached(t *testing.T) {
@@ -222,5 +229,129 @@ func TestSharedKISFillAttachmentLeavesQuoteAndFuturesAttached(t *testing.T) {
 	s.onFutures(ws.Event{})
 	if quotes != 1 || futures != 1 || ctx.Err() != nil {
 		t.Fatalf("closing fills stopped shared socket or unrelated callbacks")
+	}
+}
+
+func TestServeTossQuotesRejectsRemotePlaintextRedis(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	err := runTossQuoteFeed(context.Background(), []byte(`
+[quotes]
+enabled = true
+[redis]
+url = "redis://fixture:fixture@example.invalid:6379"
+`), logger, func() { t.Fatal("unsafe module became ready") })
+	if want := validateRedisURL("redis://fixture:fixture@example.invalid:6379"); err == nil || err.Error() != want.Error() {
+		t.Fatalf("Toss quote startup returned %v, want %v", err, want)
+	}
+}
+
+func TestSupervisorStopsKISTerminalErrors(t *testing.T) {
+	for _, failure := range []error{ws.ErrSessionOccupied, reader.ErrApprovalConfig, reader.ErrCacheOnlyApprovalUnavailable} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			var attempts atomic.Int32
+			slot := &moduleSlot{name: "kis_session", Module: &serviceModule{name: "kis_session", start: func(context.Context, func()) error {
+				attempts.Add(1)
+				return failure
+			}}}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			s := newSupervisor([]*moduleSlot{slot}, logger)
+			s.retryMin, s.retryMax = time.Millisecond, 2*time.Millisecond
+			s.run(ctx)
+			if got := slot.snapshot(); got != (moduleStatus{State: "failed"}) || attempts.Load() != 1 {
+				t.Fatalf("state=%+v attempts=%d", got, attempts.Load())
+			}
+		})
+	}
+}
+
+func TestKISRemovalKeepsSharedSocketForAbsentOrBookRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		tr  string
+		err error
+	}{
+		{ws.TRExecutionVTS, &ws.SubscribeError{}},
+		{ws.TRQuoteBook, context.DeadlineExceeded},
+		{ws.TRExecutionVTS, io.ErrClosedPipe},
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		session := &kisSession{Session: fakeKISSession{unsubscribeErr: tc.err}, ctx: ctx, cancel: cancel}
+		session.remove(tc.tr, "fixture")
+		err := ctx.Err()
+		cancel()
+		if err != nil {
+			t.Errorf("removal of %s after %v canceled shared socket", tc.tr, tc.err)
+		}
+	}
+}
+
+func TestKISOccupiedSubscribeCancelsGenerationAndKeepsReason(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &kisSession{Session: fakeKISSession{subscribeErr: ws.ErrSessionOccupied}, ctx: ctx, cancel: cancel}
+	err := s.add(context.Background(), ws.TRExecutionVTS, "fixture")
+	if !errors.Is(err, ws.ErrSessionOccupied) || !s.occupied.Load() || ctx.Err() == nil {
+		t.Fatalf("occupied subscription: err=%v recorded=%v context=%v", err, s.occupied.Load(), ctx.Err())
+	}
+}
+
+func TestKISBooksAttachWhenPromotedQuotesAreInvalid(t *testing.T) {
+	t.Setenv("SERVE_TEST_APP_KEY", "fixture-key")
+	t.Setenv("SERVE_TEST_APP_SECRET", "fixture-secret")
+	t.Setenv("SERVE_TEST_BOOK_TOKEN", "")
+	contents := []byte(`
+[kis]
+endpoint = "live"
+app_key_env = "SERVE_TEST_APP_KEY"
+app_secret_env = "SERVE_TEST_APP_SECRET"
+[redis]
+url = "redis://127.0.0.1:1"
+[kis_quotes]
+enabled = true
+[books]
+enabled = true
+symbol = "005930"
+access_token_env = "SERVE_TEST_BOOK_TOKEN"
+`)
+	if resolveKisQuoteSettings(contents).err == nil {
+		t.Fatal("fixture should reject promoted quotes")
+	}
+	h := newKISHub()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	wire := fakeKISSession{subscribed: make(chan string, 1), unsubscribed: make(chan string, 1)}
+	h.publish(&kisSession{Session: wire, ctx: ctx, cancel: cancel})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	done := make(chan error, 1)
+	var ready atomic.Bool
+	go func() { done <- runKISQuotes(ctx, contents, h, logger, false, func() { ready.Store(true) }) }()
+	select {
+	case got := <-wire.subscribed:
+		if got != ws.TRQuoteBook+":005930" {
+			t.Errorf("book subscription = %q", got)
+		}
+	case err := <-done:
+		t.Fatalf("fixed books stopped with invalid promoted quotes: %v", err)
+	case <-ctx.Done():
+		t.Error("fixed books did not attach")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) || ready.Load() {
+		t.Fatalf("result = %v, combined quote module ready = %v", err, ready.Load())
+	}
+}
+
+func TestServeKISFailureAlerts(t *testing.T) {
+	ctx := context.Background()
+	fake := &failingAlerter{}
+	for _, failure := range []error{reader.ErrApprovalConfig, errors.New("fixture transient"), ws.ErrSessionOccupied, errSharedKISStopped} {
+		run := alertKISFailures(func(context.Context, func()) error { return failure }, fake)
+		if err := run(ctx, func() {}); !errors.Is(err, failure) {
+			t.Fatalf("alert wrapper lost original failure: %v", err)
+		}
+	}
+	if want := []string{"configuration", "transient", "session-occupied"}; !reflect.DeepEqual(fake.classes, want) {
+		t.Fatalf("alerts = %v, want %v", fake.classes, want)
 	}
 }

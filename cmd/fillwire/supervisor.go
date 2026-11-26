@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/mgh3326/fillwire/internal/reader"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -29,6 +30,23 @@ func (m *serviceModule) Health() bool { return m.ready.Load() }
 func (m *serviceModule) Run(ctx context.Context) error {
 	defer m.ready.Store(false)
 	return m.start(ctx, func() { m.ready.Store(true) })
+}
+
+// streamModule reports live connection health throughout a recording attempt.
+type streamModule struct {
+	name   string
+	start  func(context.Context, func(func() bool)) error
+	health atomic.Pointer[func() bool]
+}
+
+func (m *streamModule) Name() string { return m.name }
+func (m *streamModule) Health() bool {
+	check := m.health.Load()
+	return check != nil && (*check)()
+}
+func (m *streamModule) Run(ctx context.Context) error {
+	defer m.health.Store(nil)
+	return m.start(ctx, func(check func() bool) { m.health.Store(&check) })
 }
 
 type moduleStatus struct {
@@ -83,7 +101,9 @@ func (s *supervisor) run(ctx context.Context) {
 func (s *supervisor) watch(ctx context.Context, slot *moduleSlot) {
 	defer func() {
 		slot.mu.Lock()
-		slot.status.State = "stopped"
+		if slot.status.State != "failed" {
+			slot.status.State = "stopped"
+		}
 		slot.mu.Unlock()
 	}()
 	delay := s.retryMin
@@ -91,6 +111,14 @@ func (s *supervisor) watch(ctx context.Context, slot *moduleSlot) {
 		started := time.Now()
 		err := runAttempt(func() error { return slot.Run(ctx) })
 		if ctx.Err() != nil {
+			return
+		}
+		code := reader.ProcessExitCode(err)
+		if errors.Is(err, errModuleStopped) || code == reader.ExitCodeSessionOccupied || code == reader.ExitCodeConfiguration {
+			slot.mu.Lock()
+			slot.status.State = "failed"
+			slot.mu.Unlock()
+			s.logger.Error("모듈이 중지되었습니다", "module", slot.Name(), "reason", safeRuntimeError(err))
 			return
 		}
 		if time.Since(started) >= s.retryMax {
@@ -114,6 +142,8 @@ func (s *supervisor) watch(ctx context.Context, slot *moduleSlot) {
 		delay = min(delay*2, s.retryMax)
 	}
 }
+
+var errModuleStopped = errors.New("module requires operator action before restart")
 
 func runAttempt(run func() error) (err error) {
 	defer func() {

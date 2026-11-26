@@ -110,7 +110,7 @@ func run(ctx context.Context, args []string, lookup func(string) string, stderr 
 	logger := log.New(stderr, "", 0)
 	metrics := NewMetrics()
 	server := &http.Server{
-		Handler:           tokenHandler(ensurers, logger, metrics, NewFetchService(ensurers, store, config.FetchConsumers), ready == nil),
+		Handler:           newHandlerWithFetch(ensurers, logger, metrics, NewFetchService(ensurers, store, config.FetchConsumers)),
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,

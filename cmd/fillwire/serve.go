@@ -14,7 +14,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/gatewayd"
+	"github.com/mgh3326/fillwire/internal/reader"
+	"github.com/mgh3326/go-kis/kis/ws"
+
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -156,21 +160,6 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 		"kis_futures": func(ctx context.Context, ready func()) error {
 			return runKISFutures(ctx, contents, hub, logger, books, ready)
 		},
-		"alpaca": func(ctx context.Context, ready func()) error {
-			settings, err := resolveAlpacaSettings(contents)
-			if err != nil {
-				return err
-			}
-			_, err = runAlpaca(ctx, settings, logger, ready)
-			return err
-		},
-		"upbit_fills": func(ctx context.Context, ready func()) error {
-			settings, err := resolveUpbitFillsSettings(contents)
-			if err != nil {
-				return err
-			}
-			return runUpbitFills(ctx, settings.Directory, ready)
-		},
 		"upbit": func(ctx context.Context, ready func()) error {
 			settings, err := resolveUpbitSettings(contents)
 			if err != nil {
@@ -200,8 +189,32 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 			return runTossQuoteFeed(ctx, contents, logger, ready)
 		},
 	}
-	names := make([]string, 0, len(registry))
-	for name := range registry {
+	modules := map[string]Module{
+		"alpaca": &streamModule{name: "alpaca", start: func(ctx context.Context, observe func(func() bool)) error {
+			settings, err := resolveAlpacaSettings(contents)
+			if err != nil {
+				return err
+			}
+			module, err := newAlpaca(settings, logger)
+			if err != nil {
+				return err
+			}
+			observe(module.Health)
+			return module.Run(ctx)
+		}},
+		"upbit_fills": &streamModule{name: "upbit_fills", start: func(ctx context.Context, observe func(func() bool)) error {
+			settings, err := resolveUpbitFillsSettings(contents)
+			if err != nil {
+				return err
+			}
+			return runUpbitFills(ctx, settings.Directory, observe)
+		}},
+	}
+	for name, start := range registry {
+		modules[name] = &serviceModule{name: name, start: start}
+	}
+	names := make([]string, 0, len(modules))
+	for name := range modules {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -217,24 +230,77 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 		case err != nil:
 			slot.Module = &serviceModule{name: name, start: func(context.Context, func()) error { return err }}
 		case on:
-			slot.Module = &serviceModule{name: name, start: registry[name]}
+			slot.Module = modules[name]
 			needsKIS = needsKIS || name == "kis_fills" || name == "kis_quotes" || name == "kis_futures"
 		}
 		slots = append(slots, slot)
 	}
 	if needsKIS {
+		interval, configErr := serveAlertInterval(contents)
+		alerter := alert.FromEnv(logger, interval)
+		for _, slot := range slots {
+			switch slot.name {
+			case "kis_fills", "kis_quotes", "kis_futures":
+				if module, ok := slot.Module.(*serviceModule); ok {
+					module.start = alertKISFailures(module.start, alerter)
+				}
+			}
+		}
 		slots = append(slots, &moduleSlot{name: "kis_session", Module: &serviceModule{
 			name: "kis_session",
-			start: func(ctx context.Context, ready func()) error {
-				cfg, err := parseKISTransport(contents)
-				if err != nil {
+			start: alertKISFailures(func(ctx context.Context, ready func()) error {
+				if configErr != nil {
+					err := errors.Join(reader.ErrApprovalConfig, configErr)
+					hub.finish(nil, err)
 					return err
 				}
-				return hub.run(ctx, cfg, logger, ready)
-			},
+				cfg, err := parseKISTransport(contents)
+				if err != nil {
+					err = errors.Join(reader.ErrApprovalConfig, err)
+					hub.finish(nil, err)
+					return err
+				}
+				return hub.run(ctx, cfg, logger, alerter, ready)
+			}, alerter),
 		}})
 	}
 	return slots, settings.HealthAddress, nil
+}
+
+func serveAlertInterval(contents []byte) (time.Duration, error) {
+	var settings struct {
+		Alerts struct {
+			RateLimit string `toml:"rate_limit"`
+		} `toml:"alerts"`
+	}
+	if err := toml.Unmarshal(contents, &settings); err != nil {
+		return 0, errors.New("config: invalid alerts settings")
+	}
+	if settings.Alerts.RateLimit == "" {
+		return alert.DefaultRateLimit, nil
+	}
+	interval, err := time.ParseDuration(settings.Alerts.RateLimit)
+	if err != nil || interval <= 0 {
+		return 0, errors.New("config: invalid alerts rate_limit")
+	}
+	return interval, nil
+}
+
+func alertKISFailures(start func(context.Context, func()) error, alerter alert.Alerter) func(context.Context, func()) error {
+	return func(ctx context.Context, ready func()) error {
+		err := runAttempt(func() error { return start(ctx, ready) })
+		if ctx.Err() == nil {
+			if errors.Is(err, errSharedKISStopped) {
+				return err // The shared session reports the original failure.
+			}
+			if errors.Is(err, ws.ErrSessionOccupied) {
+				alerter.Alert(ctx, "session-occupied", "fillwire KIS session occupied; operator action required")
+			} else {
+				exitCodeWithAlert(err, alerter)
+			}
+		}
+		return err
+	}
 }
 
 func runGatewaydModule(ctx context.Context, contents []byte, ready func()) error {
@@ -290,6 +356,9 @@ func runTossQuoteFeed(ctx context.Context, contents []byte, logger *slog.Logger,
 	cfg.KIS.Gatewayd, cfg.Redis, cfg.Stream.Key = input.KIS.Gatewayd, input.Redis, input.Stream.Key
 	if cfg.KIS.Gatewayd.TokenHeader == "" {
 		cfg.KIS.Gatewayd.TokenHeader = "Authorization"
+	}
+	if err := validateRedisURL(cfg.Redis.URL); err != nil {
+		return err
 	}
 	cfg.quotes = resolveQuoteSettings(contents, cfg)
 	if cfg.quotes.err != nil {
