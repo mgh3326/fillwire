@@ -1,0 +1,30 @@
+{
+  "type": "message",
+  "topic": "personal:order:3",
+  "data": {
+    "event": "FILL",
+    "accountSeq": "3",
+    "order": {
+      "orderId": "bAGzNvMOOTa5Uy0xVzYNbxDJ3Qpobwau4jDF3hyZZGWbpHm7wha8CFZc7aXVOWAl",
+      "symbol": "AAPL",
+      "side": "BUY",
+      "orderType": "LIMIT",
+      "timeInForce": "DAY",
+      "status": "FILLED",
+      "price": "100.5",
+      "quantity": "10",
+      "orderAmount": null,
+      "currency": "USD",
+      "orderedAt": "2026-06-23T09:30:00.000+09:00",
+      "canceledAt": null,
+      "execution": {
+        "filledQuantity": "10",
+        "averageFilledPrice": "100",
+        "filledAmount": "1000",
+        "commission": "1.23",
+        "tax": "0",
+        "settlementDate": "2026-06-25"
+      }
+    }
+  }
+}
