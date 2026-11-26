@@ -25,13 +25,21 @@ const (
 	TradeStream          = "alpaca-trade-updates"
 	MarketStream         = "alpaca-iex"
 	readLimit            = 1 << 20
+	defaultPingInterval  = 30 * time.Second
+	defaultPingTimeout   = 10 * time.Second
+	defaultStableSession = time.Minute
 )
 
-var ErrLiveTradingEndpoint = errors.New("alpaca: refusing non-paper trading stream endpoint")
+var (
+	ErrLiveTradingEndpoint = errors.New("alpaca: refusing non-paper trading stream endpoint")
+	ErrRecordingAppend     = errors.New("alpaca: recording append failed")
+	errPing                = errors.New("alpaca: websocket ping failed")
+)
 
 type Socket interface {
 	Read(context.Context) (websocket.MessageType, []byte, error)
 	Write(context.Context, websocket.MessageType, []byte) error
+	Ping(context.Context) error
 	CloseNow() error
 }
 
@@ -58,6 +66,9 @@ type Config struct {
 	Now            func() time.Time
 	RetryMin       time.Duration
 	RetryMax       time.Duration
+	PingInterval   time.Duration
+	PingTimeout    time.Duration
+	StableSession  time.Duration
 	Logger         *slog.Logger
 }
 
@@ -114,6 +125,15 @@ func New(cfg Config) (*Module, error) {
 	if cfg.RetryMax < cfg.RetryMin {
 		cfg.RetryMax = 30 * time.Second
 	}
+	if cfg.PingInterval <= 0 {
+		cfg.PingInterval = defaultPingInterval
+	}
+	if cfg.PingTimeout <= 0 {
+		cfg.PingTimeout = defaultPingTimeout
+	}
+	if cfg.StableSession <= 0 {
+		cfg.StableSession = defaultStableSession
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -147,15 +167,22 @@ func (m *Module) Run(ctx context.Context) error {
 	defer m.tradeReady.Store(false)
 	defer m.marketReady.Store(false)
 	defer m.closeWriters()
-	var workers atomic.Int32
-	workers.Store(2)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errs := make(chan error, 2)
-	go func() { errs <- m.reconnect(ctx, "trade_updates", m.cfg.TradeEndpoint, m.tradeKey, m.tradeSec) }()
-	go func() { errs <- m.reconnect(ctx, "market_data", m.cfg.MarketEndpoint, m.dataKey, m.dataSec) }()
-	for i := int32(0); i < workers.Load(); i++ {
-		if err := <-errs; ctx.Err() == nil && err != nil {
-			m.cfg.Logger.Error("alpaca stream stopped", "reason", err)
+	go func() { errs <- m.reconnect(runCtx, "trade_updates", m.cfg.TradeEndpoint, m.tradeKey, m.tradeSec) }()
+	go func() { errs <- m.reconnect(runCtx, "market_data", m.cfg.MarketEndpoint, m.dataKey, m.dataSec) }()
+	var fatal error
+	for range 2 {
+		if err := <-errs; err != nil && ctx.Err() == nil {
+			if fatal == nil {
+				fatal = err
+				cancel()
+			}
 		}
+	}
+	if fatal != nil {
+		return fatal
 	}
 	return ctx.Err()
 }
@@ -163,9 +190,15 @@ func (m *Module) Run(ctx context.Context) error {
 func (m *Module) reconnect(ctx context.Context, stream, endpoint, key, secret string) error {
 	delay := m.cfg.RetryMin
 	for ctx.Err() == nil {
-		if err := m.session(ctx, stream, endpoint, key, secret); ctx.Err() != nil {
+		healthyFor, err := m.sessionHealth(ctx, stream, endpoint, key, secret)
+		if ctx.Err() != nil {
 			return ctx.Err()
-		} else if err != nil {
+		}
+		delay = nextReconnectDelay(delay, healthyFor, m.cfg.StableSession, m.cfg.RetryMin, m.cfg.RetryMax)
+		if err != nil {
+			if errors.Is(err, ErrRecordingAppend) || errors.Is(err, ErrLiveTradingEndpoint) {
+				return err
+			}
 			m.cfg.Logger.Warn("alpaca stream reconnecting", "stream", stream, "reason", err.Error(), "malformed_frames", m.malformed.Load())
 		}
 		timer := time.NewTimer(delay)
@@ -175,14 +208,25 @@ func (m *Module) reconnect(ctx context.Context, stream, endpoint, key, secret st
 			return ctx.Err()
 		case <-timer.C:
 		}
-		delay = min(2*delay, m.cfg.RetryMax)
 	}
 	return ctx.Err()
 }
 
+func nextReconnectDelay(delay, healthyFor, stableFor, retryMin, retryMax time.Duration) time.Duration {
+	if healthyFor >= stableFor {
+		return retryMin
+	}
+	return min(2*delay, retryMax)
+}
+
 func (m *Module) session(ctx context.Context, stream, endpoint, key, secret string) error {
+	_, err := m.sessionHealth(ctx, stream, endpoint, key, secret)
+	return err
+}
+
+func (m *Module) sessionHealth(ctx context.Context, stream, endpoint, key, secret string) (healthyFor time.Duration, resultErr error) {
 	if stream == "trade_updates" && !paperEndpoint(endpoint) {
-		return ErrLiveTradingEndpoint
+		return 0, ErrLiveTradingEndpoint
 	}
 	headers := make(http.Header)
 	if stream == "trade_updates" {
@@ -190,14 +234,14 @@ func (m *Module) session(ctx context.Context, stream, endpoint, key, secret stri
 	}
 	conn, err := m.cfg.Dial(ctx, endpoint, headers)
 	if err != nil {
-		return errors.New("alpaca: websocket dial failed")
+		return 0, errors.New("alpaca: websocket dial failed")
 	}
 	defer conn.CloseNow()
 	if err := writeJSON(ctx, conn, map[string]string{"action": "auth", "key": key, "secret": secret}); err != nil {
-		return errors.New("alpaca: auth write failed")
+		return 0, errors.New("alpaca: auth write failed")
 	}
 	if err := m.readControl(ctx, conn, "authorization"); err != nil {
-		return err
+		return 0, err
 	}
 	var listen any
 	if stream == "trade_updates" {
@@ -206,33 +250,84 @@ func (m *Module) session(ctx context.Context, stream, endpoint, key, secret stri
 		listen = map[string]any{"action": "subscribe", "trades": m.cfg.Symbols, "quotes": m.cfg.Symbols, "bars": m.cfg.Symbols}
 	}
 	if err := writeJSON(ctx, conn, listen); err != nil {
-		return errors.New("alpaca: subscription write failed")
+		return 0, errors.New("alpaca: subscription write failed")
 	}
 	if err := m.readControl(ctx, conn, "listening"); err != nil {
-		return err
+		return 0, err
 	}
 	ready := &m.marketReady
 	if stream == "trade_updates" {
 		ready = &m.tradeReady
 	}
 	ready.Store(true)
-	defer ready.Store(false)
+	readyAt := time.Now()
+	defer func() {
+		healthyFor = time.Since(readyAt)
+		ready.Store(false)
+	}()
+	sessionCtx, cancel := context.WithCancel(ctx)
+	pingErrors := make(chan error, 1)
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		m.keepalive(sessionCtx, cancel, conn, pingErrors)
+	}()
+	defer func() {
+		cancel()
+		<-pingDone
+	}()
 	for {
-		kind, raw, err := conn.Read(ctx)
+		kind, raw, err := conn.Read(sessionCtx)
 		if err != nil {
-			return errors.New("alpaca: websocket disconnected")
+			select {
+			case pingErr := <-pingErrors:
+				return 0, pingErr
+			default:
+				return 0, errors.New("alpaca: websocket disconnected")
+			}
 		}
 		at := m.cfg.Now().UTC()
-		if (kind != websocket.MessageText && kind != websocket.MessageBinary) || !validEventFrame(stream, raw, m.cfg.Symbols) {
+		frames, ok := decodeFrames(raw)
+		if (kind != websocket.MessageText && kind != websocket.MessageBinary) || !ok || len(frames) == 0 {
 			m.malformed.Add(1)
 			continue
 		}
-		name := "market_data"
-		if stream == "trade_updates" {
-			name = "trade_updates"
+		for _, frame := range frames {
+			frameRaw, err := json.Marshal(frame)
+			if err != nil || !validEventFrame(stream, frame, m.cfg.Symbols) {
+				m.malformed.Add(1)
+				continue
+			}
+			name := "market_data"
+			if stream == "trade_updates" {
+				name = "trade_updates"
+			}
+			if err := m.recorder.Append(streamName(stream), name, at, Record{Kind: eventKind(stream, frame), ReceivedAt: at, Stream: stream, Data: frameRaw, Raw: append(json.RawMessage(nil), frameRaw...)}); err != nil {
+				return 0, fmt.Errorf("%w: %w", ErrRecordingAppend, err)
+			}
 		}
-		if err := m.recorder.Append(streamName(stream), name, at, Record{Kind: eventKind(stream, raw), ReceivedAt: at, Stream: stream, Data: append(json.RawMessage(nil), raw...), Raw: append(json.RawMessage(nil), raw...)}); err != nil {
-			return errors.New("alpaca: recording append failed")
+	}
+}
+
+func (m *Module) keepalive(ctx context.Context, cancel context.CancelFunc, conn Socket, failures chan<- error) {
+	ticker := time.NewTicker(m.cfg.PingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, stop := context.WithTimeout(ctx, m.cfg.PingTimeout)
+			err := conn.Ping(pingCtx)
+			stop()
+			if err != nil {
+				select {
+				case failures <- errors.Join(errPing, err):
+				default:
+				}
+				cancel()
+				return
+			}
 		}
 	}
 }
@@ -300,53 +395,37 @@ func (m *Module) readControl(ctx context.Context, conn Socket, expected string) 
 	}
 }
 
-func validEventFrame(stream string, raw []byte, symbols []string) bool {
-	frames, ok := decodeFrames(raw)
-	if !ok || len(frames) == 0 {
+func validEventFrame(stream string, frame map[string]json.RawMessage, symbols []string) bool {
+	var typ, symbol string
+	_ = json.Unmarshal(frame["stream"], &typ)
+	if stream == "trade_updates" {
+		if typ != "trade_updates" {
+			return false
+		}
+		var data struct {
+			Event string          `json:"event"`
+			Order json.RawMessage `json:"order"`
+		}
+		return json.Unmarshal(frame["data"], &data) == nil && data.Event != "" && len(data.Order) > 0
+	}
+	if json.Unmarshal(frame["T"], &typ) != nil || !contains([]string{"t", "q", "b", "c", "x"}, typ) {
 		return false
 	}
-	for _, frame := range frames {
-		var typ, symbol string
-		_ = json.Unmarshal(frame["stream"], &typ)
-		if stream == "trade_updates" {
-			if typ != "trade_updates" {
-				return false
-			}
-			var data struct {
-				Event string          `json:"event"`
-				Order json.RawMessage `json:"order"`
-			}
-			if json.Unmarshal(frame["data"], &data) != nil || data.Event == "" || len(data.Order) == 0 {
-				return false
-			}
-			continue
-		}
-		if json.Unmarshal(frame["T"], &typ) != nil || (typ != "t" && typ != "q" && typ != "b") {
-			return false
-		}
-		if json.Unmarshal(frame["S"], &symbol) != nil || !contains(symbols, symbol) {
-			return false
-		}
-	}
-	return true
+	return json.Unmarshal(frame["S"], &symbol) == nil && contains(symbols, symbol)
 }
 
-func eventKind(stream string, raw []byte) string {
-	frames, _ := decodeFrames(raw)
-	if len(frames) == 0 {
-		return ""
-	}
+func eventKind(stream string, frame map[string]json.RawMessage) string {
 	if stream == "trade_updates" {
-		var frame struct {
+		var update struct {
 			Data struct {
 				Event string `json:"event"`
 			} `json:"data"`
 		}
-		_ = json.Unmarshal(mustJSON(frames[0]), &frame)
-		return frame.Data.Event
+		_ = json.Unmarshal(mustJSON(frame), &update)
+		return update.Data.Event
 	}
 	var typ string
-	_ = json.Unmarshal(frames[0]["T"], &typ)
+	_ = json.Unmarshal(frame["T"], &typ)
 	switch typ {
 	case "t":
 		return "trade"
@@ -354,6 +433,10 @@ func eventKind(stream string, raw []byte) string {
 		return "quote"
 	case "b":
 		return "bar"
+	case "c":
+		return "correction"
+	case "x":
+		return "cancel_error"
 	default:
 		return ""
 	}
@@ -383,9 +466,10 @@ func contains(list []string, value string) bool {
 }
 
 func dial(ctx context.Context, endpoint string, headers http.Header) (Socket, error) {
-	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPHeader: headers})
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: client, HTTPHeader: headers})
 	if err != nil {
-		return nil, fmt.Errorf("alpaca: websocket dial failed")
+		return nil, errors.New("alpaca: websocket dial failed")
 	}
 	conn.SetReadLimit(readLimit)
 	return conn, nil
