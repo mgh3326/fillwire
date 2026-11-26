@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/coder/websocket v1.8.15
+	github.com/google/uuid v1.6.0
 	github.com/mgh3326/go-kis v0.0.0-20260907034827-836e62cb04f0
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/prometheus/client_golang v1.23.2
@@ -17,7 +18,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
