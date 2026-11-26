@@ -140,3 +140,34 @@ func TestValidateEndpointAcceptsOnlyMockPort(t *testing.T) {
 		}
 	}
 }
+
+func TestRunAllowsOnlyOneActiveSession(t *testing.T) {
+	started := make(chan struct{})
+	reader, err := New(Config{
+		UserID: "user-1",
+		Token: func(ctx context.Context) (string, error) {
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+		Append: func(Record) error { return nil },
+		Dial: func(context.Context, string) (Socket, error) {
+			t.Fatal("canceled token lookup must not dial")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- reader.Run(ctx) }()
+	<-started
+	if err := reader.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("second Run error = %v", err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Run error = %v", err)
+	}
+}

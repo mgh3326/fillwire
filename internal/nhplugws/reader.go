@@ -56,6 +56,7 @@ type Status struct {
 
 type Reader struct {
 	cfg       Config
+	running   atomic.Bool
 	connected atomic.Bool
 	malformed atomic.Uint64
 	lastError atomic.Value
@@ -159,6 +160,10 @@ func (r *Reader) Status() Status {
 }
 
 func (r *Reader) Run(ctx context.Context) error {
+	if !r.running.CompareAndSwap(false, true) {
+		return errors.New("NHPLUG WS reader is already running")
+	}
+	defer r.running.Store(false)
 	delay := r.cfg.RetryMin
 	for ctx.Err() == nil {
 		err := r.session(ctx)
@@ -198,6 +203,7 @@ func (r *Reader) session(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("NHPLUG WS mock dial failed: %w", err)
 	}
+	r.lastError.Store("")
 	defer conn.Close(websocket.StatusNormalClosure, "Bye")
 	r.connected.Store(true)
 	defer r.connected.Store(false)
