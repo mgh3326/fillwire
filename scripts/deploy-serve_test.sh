@@ -57,7 +57,7 @@ refuse ghcr.io/mgh3326/fillwire:main
 [[ ! -e $TEST_LOG ]]
 refuse "$unknown"
 [[ ! -e $current ]]
-! grep -q systemctl "$TEST_LOG"
+if grep -q systemctl "$TEST_LOG"; then exit 1; fi
 
 printf 'IMAGE=%s\n' "$a" > "$TEST_FAILURE"
 refuse "$a"
@@ -94,6 +94,6 @@ export TEST_CURRENT="$FILLWIRE_DEPLOY_STATE_DIR/quote-collector.service.image"
 : > "$TEST_LOG"
 bash scripts/deploy-serve.sh quote-collector "$a"
 assert_pin "$TEST_CURRENT" "$a"
-! grep -qx curl "$TEST_LOG"
+if grep -qx curl "$TEST_LOG"; then exit 1; fi
 
 echo 'deploy-serve pin, first failure, collector and rollback tests: PASS'
