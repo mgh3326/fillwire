@@ -1,4 +1,4 @@
-package main
+package bookreccmd
 
 import (
 	"bytes"
@@ -49,14 +49,14 @@ func TestRecordThenReplay(t *testing.T) {
 
 	clock := &fakeClock{now: time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)}
 	var stderr bytes.Buffer
-	if code := run([]string{"record", "-out", evidence}, strings.NewReader(frames), &stderr, &stderr, clock.Now); code != 0 {
+	if code := Run([]string{"record", "-out", evidence}, strings.NewReader(frames), &stderr, &stderr, clock.Now); code != 0 {
 		t.Fatalf("record exit %d: %s", code, stderr.String())
 	}
 
 	replayOnce := func() string {
 		t.Helper()
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{"replay", "-in", evidence}, nil, &stdout, &stderr, clock.Now); code != 0 {
+		if code := Run([]string{"replay", "-in", evidence}, nil, &stdout, &stderr, clock.Now); code != 0 {
 			t.Fatalf("replay exit %d: %s", code, stderr.String())
 		}
 		if !strings.Contains(stderr.String(), `"applied":2,"duplicates":1,"regressed":0,"gaps":1,"missing_vol":25`) {
@@ -73,7 +73,7 @@ func TestRecordThenReplay(t *testing.T) {
 	}
 
 	out := filepath.Join(dir, "events.jsonl")
-	if code := run([]string{"replay", "-in", evidence, "-out", out}, nil, &bytes.Buffer{}, &bytes.Buffer{}, clock.Now); code != 0 {
+	if code := Run([]string{"replay", "-in", evidence, "-out", out}, nil, &bytes.Buffer{}, &bytes.Buffer{}, clock.Now); code != 0 {
 		t.Fatal("replay -out failed")
 	}
 	if written, _ := os.ReadFile(out); string(written) != first {
@@ -84,7 +84,7 @@ func TestRecordThenReplay(t *testing.T) {
 func TestUsageErrors(t *testing.T) {
 	for _, args := range [][]string{nil, {"send"}, {"record"}, {"replay"}, {"record", "-out", "x", "-stale", "0s"}, {"record", "-out", "x", "-stale", "3ns"}} {
 		var stderr bytes.Buffer
-		if code := run(args, strings.NewReader(""), &stderr, &stderr, time.Now); code == 0 {
+		if code := Run(args, strings.NewReader(""), &stderr, &stderr, time.Now); code == 0 {
 			t.Errorf("%v: exit 0", args)
 		}
 	}
@@ -94,7 +94,7 @@ func TestReplayRefusesToOverwriteItsInput(t *testing.T) {
 	dir := t.TempDir()
 	evidence := filepath.Join(dir, "book.evidence.jsonl")
 	clock := &fakeClock{now: time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)}
-	if code := run([]string{"record", "-out", evidence}, strings.NewReader(""), io.Discard, io.Discard, clock.Now); code != 0 {
+	if code := Run([]string{"record", "-out", evidence}, strings.NewReader(""), io.Discard, io.Discard, clock.Now); code != 0 {
 		t.Fatal("record failed")
 	}
 	before, _ := os.ReadFile(evidence)
@@ -104,7 +104,7 @@ func TestReplayRefusesToOverwriteItsInput(t *testing.T) {
 	}
 	for _, out := range []string{evidence, link, filepath.Join(dir, ".", "book.evidence.jsonl")} {
 		var stderr bytes.Buffer
-		if code := run([]string{"replay", "-in", evidence, "-out", out}, nil, io.Discard, &stderr, clock.Now); code != 1 || !strings.Contains(stderr.String(), "-out names the -in") {
+		if code := Run([]string{"replay", "-in", evidence, "-out", out}, nil, io.Discard, &stderr, clock.Now); code != 1 || !strings.Contains(stderr.String(), "-out names the -in") {
 			t.Fatalf("-out %s: exit %d, %s", out, code, stderr.String())
 		}
 	}

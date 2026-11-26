@@ -11,6 +11,14 @@ import (
 	"github.com/mgh3326/fillwire/internal/kismockread"
 )
 
+// RunCLI dispatches the optional resolve operation or starts the order boundary.
+func RunCLI(ctx context.Context, args []string, lookup func(string) string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "resolve" {
+		return RunResolve(ctx, args[1:], lookup, stdout, stderr)
+	}
+	return Run(ctx, lookup, stderr)
+}
+
 // RunResolve runs the local, read-evidence-only UNKNOWN resolver. It is kept
 // separate from Run so the long-lived placement listener cannot accidentally
 // start when an operator intended a bounded reconciliation invocation.

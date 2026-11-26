@@ -22,10 +22,9 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("module root not found at %s", root)
 	}
-	// gatewayd is the one sanctioned token issuer (imported from broker-edge,
-	// hk 5872): it owns the Toss/KIS OAuth issuance this test keeps everything
-	// else away from. Only these two directories are exempt; both must exist so
-	// a rename cannot silently widen the exemption.
+	// gatewayd owns the Toss/KIS OAuth issuance. NHPLUG has one separately
+	// pinned token issuer file; keep that exception file-scoped so unrelated Go
+	// code remains covered by the generic credential-marker scan.
 	issuerDirs := map[string]bool{
 		filepath.Join(root, "internal", "gatewayd"): true,
 		filepath.Join(root, "cmd", "gatewayd"):      true,
@@ -34,6 +33,10 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
 			t.Fatalf("token issuer directory %s not found", dir)
 		}
+	}
+	nhplugIssuer := filepath.Join(root, "internal", "nhplugws", "token.go")
+	if info, err := os.Stat(nhplugIssuer); err != nil || info.IsDir() {
+		t.Fatalf("NHPLUG token issuer file %s not found", nhplugIssuer)
 	}
 	forbidden := []string{"oauth2", "/oauth", "client_secret", "client_credentials", "grant_type", "openapi.tossinvest.com", "toss_api_client"}
 	tossHosts := 0
@@ -57,9 +60,17 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 		}
 		scanned++
 		text := strings.ToLower(string(raw))
-		for _, needle := range forbidden {
-			if strings.Contains(text, needle) {
-				t.Errorf("%s contains %q", path, needle)
+		if path == nhplugIssuer {
+			for _, needle := range []string{"openapi.tossinvest.com", "toss_api_client"} {
+				if strings.Contains(text, needle) {
+					t.Errorf("%s contains Toss-specific marker %q", path, needle)
+				}
+			}
+		} else {
+			for _, needle := range forbidden {
+				if strings.Contains(text, needle) {
+					t.Errorf("%s contains %q", path, needle)
+				}
 			}
 		}
 		tossHosts += strings.Count(text, "tossinvest.com")

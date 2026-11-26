@@ -1,4 +1,4 @@
-package main
+package execsimcmd
 
 import (
 	"bytes"
@@ -14,13 +14,13 @@ import (
 const (
 	evidence = "../../internal/exec/sim/testdata/sim.evidence.jsonl"
 	intents  = "../../internal/exec/sim/testdata/sim.intents.jsonl"
-	golden   = "testdata/sim.golden.jsonl"
+	golden   = "../../cmd/execsim/testdata/sim.golden.jsonl"
 )
 
 func execsim(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(args, &stdout, &stderr)
+	code := Run(args, &stdout, &stderr)
 	return code, stdout.String(), stderr.String()
 }
 
@@ -56,9 +56,9 @@ func TestUsageErrors(t *testing.T) {
 }
 
 const (
-	upbitBooks   = "testdata/upbit.books.jsonl"
-	upbitIntents = "testdata/upbit.intents.jsonl"
-	upbitGolden  = "testdata/upbit.golden.jsonl"
+	upbitBooks   = "../../cmd/execsim/testdata/upbit.books.jsonl"
+	upbitIntents = "../../cmd/execsim/testdata/upbit.intents.jsonl"
+	upbitGolden  = "../../cmd/execsim/testdata/upbit.golden.jsonl"
 )
 
 func TestUpbitReplayIsDeterministicAndPrintsBothRules(t *testing.T) {

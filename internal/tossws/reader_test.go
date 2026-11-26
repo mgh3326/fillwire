@@ -171,6 +171,16 @@ func TestDeclarationIncludesOrdersAndConfiguredQuoteChannels(t *testing.T) {
 	}
 }
 
+func TestDeclarationRejectsMoreThan100Subscriptions(t *testing.T) {
+	symbols := make([]quote.Symbol, 50)
+	for index := range symbols {
+		symbols[index] = quote.Symbol{Market: quote.MarketKR, Code: fmt.Sprintf("%06d", index+1)}
+	}
+	if _, _, err := buildDeclaration("request-1", "3", symbols); err == nil {
+		t.Fatal("declaration with 101 subscriptions was accepted")
+	}
+}
+
 func TestReaderRecordsDocumentedQuoteFramesAndCountsMalformed(t *testing.T) {
 	trade := fixture(t, "trade-us-asyncapi-example.json")
 	book := fixture(t, "orderbook-kr-asyncapi-example.json")

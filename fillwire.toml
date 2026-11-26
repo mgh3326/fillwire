@@ -123,7 +123,7 @@ access_token_source = "" # "" with access_token_env, or "redis"
 enabled = false
 directory = "/var/lib/fillwire/recordings"
 
-# 토스 개인 주문과 선택 시세 프레임은 웹소켓 하나를 공유하며 기본 비활성화입니다.
+# fillwire serve의 토스 개인 주문과 선택 시세 프레임은 연결을 공유하며 기본 비활성화입니다.
 [toss_ws]
 enabled = false
 account_seq = ""
@@ -137,6 +137,12 @@ markets_file = "/etc/fillwire/upbit-markets.txt" # 한 줄에 KRW 마켓 코드 
 directory = "/var/lib/fillwire/recordings"
 retry_min = "1s"
 retry_max = "30s"
+
+# Alpaca paper 체결 알림 및 IEX 시세 기록기. 기본 비활성화.
+[alpaca]
+enabled = false
+symbols = ["AAPL", "MSFT"]
+directory = "/var/lib/fillwire/recordings"
 
 # KIS 국내 지수선물(F200·MF200 근월·차월) 주간·야간 체결 -> 1분봉. 기존 KIS 웹소켓
 # 세션과 구독 예산을 공유하며(등록 8건) 두 번째 세션을 열지 않습니다. live 전용.

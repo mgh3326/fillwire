@@ -3,12 +3,9 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"log/slog"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/gatewayd"
@@ -16,7 +13,6 @@ import (
 	"github.com/mgh3326/fillwire/internal/recording"
 	"github.com/mgh3326/fillwire/internal/tokenfetch"
 	"github.com/mgh3326/fillwire/internal/tossws"
-	"github.com/pelletier/go-toml/v2"
 )
 
 const tossOrderStream = "toss-order"
@@ -54,6 +50,9 @@ func resolveTossWSSettings(contents []byte, g gatewaydSettings) (tossWSSettings,
 		}
 		symbols = loaded
 	}
+	if g.TokenHeader == "" {
+		g.TokenHeader = "Authorization"
+	}
 	base, err := tokenfetch.NormalizeURL(g.URL)
 	if err != nil || !tokenfetch.CredentialTransportOK(base) ||
 		strings.TrimSpace(g.TokenEnv) == "" || !strings.EqualFold(g.TokenHeader, "Authorization") {
@@ -70,40 +69,12 @@ func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logg
 	if !settings.Enabled {
 		return func() {}
 	}
-	logger = logger.With("lane", "toss_ws")
-	client, err := tokenfetch.NewClient(settings.fetchURL, settings.credential)
-	if err != nil {
-		logger.Error("Toss WS gatewayd client setup failed")
-		return func() {}
-	}
-	sink, err := recording.NewSink(settings.Directory, tossOrderStream)
-	if err != nil {
-		logger.Error("Toss WS JSONL recorder setup failed", "reason", err)
-		return func() {}
-	}
-	reader, err := tossws.New(tossws.Config{
-		AccountSeq: settings.AccountSeq,
-		Symbols:    settings.symbols,
-		Tokens:     tokenfetch.NewHolder(client, string(gatewayd.ProviderToss), 2*time.Minute, false, nil),
-		Append: func(r tossws.Record) error {
-			return sink.Append(tossOrderStream, settings.AccountSeq, r.ReceivedAt, r)
-		},
-		Logger: logger,
-	})
-	if err != nil {
-		_ = sink.Close()
-		logger.Error("Toss WS reader setup failed", "reason", err)
-		return func() {}
-	}
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := reader.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := runTossWS(ctx, settings, logger, nil); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("Toss WS reader stopped", "reason", err)
-		}
-		if err := sink.Close(); err != nil {
-			logger.Error("Toss WS JSONL recorder close failed", "reason", err)
 		}
 	}()
 	return func() {
@@ -112,45 +83,21 @@ func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logg
 	}
 }
 
-// runTossWSCommand runs only the Toss websocket stream for hosts that have not
-// yet adopted the resident `serve` module registry.
-func runTossWSCommand(args []string) (runErr error) {
-	flags := flag.NewFlagSet("fillwire tossws", flag.ContinueOnError)
-	configPath := flags.String("config", "fillwire.toml", "path to fillwire TOML configuration")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if flags.NArg() != 0 {
-		return errors.New("usage: fillwire tossws [-config FILE]")
-	}
-	contents, err := os.ReadFile(*configPath)
-	if err != nil {
-		return errors.New("tossws: cannot read configuration")
-	}
-	var cfg fileConfig
-	if err := toml.Unmarshal(contents, &cfg); err != nil {
-		return errors.New("tossws: invalid TOML configuration")
-	}
-	if cfg.KIS.Gatewayd.TokenHeader == "" {
-		cfg.KIS.Gatewayd.TokenHeader = "Authorization"
-	}
-	settings, err := resolveTossWSSettings(contents, cfg.KIS.Gatewayd)
-	if err != nil {
-		return err
-	}
-	if !settings.Enabled {
-		return errors.New("tossws: [toss_ws] is disabled")
-	}
+func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger, ready func()) error {
+	logger = logger.With("lane", "toss_ws")
 	client, err := tokenfetch.NewClient(settings.fetchURL, settings.credential)
 	if err != nil {
-		return errors.New("tossws: gatewayd client setup failed")
+		return errors.New("Toss WS gatewayd client setup failed")
 	}
 	sink, err := recording.NewSink(settings.Directory, tossOrderStream)
 	if err != nil {
-		return errors.New("tossws: JSONL recorder setup failed")
+		return err
 	}
-	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("lane", "toss_ws")
+	defer func() {
+		if err := sink.Close(); err != nil {
+			logger.Error("Toss WS JSONL recorder close failed", "reason", err)
+		}
+	}()
 	reader, err := tossws.New(tossws.Config{
 		AccountSeq: settings.AccountSeq,
 		Symbols:    settings.symbols,
@@ -163,7 +110,15 @@ func runTossWSCommand(args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	return reader.Run(ctx)
+	if ready != nil {
+		ready()
+	}
+	err = reader.Run(ctx)
+	// Reader.Run retries transport failures itself. Preserve its deliberate
+	// authentication stops and subscription rejections under the supervisor.
+	if ready != nil && err != nil && ctx.Err() == nil &&
+		(!errors.Is(err, tossws.ErrRecord) || errors.Is(err, tossws.ErrAuthRevokedStop)) {
+		return errors.Join(errModuleStopped, err)
+	}
+	return err
 }

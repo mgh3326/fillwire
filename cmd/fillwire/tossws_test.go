@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,19 +33,20 @@ func TestTossWSConfigExplicitOptIn(t *testing.T) {
 			t.Fatal("invalid configuration accepted")
 		}
 	}
+	tooManySymbols := filepath.Join(t.TempDir(), "too-many-symbols.txt")
+	var contents strings.Builder
+	for index := 0; index < 50; index++ {
+		fmt.Fprintf(&contents, "kr %06d\n", index+1)
+	}
+	if err := os.WriteFile(tooManySymbols, []byte(contents.String()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tooMany := on + "\nsymbols_file = '" + tooManySymbols + "'"
+	if _, err := resolveTossWSSettings([]byte(tooMany), gateway); err == nil {
+		t.Fatal("configuration with 101 trade/orderbook subscriptions was accepted")
+	}
 	gateway.URL = "http://gateway.invalid"
 	if _, err := resolveTossWSSettings([]byte(on), gateway); err == nil {
 		t.Fatal("untrusted credential transport accepted")
-	}
-}
-
-func TestTossWSStandaloneCommandHonorsDisabledConfig(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "fillwire.toml")
-	if err := os.WriteFile(path, []byte("[toss_ws]\nenabled = false\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	err := runTossWSCommand([]string{"-config", path})
-	if err == nil || !strings.Contains(err.Error(), "disabled") {
-		t.Fatalf("runTossWSCommand() = %v, want disabled", err)
 	}
 }
