@@ -293,8 +293,7 @@ func (m *Module) sessionHealth(ctx context.Context, stream, endpoint, key, secre
 			continue
 		}
 		for _, frame := range frames {
-			frameRaw, err := json.Marshal(frame)
-			if err != nil || !validEventFrame(stream, frame, m.cfg.Symbols) {
+			if !frame.valid || !validEventFrame(stream, frame.fields, m.cfg.Symbols) {
 				m.malformed.Add(1)
 				continue
 			}
@@ -302,7 +301,8 @@ func (m *Module) sessionHealth(ctx context.Context, stream, endpoint, key, secre
 			if stream == "trade_updates" {
 				name = "trade_updates"
 			}
-			if err := m.recorder.Append(streamName(stream), name, at, Record{Kind: eventKind(stream, frame), ReceivedAt: at, Stream: stream, Data: frameRaw, Raw: append(json.RawMessage(nil), frameRaw...)}); err != nil {
+			frameRaw := append(json.RawMessage(nil), frame.raw...)
+			if err := m.recorder.Append(streamName(stream), name, at, Record{Kind: eventKind(stream, frame.fields), ReceivedAt: at, Stream: stream, Data: frameRaw, Raw: append(json.RawMessage(nil), frameRaw...)}); err != nil {
 				return 0, fmt.Errorf("%w: %w", ErrRecordingAppend, err)
 			}
 		}
@@ -364,7 +364,12 @@ func (m *Module) readControl(ctx context.Context, conn Socket, expected string) 
 			m.malformed.Add(1)
 			continue
 		}
-		for _, frame := range frames {
+		for _, part := range frames {
+			if !part.valid {
+				m.malformed.Add(1)
+				continue
+			}
+			frame := part.fields
 			var typ string
 			_ = json.Unmarshal(frame["stream"], &typ)
 			var marketType, message string
@@ -442,16 +447,33 @@ func eventKind(stream string, frame map[string]json.RawMessage) string {
 	}
 }
 
-func decodeFrames(raw []byte) ([]map[string]json.RawMessage, bool) {
-	var frames []map[string]json.RawMessage
-	if json.Unmarshal(raw, &frames) == nil && len(frames) > 0 {
+type decodedFrame struct {
+	raw    json.RawMessage
+	fields map[string]json.RawMessage
+	valid  bool
+}
+
+func decodeFrames(raw []byte) ([]decodedFrame, bool) {
+	var batch []json.RawMessage
+	if err := json.Unmarshal(raw, &batch); err == nil && batch != nil {
+		frames := make([]decodedFrame, 0, len(batch))
+		for _, item := range batch {
+			frames = append(frames, decodeFrame(item))
+		}
 		return frames, true
 	}
-	var frame map[string]json.RawMessage
-	if json.Unmarshal(raw, &frame) == nil && len(frame) > 0 {
-		return []map[string]json.RawMessage{frame}, true
+	if !json.Valid(raw) {
+		return nil, false
 	}
-	return nil, false
+	return []decodedFrame{decodeFrame(raw)}, true
+}
+
+func decodeFrame(raw json.RawMessage) decodedFrame {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || len(fields) == 0 {
+		return decodedFrame{raw: append(json.RawMessage(nil), raw...)}
+	}
+	return decodedFrame{raw: append(json.RawMessage(nil), raw...), fields: fields, valid: true}
 }
 
 func mustJSON(value any) []byte { b, _ := json.Marshal(value); return b }

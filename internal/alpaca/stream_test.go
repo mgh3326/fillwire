@@ -127,8 +127,8 @@ func TestTradeFillAndMarketFramesAreRecordedWithReceivedAt(t *testing.T) {
 			t.Errorf("market record %d kind = %q, want %q", i, record.Kind, wantKinds[i])
 		}
 	}
-	if got := module.malformed.Load(); got != 2 {
-		t.Fatalf("malformed frames = %d, want 2", got)
+	if got := module.malformed.Load(); got != 4 {
+		t.Fatalf("malformed frames = %d, want 4", got)
 	}
 	for _, record := range append(tradeRecords, marketRecords...) {
 		if !record.ReceivedAt.Equal(at.UTC()) {
@@ -173,8 +173,8 @@ func TestMixedMarketBatchDoesNotDropValidSiblings(t *testing.T) {
 			t.Errorf("record %d has zero received_at", i)
 		}
 	}
-	if got := module.malformed.Load(); got != 1 {
-		t.Fatalf("malformed elements = %d, want 1", got)
+	if got := module.malformed.Load(); got != 3 {
+		t.Fatalf("malformed elements = %d, want 3", got)
 	}
 }
 
@@ -189,7 +189,10 @@ func TestPingFailureClosesSilentSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_ = module.session(ctx, "market_data", IEXEndpoint, "key", "secret")
+	err := module.session(ctx, "market_data", IEXEndpoint, "key", "secret")
+	if !errors.Is(err, errPing) || !errors.Is(err, socket.pingErr) {
+		t.Fatalf("session error = %v, want ping sentinel and injected error", err)
+	}
 	if elapsed := time.Since(started); elapsed >= 100*time.Millisecond {
 		t.Fatalf("silent session took %s to close after ping failure", elapsed)
 	}
