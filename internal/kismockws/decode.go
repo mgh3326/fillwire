@@ -4,6 +4,7 @@ package kismockws
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,7 +44,7 @@ var futuresNoticeFields = []string{
 
 // DecodeNotice maps the decrypted websocket fields to KIS's sample schema.
 // The count check fails closed so a changed wire layout is counted and dropped.
-func DecodeNotice(event ws.Event) (Notice, error) {
+func DecodeNotices(event ws.Event) ([]Notice, error) {
 	var names []string
 	switch event.TR {
 	case TROverseasNotice:
@@ -51,21 +52,29 @@ func DecodeNotice(event ws.Event) (Notice, error) {
 	case TRFuturesNotice:
 		names = futuresNoticeFields
 	default:
-		return Notice{}, errors.New("kismockws: unsupported notice TR")
+		return nil, errors.New("kismockws: unsupported notice TR")
 	}
-	if len(event.Fields) != len(names) {
-		return Notice{}, errors.New("kismockws: malformed notice field count")
+	parts := strings.SplitN(string(event.Raw), "|", 4)
+	if len(parts) != 4 || parts[1] != event.TR {
+		return nil, errors.New("kismockws: malformed notice header")
 	}
-	fields := make(map[string]string, len(names))
-	for i, name := range names {
-		fields[name] = event.Fields[i]
+	count, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+	if err != nil || count < 1 || len(event.Fields) != count*len(names) {
+		return nil, errors.New("kismockws: malformed notice field count")
 	}
-	kind := classifyNotice(fields)
 	at := event.ReceivedAt
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	return Notice{Kind: kind, TR: event.TR, ReceivedAt: at.UTC(), Fields: fields, Raw: event.Raw}, nil
+	out := make([]Notice, 0, count)
+	for row := range count {
+		fields := make(map[string]string, len(names))
+		for i, name := range names {
+			fields[name] = event.Fields[row*len(names)+i]
+		}
+		out = append(out, Notice{Kind: classifyNotice(fields), TR: event.TR, ReceivedAt: at.UTC(), Fields: fields, Raw: event.Raw})
+	}
+	return out, nil
 }
 
 func classifyNotice(fields map[string]string) string {

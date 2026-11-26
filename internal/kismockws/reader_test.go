@@ -3,10 +3,12 @@ package kismockws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -134,6 +136,49 @@ func TestModuleUsesVTSAndMockTRRegistrations(t *testing.T) {
 	}
 }
 
+func TestModuleReturnsRecordingErrorAfterAppendFailure(t *testing.T) {
+	transport := newAckTransport()
+	module, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	module.appendRecord = func(string, time.Time, any) error { return errors.New("disk full") }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- module.Run(ctx) }()
+	deadline := time.After(2 * time.Second)
+	for {
+		transport.mu.Lock()
+		count := len(transport.trs)
+		transport.mu.Unlock()
+		if count == 5 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("mock subscriptions did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	fields := make([]string, 46)
+	fields[0], fields[1] = "005930", "100203"
+	fields[2], fields[12], fields[13], fields[21] = "100", "1", "1", "1"
+	transport.reads <- []byte("0|H0STCNT0|001|" + strings.Join(fields, "^"))
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "disk full") {
+			t.Fatalf("Run error = %v, want append failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after recording append failure")
+	}
+}
+
 func TestModuleEnforcesSessionRegistrationLimit(t *testing.T) {
 	symbols := make([]string, 20)
 	for i := range symbols {
@@ -156,8 +201,8 @@ func TestMalformedEventsAreCountedAndDropped(t *testing.T) {
 	}
 	defer sink.Close()
 	module := &Module{}
-	module.recordQuote(sink, ws.Event{TR: "H0STCNT0", Raw: []byte("malformed")})
-	module.recordNotice(sink, ws.Event{TR: TROverseasNotice, Fields: []string{"short"}})
+	module.recordQuote(sink, ws.Event{TR: "H0STCNT0", Raw: []byte("malformed")}, func() {})
+	module.recordNotice(sink, ws.Event{TR: TROverseasNotice, Fields: []string{"short"}, Raw: []byte("0|" + TROverseasNotice + "|001|ciphertext")}, func() {})
 	if got := module.Health().MalformedFrames; got != 2 {
 		t.Fatalf("malformed frame count = %d, want 2", got)
 	}
@@ -165,7 +210,36 @@ func TestMalformedEventsAreCountedAndDropped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("malformed frames were recorded: %v", entries)
+	if len(entries) != 1 || filepath.Base(entries[0]) != malformedRecording+".jsonl" {
+		t.Fatalf("malformed notice recording = %v, want only malformed-notices", entries)
+	}
+}
+
+type retrySession struct {
+	calls int
+	err   error
+}
+
+func (s *retrySession) Subscribe(context.Context, string, string) error {
+	s.calls++
+	if s.calls == 1 {
+		return s.err
+	}
+	return nil
+}
+func (*retrySession) Unsubscribe(context.Context, string, string) error { return nil }
+
+func TestSubscribeWithRetryRetriesTransientAndStopsOnRejection(t *testing.T) {
+	transient := &retrySession{err: fmt.Errorf("temporary transport error")}
+	if err := subscribeWithRetry(context.Background(), transient, "H0STCNT0", "005930"); err != nil {
+		t.Fatal(err)
+	}
+	if transient.calls != 2 {
+		t.Fatalf("transient subscribe calls = %d, want 2", transient.calls)
+	}
+	permanent := &retrySession{err: &ws.SubscribeError{TR: "H0STCNT0", Msg1: "invalid registration"}}
+	err := subscribeWithRetry(context.Background(), permanent, "H0STCNT0", "005930")
+	if !errors.Is(err, ws.ErrSubscribeFailed) || permanent.calls != 1 {
+		t.Fatalf("permanent rejection = %v after %d calls", err, permanent.calls)
 	}
 }

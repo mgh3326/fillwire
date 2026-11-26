@@ -27,9 +27,9 @@ import (
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "kis-mock-ws" {
-		if err := runKISMockWSCommand(os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) && !errors.Is(err, context.Canceled) {
+		if err := runKISMockWSCommand(os.Args[2:]); err != nil && kisMockWSCommandExitCode(err) != 0 {
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			os.Exit(kisMockWSCommandExitCode(err))
 		}
 		return
 	}

@@ -41,65 +41,84 @@ type kisMockWSCommandConfig struct {
 	} `toml:"kis_mock_ws"`
 }
 
+var errKISMockWSUsage = errors.New("kis-mock-ws: invalid command line")
+
+func kisMockWSConfigError(message string) error {
+	return fmt.Errorf("%w: kis-mock-ws: %s", reader.ErrApprovalConfig, message)
+}
+
+func kisMockWSCommandExitCode(err error) int {
+	if err == nil || errors.Is(err, flag.ErrHelp) || errors.Is(err, context.Canceled) {
+		return 0
+	}
+	if errors.Is(err, errKISMockWSUsage) {
+		return 2
+	}
+	return reader.ProcessExitCode(err)
+}
+
 func runKISMockWSCommand(args []string) error {
 	flags := flag.NewFlagSet("kis-mock-ws", flag.ContinueOnError)
 	configPath := flags.String("config", "fillwire.toml", "path to fillwire TOML configuration")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errKISMockWSUsage, err)
 	}
 	contents, err := os.ReadFile(*configPath)
 	if err != nil {
-		return fmt.Errorf("kis-mock-ws: read config: %w", err)
+		return fmt.Errorf("%w: read config: %v", reader.ErrApprovalConfig, err)
 	}
 	var cfg kisMockWSCommandConfig
 	if err := toml.Unmarshal(contents, &cfg); err != nil {
-		return errors.New("kis-mock-ws: invalid TOML configuration")
+		return kisMockWSConfigError("invalid TOML configuration")
 	}
 	if !cfg.KISMockWS.Enabled {
-		return errors.New("kis-mock-ws: disabled; set [kis_mock_ws].enabled = true")
+		return kisMockWSConfigError("disabled; set [kis_mock_ws].enabled = true")
 	}
 	if cfg.KIS.Endpoint != "mock" || cfg.KIS.AccountMode != "mock" {
-		return errors.New("kis-mock-ws: refusing non-mock KIS configuration")
+		return kisMockWSConfigError("refusing non-mock KIS configuration")
 	}
 	if cfg.KIS.ApprovalMode != "" {
-		return errors.New("kis-mock-ws: this command currently requires the shared default approval mode")
+		return kisMockWSConfigError("this command currently requires the shared default approval mode")
 	}
 	if strings.TrimSpace(cfg.KIS.HTSID) == "" || strings.TrimSpace(cfg.Redis.URL) == "" || strings.TrimSpace(cfg.KISMockWS.RecordingDirectory) == "" {
-		return errors.New("kis-mock-ws: HTS ID, Redis URL and recording_directory are required")
+		return kisMockWSConfigError("HTS ID, Redis URL and recording_directory are required")
+	}
+	if err := validateRedisURL(cfg.Redis.URL); err != nil {
+		return fmt.Errorf("%w: kis-mock-ws: Redis URL refused by transport policy", reader.ErrApprovalConfig)
 	}
 	appKey, ok := os.LookupEnv(cfg.KIS.AppKeyEnv)
 	if !ok || appKey == "" {
-		return fmt.Errorf("kis-mock-ws: required environment variable %s is unset", cfg.KIS.AppKeyEnv)
+		return kisMockWSConfigError(fmt.Sprintf("required environment variable %s is unset", cfg.KIS.AppKeyEnv))
 	}
 	appSecret, ok := os.LookupEnv(cfg.KIS.AppSecretEnv)
 	if !ok || appSecret == "" {
-		return fmt.Errorf("kis-mock-ws: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
+		return kisMockWSConfigError(fmt.Sprintf("required environment variable %s is unset", cfg.KIS.AppSecretEnv))
 	}
 	margin := time.Hour
 	if strings.TrimSpace(cfg.KIS.ApprovalMargin) != "" {
 		margin, err = time.ParseDuration(cfg.KIS.ApprovalMargin)
 		if err != nil || margin <= 0 || margin > reader.MaxRefreshMargin {
-			return errors.New("kis-mock-ws: invalid approval_refresh_margin")
+			return kisMockWSConfigError("invalid approval_refresh_margin")
 		}
 	}
 	pace := kismockws.SubscriptionPace
 	if strings.TrimSpace(cfg.KISMockWS.SubscribePace) != "" {
 		pace, err = time.ParseDuration(cfg.KISMockWS.SubscribePace)
 		if err != nil || pace <= 0 {
-			return errors.New("kis-mock-ws: invalid subscribe_pace")
+			return kisMockWSConfigError("invalid subscribe_pace")
 		}
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	redisOptions, err := redis.ParseURL(cfg.Redis.URL)
 	if err != nil {
-		return errors.New("kis-mock-ws: invalid Redis URL")
+		return kisMockWSConfigError("invalid Redis URL")
 	}
 	redisOptions.PoolSize = 2
 	redisClient := redis.NewClient(redisOptions)
 	defer redisClient.Close()
 	kisClient, err := kis.NewClient(kis.Config{Host: kis.HostVTS, AppKey: appKey, AppSecret: appSecret, RequestTimeout: reader.ApprovalIssueTimeout})
 	if err != nil {
-		return errors.New("kis-mock-ws: invalid KIS mock client configuration")
+		return kisMockWSConfigError("invalid KIS mock client configuration")
 	}
 	approval, err := reader.NewApprovalProviderConfig(redisClient, kisApprovalIssuer{client: kisClient}, "", "mock", margin, logger)
 	if err != nil {

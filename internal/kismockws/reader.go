@@ -22,6 +22,10 @@ const (
 	overseasRecordingName = "overseas-fills"
 	futuresRecordingName  = "futures-fills"
 	readerOutputBuffer    = 32
+	malformedRecording    = "malformed-notices"
+	noticeAckTimeout      = 5 * time.Second
+	subscribeRetryMin     = 500 * time.Millisecond
+	subscribeRetryMax     = 5 * time.Second
 )
 
 // Config describes one record-only VTS session. Endpoint must be "mock";
@@ -48,7 +52,8 @@ type Health struct {
 
 // Module records KIS mock quote and notice frames without ingesting them.
 type Module struct {
-	cfg Config
+	cfg          Config
+	appendRecord func(stream string, at time.Time, value any) error
 
 	connected atomic.Bool
 	malformed atomic.Uint64
@@ -77,8 +82,8 @@ func New(cfg Config) (*Module, error) {
 		seen[symbol] = true
 	}
 	// The parent reader registers the domestic mock execution notice. Add two
-	// quotes per symbol plus the overseas and futures notices. Leave the sum
-	// within the 41-registration ceiling shown by the KIS websocket examples.
+	// quotes per symbol plus the overseas and futures notices. Keep the sum
+	// within fillwire's conservative 41-registration cap.
 	if 1+2*len(cfg.Symbols)+2 > RegistrationLimit {
 		return nil, errors.New("kismockws: subscriptions exceed per-session registration limit")
 	}
@@ -121,26 +126,19 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 	if m.cfg.Endpoint != "mock" {
 		return errors.New("kismockws: refusing non-mock endpoint")
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	sink, err := recording.NewSink(m.cfg.RecordingDirectory, Name)
 	if err != nil {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
 	quotes := func(event ws.Event) {
-		m.recordQuote(sink, event)
+		m.recordQuote(sink, event, cancel)
 	}
-	var attachErrMu sync.Mutex
-	var attachErr error
-	setAttachError := func(err error) {
-		attachErrMu.Lock()
-		attachErr = err
-		attachErrMu.Unlock()
-	}
-	getAttachError := func() error {
-		attachErrMu.Lock()
-		defer attachErrMu.Unlock()
-		return attachErr
-	}
+	attachErr := make(chan error, 1)
+	attachStarted := atomic.Bool{}
+	attachDone := make(chan struct{})
 	attach := func(sessionCtx context.Context, session reader.Session) {
 		registrations := make([][2]string, 0, 2*len(m.cfg.Symbols)+2)
 		for _, symbol := range m.cfg.Symbols {
@@ -157,33 +155,56 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 				case <-timer.C:
 				}
 			}
-			if err := session.Subscribe(sessionCtx, registration[0], registration[1]); err != nil {
-				setAttachError(fmt.Errorf("kismockws: subscription failed for %s", registration[0]))
+			if err := subscribeWithRetry(sessionCtx, session, registration[0], registration[1]); err != nil {
+				if sessionCtx.Err() != nil {
+					return
+				}
 				m.setError("subscription failed")
+				m.cfg.Logger.Error("KIS mock websocket subscription failed", "tr", registration[0])
+				attachErr <- fmt.Errorf("kismockws: subscription failed for %s: %w", registration[0], err)
+				cancel()
 				return
 			}
 		}
 	}
 	output := make(chan ws.Event, readerOutputBuffer)
+	events := (<-chan ws.Event)(output)
 	readerDone := make(chan error, 1)
 	go func() {
 		defer close(output)
 		readerDone <- reader.New(reader.Config{
-			Endpoint:      m.cfg.Endpoint,
-			HTSID:         m.cfg.HTSID,
-			Approval:      m.cfg.Approval,
-			Dialer:        m.cfg.Dialer,
-			EventBuffer:   readerOutputBuffer,
-			Logger:        m.cfg.Logger,
-			OnSubscribed:  func() { m.connected.Store(true); m.clearError() },
-			OnReconnected: func() { m.connected.Store(true); m.reconnect.Add(1); m.clearError() },
-			OnQuote:       quotes,
-			OnSession:     attach,
-		}).Run(ctx, output)
+			Endpoint:    m.cfg.Endpoint,
+			HTSID:       m.cfg.HTSID,
+			Approval:    m.cfg.Approval,
+			Dialer:      m.cfg.Dialer,
+			EventBuffer: readerOutputBuffer,
+			Logger:      m.cfg.Logger,
+			OnSubscribed: func() {
+				if runCtx.Err() == nil {
+					m.connected.Store(true)
+					m.clearError()
+				}
+			},
+			OnReconnected: func() {
+				if runCtx.Err() == nil {
+					m.connected.Store(true)
+					m.reconnect.Add(1)
+					m.clearError()
+				}
+			},
+			OnQuote: quotes,
+			OnSession: func(sessionCtx context.Context, session reader.Session) {
+				if !attachStarted.CompareAndSwap(false, true) {
+					return
+				}
+				defer close(attachDone)
+				attach(sessionCtx, session)
+			},
+		}).Run(runCtx, output)
 	}()
 	processEvent := func(event ws.Event) {
 		if event.TR == TROverseasNotice || event.TR == TRFuturesNotice {
-			m.recordNotice(sink, event)
+			m.recordNotice(sink, event, cancel)
 		}
 	}
 	drain := func() {
@@ -191,31 +212,71 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 			processEvent(event)
 		}
 	}
+	readerEnded := false
+	var readerErr error
+	finish := func() error {
+		cancel()
+		if !readerEnded {
+			readerErr = <-readerDone
+			readerEnded = true
+		}
+		if attachStarted.Load() {
+			<-attachDone
+		}
+		drain()
+		m.connected.Store(false)
+		var subscriptionErr error
+		select {
+		case subscriptionErr = <-attachErr:
+		default:
+		}
+		result := m.recordingError(errors.Join(readerErr, subscriptionErr))
+		if result != nil && !errors.Is(result, context.Canceled) {
+			m.setError("KIS websocket stopped")
+		}
+		return result
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			m.connected.Store(false)
-			readerErr := <-readerDone
-			drain()
-			err := m.recordingError(errors.Join(readerErr, getAttachError()))
-			if err != nil && !errors.Is(err, context.Canceled) {
-				m.setError("KIS websocket stopped")
-			}
-			return err
+			return finish()
 		case err := <-readerDone:
-			m.connected.Store(false)
-			drain()
-			err = m.recordingError(errors.Join(err, getAttachError()))
-			if err != nil && !errors.Is(err, context.Canceled) {
-				m.setError("KIS websocket stopped")
-			}
-			return err
-		case event, ok := <-output:
+			readerEnded = true
+			readerErr = err
+			return finish()
+		case event, ok := <-events:
 			if !ok {
-				output = nil
+				events = nil
 				continue
 			}
 			processEvent(event)
+		}
+	}
+}
+
+func subscribeWithRetry(ctx context.Context, session reader.Session, tr, key string) error {
+	delay := subscribeRetryMin
+	for {
+		requestCtx, cancel := context.WithTimeout(ctx, noticeAckTimeout)
+		err := session.Subscribe(requestCtx, tr, key)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil || errors.Is(err, ws.ErrSubscribeFailed) {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < subscribeRetryMax/2 {
+			delay *= 2
+		} else {
+			delay = subscribeRetryMax
 		}
 	}
 }
@@ -224,7 +285,7 @@ func record(sink *recording.Sink, stream string, at time.Time, value any) error 
 	return sink.Append(Name, stream, at, value)
 }
 
-func (m *Module) recordQuote(sink *recording.Sink, event ws.Event) {
+func (m *Module) recordQuote(sink *recording.Sink, event ws.Event, cancel context.CancelFunc) {
 	value, err := DecodeQuote(event)
 	if err != nil {
 		m.malformed.Add(1)
@@ -234,29 +295,69 @@ func (m *Module) recordQuote(sink *recording.Sink, event ws.Event) {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	m.append(sink, quoteRecordingName, at, value)
-	m.received(at)
+	if m.append(sink, quoteRecordingName, at, value, cancel) {
+		m.received(at)
+	}
 }
 
-func (m *Module) recordNotice(sink *recording.Sink, event ws.Event) {
-	notice, err := DecodeNotice(event)
+func (m *Module) recordNotice(sink *recording.Sink, event ws.Event, cancel context.CancelFunc) {
+	notices, err := DecodeNotices(event)
 	if err != nil {
 		m.malformed.Add(1)
+		at := event.ReceivedAt
+		if at.IsZero() {
+			at = time.Now().UTC()
+		}
+		bad := struct {
+			Kind       string    `json:"kind"`
+			TR         string    `json:"tr"`
+			ReceivedAt time.Time `json:"received_at"`
+			Reason     string    `json:"reason"`
+			Fields     []string  `json:"fields"`
+			Raw        []byte    `json:"raw,omitempty"`
+		}{"malformed_notice", event.TR, at.UTC(), "invalid notice layout", event.Fields, event.Raw}
+		if m.append(sink, malformedRecording, at, bad, cancel) {
+			m.received(at)
+		}
+		if m.cfg.Logger != nil {
+			m.cfg.Logger.Warn("KIS mock websocket malformed notice recorded", "tr", event.TR)
+		}
 		return
 	}
-	stream := overseasRecordingName
-	if event.TR == TRFuturesNotice {
-		stream = futuresRecordingName
+	for _, notice := range notices {
+		stream := overseasRecordingName
+		if event.TR == TRFuturesNotice {
+			stream = futuresRecordingName
+		}
+		if m.append(sink, stream, notice.ReceivedAt, notice, cancel) {
+			m.received(notice.ReceivedAt)
+		}
 	}
-	m.append(sink, stream, notice.ReceivedAt, notice)
-	m.received(notice.ReceivedAt)
 }
 
-func (m *Module) append(sink *recording.Sink, name string, at time.Time, value any) {
-	if err := record(sink, name, at, value); err != nil {
+func (m *Module) append(sink *recording.Sink, name string, at time.Time, value any, cancel context.CancelFunc) bool {
+	m.mu.RLock()
+	failed := m.writeErr != nil
+	m.mu.RUnlock()
+	if failed {
+		return false
+	}
+	appendRecord := m.appendRecord
+	if appendRecord == nil {
+		appendRecord = func(stream string, at time.Time, value any) error {
+			return record(sink, stream, at, value)
+		}
+	}
+	if err := appendRecord(name, at, value); err != nil {
 		m.setWriteError(err)
 		m.setError("recording append failed")
+		if m.cfg.Logger != nil {
+			m.cfg.Logger.Error("KIS mock websocket recording failed")
+		}
+		cancel()
+		return false
 	}
+	return true
 }
 
 func (m *Module) received(at time.Time) {
