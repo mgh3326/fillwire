@@ -1017,6 +1017,14 @@ Upbit 기록기를 단독으로 실행해 확인하려면 다음 명령을 사�
 fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fillwire/recordings
 ```
 
+## Alpaca paper 스트림 기록기 (기본 비활성화)
+
+`[alpaca] enabled = true`와 `symbols` 종목 목록 및 `directory`를 설정하면 `fillwire alpaca --config fillwire.toml`이 Alpaca paper 계정의 `trade_updates`와 IEX의 주식 trade/quote/minute bar 프레임을 UTC 날짜별 JSONL 파일에 기록합니다. 명령은 paper 거래 스트림 `wss://paper-api.alpaca.markets/stream`에만 연결하며 라이브 거래 스트림 호스트는 다이얼 전에 거부합니다. 구독 전에 API 인증을 수행합니다. 주문 제출이나 ledger ingest를 호출하지 않습니다.
+
+키 값은 설정 파일에 넣지 않습니다. 프로세스는 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `ALPACA_DATA_API_KEY_ID`, `ALPACA_DATA_API_SECRET_KEY` 환경 변수에서 읽습니다. 기본 IEX feed는 무료 market-data plan에서 제공되는 feed입니다. 연결이 끊기면 재시도하며, 형식이 잘못된 프레임은 버립니다. 기록은 `<directory>/alpaca-trade-updates/<UTC 날짜>/trade_updates.jsonl` 및 `<directory>/alpaca-iex/<UTC 날짜>/market_data.jsonl`에 추가됩니다.
+
+Trading stream의 인증, `trade_updates` 구독 및 fill 이벤트 형식은 [Alpaca WebSocket Streaming 문서](https://docs.alpaca.markets/us/docs/websocket-streaming)를 따릅니다. IEX endpoint와 trades/quotes/bars 구독 형식은 [Alpaca Market Data WebSocket 문서](https://docs.alpaca.markets/us/docs/streaming-market-data) 및 [market data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq)를 따릅니다.
+
 ## 재연결 reconcile 트리거 (기본 비활성화)
 
 `[reconcile] enabled = true`로 켜면 KIS 최초 구독 직후, 재연결 성공 직후, 그리고 `interval`(설정 시)마다 auto_trader의 `reconcile/trigger` 엔드포인트를 호출해 수 초의 체결 통지 공백을 바로 메웁니다. 토큰은 `[ingest]`와 같은 것을 쓰며 로그에 남지 않습니다. 호출은 체결 처리 경로와 분리되어 있어 느리거나 실패해도 처리·종료에 영향이 없습니다. 기본값 `dry_run = true`는 보고만 하며, `dry_run = false`(커밋) 전환과 auto_trader의 30분 TaskIQ 크론 해제는 별도 승인 후의 환경 변경입니다.
