@@ -22,6 +22,7 @@
   사용합니다. pi의 실제 사용량과 OOM 여부를 그림자 기간에 확인합니다.
 - 스크립트는 arm64 다이제스트를 당겨 확인한 뒤 현재 핀을 교체합니다. serve는 컨테이너의
   실제 이미지와 `/healthz` 200, collector는 컨테이너의 실제 이미지와 실행 상태를 검사합니다.
+  두 유닛 모두 같은 컨테이너가 자동 재시작 없이 6초 이상 연속으로 검사를 통과해야 합니다.
   두 검사와 별도로 기록의 신선도를 확인합니다. 성공한 교체의 직전 핀은 `.previous`에 남습니다.
   이전 이미지의 로컬 캐시는 롤백을 위해 보존합니다. 배포가 강제 종료되어
   `<unit>.service.lock`이 남으면 기존 배포 프로세스가 종료됐는지 확인하고, 현재 컨테이너
@@ -99,6 +100,24 @@ fillwire market-tap -enabled -targets /etc/fillwire/targets.json -calendar /etc/
    broker-edge에 함께 묶인 배치에서는 3단계 정지 직후 이전합니다. 전환 전후에 토큰
    조회와 소비자 연결을 확인합니다. 기존 이미지와 유닛은 롤백에 쓸 수 있게 보존합니다.
 
+각 인계가 확인되면 해당 단계에서 실제로 내린 기존 유닛의 부팅 자동 시작을 해제합니다.
+`broker-edge`가 모의 주문을 계속 처리하거나 독립 `gatewayd`가 토큰을 계속 발급하는
+배치에서는 해당 명령을 건너뜁니다. gatewayd가 broker-edge에 묶여 있는 배치에서는
+실제 소유 유닛만 비활성화합니다.
+
+```sh
+sudo systemctl disable fillwire-rec.service
+sudo systemctl disable fillwire.service
+sudo systemctl disable broker-edge.service
+sudo systemctl disable gatewayd.service
+```
+
+새 유닛의 인계와 출력 확인을 마친 뒤 부팅 자동 시작을 활성화합니다.
+
+```sh
+sudo systemctl enable fillwire-serve.service quote-collector.service
+```
+
 ## Dagu 잡의 대체와 유지
 
 | 잡 | 전환 결론 | 근거와 종료 조건 |
@@ -125,10 +144,25 @@ sudo bash /usr/local/sbin/deploy-serve.sh fillwire-serve --rollback
 sudo bash /usr/local/sbin/deploy-serve.sh quote-collector --rollback
 ```
 
-데이터 경로를 되돌릴 때는 collector를 먼저 내리고 Python 수집이 다시 쓰는지 확인합니다.
-serve 롤백은 새 serve를 멈춰 토큰 발급과 KIS 세션이 종료된 뒤 기존 gatewayd,
-broker-edge(`kis-mock-edge`), `fillwire.service`, `fillwire-rec` 순으로 실제로 내렸던
-유닛을 복구합니다. 정지한 Dagu 잡은 해당 운영 테이블과 누락 범위를 확인한 뒤 재개합니다.
+데이터 경로를 되돌릴 때는 collector를 먼저 내리고 새 serve의 토큰 발급과 KIS 세션도
+종료됐는지 확인합니다.
+
+```sh
+sudo systemctl disable --now quote-collector.service
+sudo systemctl disable --now fillwire-serve.service
+```
+
+인계에서 실제로 비활성화한 기존 유닛만 아래 순서로 복구합니다.
+
+```sh
+sudo systemctl enable --now gatewayd.service
+sudo systemctl enable --now broker-edge.service
+sudo systemctl enable --now fillwire.service
+sudo systemctl enable --now fillwire-rec.service
+```
+
+정지한 Dagu 잡은 해당 운영 테이블과 누락 범위를 확인한 뒤 재개하고 Python 수집이
+다시 쓰는지 확인합니다.
 Toss 원장 대사는 단일 실행자를 유지합니다. 운영 설정과 Redis 소비자 라우팅도 이전
 사본으로 복원합니다.
 

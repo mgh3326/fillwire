@@ -43,3 +43,14 @@ for command, unit in [
             value = next(args, "")
             assert value and not value.startswith("-"), (flag, value)
     print(f"fillwire {command} --help matches the unit and runbook")
+
+cutover = runbook.split("## 기존 유닛 인계 순서\n", 1)[1].split("\n## ", 1)[0]
+rollback = runbook.split("## 롤백\n", 1)[1]
+assert "sudo systemctl enable fillwire-serve.service quote-collector.service\n" in cutover
+stop_collector = rollback.index("sudo systemctl disable --now quote-collector.service\n")
+stop_serve = rollback.index("sudo systemctl disable --now fillwire-serve.service\n")
+assert stop_collector < stop_serve
+for unit in ("fillwire-rec.service", "fillwire.service", "broker-edge.service", "gatewayd.service"):
+    assert f"sudo systemctl disable {unit}\n" in cutover, unit
+    assert f"sudo systemctl enable --now {unit}\n" in rollback, unit
+print("cutover and rollback document inverse systemd boot settings")

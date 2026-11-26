@@ -67,18 +67,31 @@ write_pin() {
 
 restart_and_gate() {
   systemctl restart "$unit" || return 1
-  local attempt status
-  for ((attempt=0; attempt<10; attempt++)); do
-    if systemctl is-active --quiet "$unit" &&
-      [[ $(docker container inspect --format '{{.State.Running}} {{.Config.Image}}' "$name") == "true $1" ]]; then
-      if [[ $name == quote-collector ]]; then
-        return 0
-      fi
+  local attempt status snapshot restarts stable_snapshot=
+  local samples=0
+  # Allow startup time, then require seven consecutive samples a second apart.
+  # The six-second window exceeds the units' five-second RestartSec.
+  for ((attempt=0; attempt<16; attempt++)); do
+    status=200
+    if [[ $name == fillwire-serve ]]; then
       status=$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' \
         http://127.0.0.1:8792/healthz) || status=
-      [[ $status == 200 ]] && return 0
     fi
-    if ((attempt<9)); then sleep 1; fi
+    if [[ $status == 200 ]] && systemctl is-active --quiet "$unit" &&
+      snapshot=$(docker container inspect --format '{{.State.Running}} {{.Config.Image}} {{.Id}} {{.State.StartedAt}}' "$name" 2>/dev/null) &&
+      [[ $snapshot == "true $1 "?*" "?* ]] &&
+      restarts=$(systemctl show --property=NRestarts --value "$unit") &&
+      [[ $restarts == 0 ]]; then
+      if ((samples == 0)); then
+        stable_snapshot=$snapshot
+      fi
+      [[ $snapshot == "$stable_snapshot" ]] || return 1
+      samples=$((samples + 1))
+      if ((samples == 7)); then return 0; fi
+    elif ((samples > 0)); then
+      return 1
+    fi
+    if ((attempt<15)); then sleep 1; fi
   done
   return 1
 }
@@ -93,10 +106,13 @@ if restart_and_gate "$pin"; then
 fi
 
 if [[ -z $old ]]; then
+  stop_failed=0
+  systemctl stop "$unit" || stop_failed=1
   rm -f "$current"
-  systemctl stop "$unit" || fail "first deployment failed and unit stop failed"
+  ((stop_failed == 0)) || fail "first deployment failed and unit stop failed"
   fail "first deployment failed; unit stopped"
 fi
 write_pin "$current" "$old"
+systemctl reset-failed "$unit" || true
 restart_and_gate "$old" || fail "deployment failed and recovery failed"
 fail "deployment failed; restored $old"
