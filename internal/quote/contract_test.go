@@ -38,6 +38,10 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 	if info, err := os.Stat(nhplugIssuer); err != nil || info.IsDir() {
 		t.Fatalf("NHPLUG token issuer file %s not found", nhplugIssuer)
 	}
+	kiwoomIssuer := filepath.Join(root, "internal", "kiwoomws", "oauth.go")
+	if info, err := os.Stat(kiwoomIssuer); err != nil || info.IsDir() {
+		t.Fatalf("Kiwoom mock token issuer file %s not found", kiwoomIssuer)
+	}
 	forbidden := []string{"oauth2", "/oauth", "client_secret", "client_credentials", "grant_type", "openapi.tossinvest.com", "toss_api_client"}
 	tossHosts := 0
 	scanned := 0
@@ -60,8 +64,20 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 		}
 		scanned++
 		text := strings.ToLower(string(raw))
+		if hasTossTokenEndpoint(text) {
+			t.Errorf("%s can reach the Toss token endpoint", path)
+		}
 		if path == nhplugIssuer {
 			for _, needle := range []string{"openapi.tossinvest.com", "toss_api_client"} {
+				if strings.Contains(text, needle) {
+					t.Errorf("%s contains Toss-specific marker %q", path, needle)
+				}
+			}
+		} else if path == kiwoomIssuer {
+			if !strings.Contains(text, `mockrestendpoint+"/oauth2/token"`) {
+				t.Errorf("%s no longer pins the Kiwoom mock token path to MockRESTEndpoint", path)
+			}
+			for _, needle := range []string{"openapi.tossinvest.com", "toss_api_client", "tossbaseurl"} {
 				if strings.Contains(text, needle) {
 					t.Errorf("%s contains Toss-specific marker %q", path, needle)
 				}
@@ -84,5 +100,37 @@ func TestNoFillwireCodeCanReachTheTossTokenEndpoint(t *testing.T) {
 	}
 	if tossHosts != 1 || !strings.Contains(Endpoint, "openapi-ws.tossinvest.com") {
 		t.Fatalf("tossinvest.com appears %d times in production code; want exactly the websocket Endpoint", tossHosts)
+	}
+}
+
+func hasTossTokenEndpoint(text string) bool {
+	tossBase := strings.Contains(text, "openapi.tossinvest.com") || strings.Contains(text, "tossbaseurl")
+	tokenPath := strings.Contains(text, "/oauth2/token") || strings.Contains(text, "toss_oauth_token_path")
+	return tossBase && tokenPath
+}
+
+func TestTossTokenEndpointGuardScopesOAuthPathByTossHost(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want bool
+	}{
+		{
+			name: "Toss token endpoint is caught",
+			code: `http.Post("https://openapi.tossinvest.com/oauth2/token", body)`,
+			want: true,
+		},
+		{
+			name: "Kiwoom mock token endpoint is allowed",
+			code: `http.Post(MockRESTEndpoint+"/oauth2/token", body)`,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasTossTokenEndpoint(strings.ToLower(tt.code)); got != tt.want {
+				t.Fatalf("hasTossTokenEndpoint(%q) = %v, want %v", tt.code, got, tt.want)
+			}
+		})
 	}
 }

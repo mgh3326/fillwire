@@ -1,4 +1,4 @@
-package main
+package execupbitcmd
 
 import (
 	"bytes"
@@ -11,14 +11,14 @@ import (
 func runArgs(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(args, &stdout, &stderr)
+	code := Run(args, &stdout, &stderr)
 	return code, stdout.String(), stderr.String()
 }
 
 // TestDryRunReplayGolden pins the whole recorded sequence: book lines,
 // child requests, the expiry cancel and the finish.
 func TestDryRunReplayGolden(t *testing.T) {
-	const dir = "testdata"
+	const dir = "../../cmd/execupbit/testdata"
 	golden, err := os.ReadFile(filepath.Join(dir, "dry-run.golden.jsonl"))
 	if err != nil {
 		t.Fatal(err)
@@ -51,13 +51,13 @@ func TestShadowOnlyModes(t *testing.T) {
 		code   int
 		stderr string
 	}{
-		{"no dry-run", []string{"-intent", "testdata/intent.json", "-books", "testdata/books.jsonl"}, 2, "shadow only"},
-		{"send flag", []string{"-dry-run", "-send", "-intent", "testdata/intent.json", "-books", "testdata/books.jsonl"}, 2, "flag provided but not defined: -send"},
-		{"no intent", []string{"-dry-run", "-books", "testdata/books.jsonl"}, 2, "usage:"},
-		{"two sources", []string{"-dry-run", "-intent", "testdata/intent.json", "-books", "testdata/books.jsonl", "-live"}, 2, "usage:"},
-		{"no source", []string{"-dry-run", "-intent", "testdata/intent.json"}, 2, "usage:"},
-		{"live without root", []string{"-dry-run", "-intent", "testdata/intent.json", "-live"}, 2, "-live needs -root"},
-		{"zero stale", []string{"-dry-run", "-intent", "testdata/intent.json", "-books", "testdata/books.jsonl", "-stale", "0s"}, 2, "usage:"},
+		{"no dry-run", []string{"-intent", "../../cmd/execupbit/testdata/intent.json", "-books", "../../cmd/execupbit/testdata/books.jsonl"}, 2, "shadow only"},
+		{"send flag", []string{"-dry-run", "-send", "-intent", "../../cmd/execupbit/testdata/intent.json", "-books", "../../cmd/execupbit/testdata/books.jsonl"}, 2, "flag provided but not defined: -send"},
+		{"no intent", []string{"-dry-run", "-books", "../../cmd/execupbit/testdata/books.jsonl"}, 2, "usage:"},
+		{"two sources", []string{"-dry-run", "-intent", "../../cmd/execupbit/testdata/intent.json", "-books", "../../cmd/execupbit/testdata/books.jsonl", "-live"}, 2, "usage:"},
+		{"no source", []string{"-dry-run", "-intent", "../../cmd/execupbit/testdata/intent.json"}, 2, "usage:"},
+		{"live without root", []string{"-dry-run", "-intent", "../../cmd/execupbit/testdata/intent.json", "-live"}, 2, "-live needs -root"},
+		{"zero stale", []string{"-dry-run", "-intent", "../../cmd/execupbit/testdata/intent.json", "-books", "../../cmd/execupbit/testdata/books.jsonl", "-stale", "0s"}, 2, "usage:"},
 	}
 	for _, c := range cases {
 		code, stdout, stderr := runArgs(t, c.args...)
@@ -75,14 +75,14 @@ func TestInvalidIntentFails(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"schema_version":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	code, _, stderr := runArgs(t, "-dry-run", "-intent", path, "-books", "testdata/books.jsonl")
+	code, _, stderr := runArgs(t, "-dry-run", "-intent", path, "-books", "../../cmd/execupbit/testdata/books.jsonl")
 	if code != 1 || !strings.Contains(stderr, "invalid intent") {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}
 }
 
 func TestUnreadableBookFileFails(t *testing.T) {
-	code, _, stderr := runArgs(t, "-dry-run", "-intent", "testdata/intent.json", "-books", filepath.Join(t.TempDir(), "absent.jsonl"))
+	code, _, stderr := runArgs(t, "-dry-run", "-intent", "../../cmd/execupbit/testdata/intent.json", "-books", filepath.Join(t.TempDir(), "absent.jsonl"))
 	if code != 1 || stderr == "" {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}

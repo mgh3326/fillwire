@@ -118,10 +118,45 @@ symbol = "005930"
 access_token_env = "KIS_MOCK_ACCESS_TOKEN"
 access_token_source = "" # "" with access_token_env, or "redis"
 
+# Binance Spot Demo market and user streams. Disabled unless enabled = true.
+# Frames are appended to date-partitioned JSONL recordings; fills are never
+# sent to the execution ledger. User stream credentials are read only when
+# enabled and user_stream is true (default), from the documented environment
+# names; values are never logged.
+[binance_demo]
+enabled = false
+symbols = ["BTCUSDT"]
+directory = "/var/lib/fillwire/recordings"
+user_stream = true
+
 # Toss/KIS 시세 레인의 장기 JSONL 기록. 기본 비활성화.
 [recording]
 enabled = false
 directory = "/var/lib/fillwire/recordings"
+
+# fillwire serve의 토스 개인 주문과 선택 시세 프레임은 연결을 공유하며 기본 비활성화입니다.
+[toss_ws]
+enabled = false
+account_seq = ""
+directory = "/var/lib/fillwire/recordings"
+symbols_file = "" # 선택 사항: 줄마다 "<kr|us> <code>", 최대 40개
+
+# 키움 모의 웹소켓 기록기. 계정별로 따로 실행합니다:
+# fillwire kiwoom-kr 또는 fillwire kiwoom-us
+[kiwoom_mock_kr]
+enabled = false
+symbols = []
+directory = "/var/lib/fillwire/recordings"
+app_key_env = "KIWOOM_MOCK_APP_KEY"
+app_secret_env = "KIWOOM_MOCK_APP_SECRET"
+
+[kiwoom_mock_us]
+enabled = false
+# symbols = [{ code = "NVDA", exchange = "ND" }]
+symbols = []
+directory = "/var/lib/fillwire/recordings"
+app_key_env = "KIWOOM_MOCK_US_APP_KEY"
+app_secret_env = "KIWOOM_MOCK_US_APP_SECRET"
 
 # Upbit 공개 호가 및 체결 기록기. API 키와 비공개 웹소켓을 사용하지 않습니다.
 [upbit]
@@ -170,7 +205,7 @@ access_token_source = "" # "" with access_token_env, or "redis"
 [kis_mock_ws]
 enabled = false
 symbols = [] # 예: ["005930", "000660"]
-futures_notice_tr_id = "H0IFCNI0" # 첫 모의 세션에서 확인 필요; H0IFCNI9로 전환 가능
+futures_notice_tr_id = "H0IFCNI9" # 첫 모의 세션에서 확인 필요; H0IFCNI0로 전환 가능
 recording_directory = "/var/lib/fillwire/recordings"
 subscribe_pace = "500ms"
 

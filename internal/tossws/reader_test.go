@@ -12,12 +12,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/recording"
 	"github.com/mgh3326/fillwire/internal/tokenfetch"
 )
@@ -150,6 +152,274 @@ func TestFakeServerRecordsDocumentedOrder(t *testing.T) {
 	}
 	if reader.malformed.Load() != 2 || strings.Contains(logs.String(), fakeToken) || bytes.Contains(file, []byte("synthetic-toss-ws")) {
 		t.Fatal("malformed frames or credential handling incorrect")
+	}
+}
+
+func TestDeclarationIncludesOrdersAndConfiguredQuoteChannels(t *testing.T) {
+	declaration, topics, err := buildDeclaration("request-1", "3", []quote.Symbol{
+		{Market: quote.MarketKR, Code: "005930"},
+		{Market: quote.MarketUS, Code: "AAPL"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"id":"request-1"},{"codes":["3"],"type":"personal:order"},{"codes":["005930"],"type":"trade:kr"},{"codes":["005930"],"type":"orderbook:kr"},{"codes":["AAPL"],"type":"trade:us"},{"codes":["AAPL"],"type":"orderbook:us"}]`
+	if string(declaration) != want {
+		t.Fatalf("declaration = %s, want %s", declaration, want)
+	}
+	if strings.Join(topics, ",") != "personal:order:3,trade:kr:005930,orderbook:kr:005930,trade:us:AAPL,orderbook:us:AAPL" {
+		t.Fatalf("topics = %v", topics)
+	}
+}
+
+func TestDeclarationRejectsMoreThan100Subscriptions(t *testing.T) {
+	symbols := make([]quote.Symbol, 50)
+	for index := range symbols {
+		symbols[index] = quote.Symbol{Market: quote.MarketKR, Code: fmt.Sprintf("%06d", index+1)}
+	}
+	if _, _, err := buildDeclaration("request-1", "3", symbols); err == nil {
+		t.Fatal("declaration with 101 subscriptions was accepted")
+	}
+}
+
+func TestReaderRecordsDocumentedQuoteFramesAndCountsMalformed(t *testing.T) {
+	trade := fixture(t, "trade-us-asyncapi-example.json")
+	book := fixture(t, "orderbook-kr-asyncapi-example.json")
+	var cancel context.CancelFunc
+	ctx, stop := context.WithCancel(context.Background())
+	cancel = stop
+	frames := make(chan []byte, 6)
+	var declaration []byte
+	var records []Record
+	var recordsMu sync.Mutex
+	var reader *Reader
+	before := time.Now()
+	reader, err := New(Config{
+		AccountSeq: "3", Tokens: testTokens{},
+		Symbols: []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}, {Market: quote.MarketUS, Code: "AAPL"}},
+		Append: func(record Record) error {
+			recordsMu.Lock()
+			records = append(records, record)
+			if (record.Kind == "trade" || record.Kind == "orderbook") && !reader.Health() {
+				t.Error("reader was unhealthy after subscription acknowledgement")
+			}
+			recordsMu.Unlock()
+			if record.Kind == "trade" {
+				cancel()
+			}
+			return nil
+		},
+		Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+			return fakeSocket{
+				write: func(raw []byte) error {
+					declaration = append([]byte(nil), raw...)
+					_, topics, err := buildDeclaration(requestID(raw), "3", []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}, {Market: quote.MarketUS, Code: "AAPL"}})
+					if err != nil {
+						return err
+					}
+					ack, _ := json.Marshal(map[string]any{"type": "subscriptions", "id": requestID(raw), "subscribed": topics, "rejected": []any{}})
+					frames <- ack
+					frames <- book
+					frames <- []byte(`{"type":"message","topic":"orderbook:kr:005930","data":{}}`)
+					frames <- []byte(`{"type":"message","topic":"orderbook:kr:005930","data":{"timestamp":"garbage","asks":[],"bids":[]}}`)
+					frames <- []byte(`{"type":"message","topic":"trade:kr:005930","data":{"price":4}} trailing`)
+					frames <- trade
+					return nil
+				},
+				read: func(ctx context.Context) ([]byte, error) {
+					select {
+					case raw := <-frames:
+						return raw, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+				close: func() {},
+			}, 0, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v", err)
+	}
+	if reader.Health() {
+		t.Fatal("reader remained healthy after its connection closed")
+	}
+	receivedAfter := time.Now()
+	if !bytes.Contains(declaration, []byte(`"type":"personal:order"`)) ||
+		!bytes.Contains(declaration, []byte(`"type":"trade:us"`)) ||
+		!bytes.Contains(declaration, []byte(`"type":"orderbook:kr"`)) {
+		t.Fatalf("declaration missing a channel: %s", declaration)
+	}
+	recordsMu.Lock()
+	defer recordsMu.Unlock()
+	var quoteRecords []Record
+	for _, record := range records {
+		if record.Kind == "trade" || record.Kind == "orderbook" {
+			quoteRecords = append(quoteRecords, record)
+		}
+	}
+	if len(quoteRecords) != 2 || quoteRecords[0].Kind != "orderbook" || quoteRecords[1].Kind != "trade" ||
+		!bytes.Equal(bytes.TrimSpace(quoteRecords[0].Raw), bytes.TrimSpace(book)) || !bytes.Equal(bytes.TrimSpace(quoteRecords[1].Raw), bytes.TrimSpace(trade)) {
+		t.Fatalf("quote records = %+v", quoteRecords)
+	}
+	for _, record := range quoteRecords {
+		if record.ReceivedAt.Before(before) || record.ReceivedAt.After(receivedAfter) || record.Topic == "" || record.SessionID == "" {
+			t.Fatalf("quote record missing receipt metadata: %+v", record)
+		}
+	}
+	if reader.malformed.Load() != 3 {
+		t.Fatalf("malformed count = %d, want 3", reader.malformed.Load())
+	}
+}
+
+func TestPartialQuoteRejectionKeepsPersonalOrderRecording(t *testing.T) {
+	order := fixture(t, "order.json")
+	trade := fixture(t, "trade-us-asyncapi-example.json")
+	var id string
+	var records []Record
+	var recordsMu sync.Mutex
+	var logs bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, err := New(Config{
+		AccountSeq: "3", Tokens: testTokens{}, Symbols: []quote.Symbol{{Market: quote.MarketUS, Code: "AAPL"}},
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		Append: func(record Record) error {
+			recordsMu.Lock()
+			records = append(records, record)
+			recordsMu.Unlock()
+			if record.Kind == "order" {
+				cancel()
+			}
+			return nil
+		},
+		Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+			frames := make(chan []byte, 3)
+			return fakeSocket{
+				write: func(raw []byte) error {
+					id = requestID(raw)
+					ack := fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3","trade:us:AAPL"],"rejected":[{"target":"orderbook:us:AAPL","code":"stock-not-found"}]}`, id)
+					frames <- ack
+					frames <- trade
+					frames <- order
+					return nil
+				},
+				read: func(ctx context.Context) ([]byte, error) {
+					select {
+					case frame := <-frames:
+						return frame, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+				close: func() {},
+			}, 0, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context cancellation after order record", err)
+	}
+	recordsMu.Lock()
+	defer recordsMu.Unlock()
+	var orderCount, quoteCount int
+	for _, record := range records {
+		switch record.Kind {
+		case "order":
+			orderCount++
+		case "trade":
+			quoteCount++
+		}
+	}
+	if orderCount != 1 || quoteCount != 1 {
+		t.Fatalf("records=%+v", records)
+	}
+	if !strings.Contains(logs.String(), "rejected_quotes=1") || !strings.Contains(logs.String(), "orderbook:us:AAPL") {
+		t.Fatalf("rejected quote target was not counted and logged: %s", logs.String())
+	}
+}
+
+func TestSlowQuoteRecorderDoesNotBlockOrderFrames(t *testing.T) {
+	order := fixture(t, "order.json")
+	trade := fixture(t, "trade-us-asyncapi-example.json")
+	var id string
+	quoteStarted := make(chan struct{})
+	releaseQuote := make(chan struct{})
+	orderRecorded := make(chan struct{})
+	var releaseOnce sync.Once
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, err := New(Config{
+		AccountSeq: "3", Tokens: testTokens{}, Symbols: []quote.Symbol{{Market: quote.MarketUS, Code: "AAPL"}},
+		Append: func(record Record) error {
+			if record.Kind == "trade" {
+				close(quoteStarted)
+				<-releaseQuote
+			}
+			if record.Kind == "order" {
+				close(orderRecorded)
+				releaseOnce.Do(func() { close(releaseQuote) })
+				cancel()
+			}
+			return nil
+		},
+		Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+			frames := make(chan []byte, 3)
+			return fakeSocket{
+				write: func(raw []byte) error {
+					id = requestID(raw)
+					ack := fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3","trade:us:AAPL","orderbook:us:AAPL"],"rejected":[]}`, id)
+					frames <- ack
+					frames <- trade
+					frames <- order
+					return nil
+				},
+				read: func(ctx context.Context) ([]byte, error) {
+					select {
+					case frame := <-frames:
+						return frame, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+				close: func() {},
+			}, 0, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- reader.Run(ctx) }()
+	select {
+	case <-quoteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("quote recorder did not start")
+	}
+	select {
+	case <-orderRecorded:
+	case <-time.After(time.Second):
+		cancel()
+		releaseOnce.Do(func() { close(releaseQuote) })
+		t.Fatal("slow quote recorder blocked the order frame")
+	}
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context cancellation", err)
+	}
+}
+
+func TestReaderRejectsMoreThan100Subscriptions(t *testing.T) {
+	symbols := make([]quote.Symbol, 50)
+	for i := range symbols {
+		symbols[i] = quote.Symbol{Market: quote.MarketKR, Code: fmt.Sprintf("%06d", i)}
+	}
+	if _, err := New(Config{AccountSeq: "3", Tokens: testTokens{}, Append: func(Record) error { return nil }, Symbols: symbols}); err == nil {
+		t.Fatal("configuration with 101 subscriptions was accepted")
 	}
 }
 

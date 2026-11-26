@@ -13,8 +13,9 @@ import (
 // deliberate review decision: it is how order code or a broker client could
 // enter this binary.
 var allowedDeps = map[string]bool{
-	"github.com/mgh3326/fillwire/cmd/bookrec":   true,
-	"github.com/mgh3326/fillwire/internal/book": true,
+	"github.com/mgh3326/fillwire/cmd/bookrec":         true,
+	"github.com/mgh3326/fillwire/internal/bookreccmd": true,
+	"github.com/mgh3326/fillwire/internal/book":       true,
 	// kst is a single time.FixedZone constant; it imports only "time".
 	"github.com/mgh3326/fillwire/internal/kst": true,
 }
@@ -73,7 +74,7 @@ func TestBinaryHasNoOrderCode(t *testing.T) {
 
 	symbols := string(goTool(t, "tool", "nm", binary))
 	// Positive controls: the scan sees this binary's own code and literals.
-	for _, want := range []string{"main.run", "internal/book.Replay"} {
+	for _, want := range []string{"internal/bookreccmd.Run", "internal/book.Replay"} {
 		if !strings.Contains(symbols, want) {
 			t.Fatalf("symbol table lacks %s; the scan would pass vacuously", want)
 		}

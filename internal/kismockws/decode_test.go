@@ -64,7 +64,7 @@ func TestMockNoticesDecodeAndRecord(t *testing.T) {
 	}{
 		{TROverseasNotice, overseasRecordingName, 25},
 		{TRFuturesNotice, futuresRecordingName, 22},
-		{TRFuturesNoticeLegacy, futuresRecordingName, 22},
+		{TRFuturesNoticeAlt, futuresRecordingName, 22},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tr, func(t *testing.T) {
@@ -118,7 +118,7 @@ func TestDecodeNoticeDropsMalformedFrames(t *testing.T) {
 }
 
 func TestDecodeNoticesSplitsFlattenedRows(t *testing.T) {
-	for _, tr := range []string{TRFuturesNotice, TRFuturesNoticeLegacy} {
+	for _, tr := range []string{TRFuturesNotice, TRFuturesNoticeAlt} {
 		t.Run(tr, func(t *testing.T) {
 			fields := make([]string, 44)
 			fields[12], fields[34] = "2", "2"

@@ -2,8 +2,9 @@
 
 Fillwire listens to broker execution feeds, persists decoded fills to Redis Streams, and delivers them through independent consumer groups.
 
-It is a runtime, not a broker client: protocol code lives in separate libraries (for example, `go-kis`). `fillwire` never places orders: it listens, persists, and delivers. The separate
-operator command [`execmock`](docs/e3a-mock-runbook.md) can send approved KIS mock
+Protocol code lives in libraries such as `go-kis`. The `fillwire run` and
+`fillwire serve` runtimes listen, persist, and deliver. The operator command
+[`fillwire execmock`](docs/e3a-mock-runbook.md) can send approved KIS mock
 intents, with sending off by default.
 
 ## Scope
@@ -30,6 +31,50 @@ startup: XAUTOCLAIM pending entries before ordinary XREADGROUP
 On shutdown, fillwire stops the socket reader first, then gives already received events a bounded `drain_timeout` window to pass through decode and `XADD`. The drain uses a separate background-rooted context rather than the canceled signal context. If the window expires, the remaining in-memory entries are logged and counted before exit.
 
 Fillwire does not implement restart handoff, a local checkpoint database, an HTTP metrics endpoint, heartbeat reporting, parallel consumers, broker orders, amendments, or cancellations. Those are outside this PR.
+
+## 통합 CLI와 상주 서버
+
+`go build -o fillwire ./cmd/fillwire`로 빌드합니다. `fillwire <명령> --help`에서
+명령별 사용법을 확인할 수 있습니다. 기존 `fillwire -config FILE` 실행은
+`fillwire run -config FILE`과 같습니다. 각 명령의 독립 실행 파일도 빌드할 수 있습니다.
+
+`fillwire serve -config FILE`는 하나의 TOML 파일로 상주 서버와 모듈을 설정합니다.
+아래 표의 각 모듈은 `enabled = true`를 지정하면 실행됩니다.
+
+| 설정 표 | 기능 |
+|---|---|
+| `[gatewayd]` | 토큰 발급 및 조회 HTTP 서버. `providers`는 기존 CLI와 같은 쉼표 구분 목록이며 기본값은 `kis-mock`입니다. `ensure_interval`을 생략하면 요청 시에만 토큰을 발급합니다. `listen`과 `[redis].url`을 생략하면 각각 `GATEWAYD_LISTEN_ADDR`와 `REDIS_URL`을 사용합니다. 공급자 및 조회 인증은 기존 gatewayd 환경 변수를 사용합니다. |
+| `[kis_fills]` | KIS 체결 기록과 ingest. `[kis]`, `[redis]`, `[stream]`, `[ingest]`, `[channel]`, `[retry]`를 사용합니다. |
+| `[kis_quotes]` 또는 `[books]` | KIS 승격 종목 체결·호가 또는 고정 종목 호가. `[recording]`을 활성화하면 고정 종목 KIS 호가도 JSONL로 기록합니다. `fillwire bookrec`는 표준 입력 기록과 파일 재생을 제공합니다. |
+| `[kis_futures]` | KIS 지수선물 웹소켓 분봉. live 세션에서만 동작합니다. |
+| `[upbit]` | Upbit 공개 호가·체결 웹소켓 기록. |
+| `[toss_ws]` | Toss `personal:order` 그림자 기록. |
+| `[upbit_fills]` | Upbit 개인 체결 그림자 기록. |
+| `[alpaca]` | Alpaca paper 체결 및 IEX 시세 기록. |
+| `[binance_demo]` | Binance Spot Demo 시장·사용자 스트림 기록. |
+| `[quotes]` | 기존 Toss 해외 종목 시세 피드. |
+
+KIS 체결·호가·선물은 `[kis]`에 설정한 웹소켓 세션을 공유합니다. 호가 또는 선물만
+활성화할 때는 체결 구독과 ingest 설정이 필요 없습니다. 선물을 함께 활성화하면
+승격 호가의 등록 상한에서 선물 슬롯을 먼저 확보합니다. 서비스 모듈은 읽기와 기록을
+담당하며 gatewayd는 토큰을 발급합니다. 주문 실행 명령은 CLI에서 별도로 실행합니다.
+
+```toml
+[serve]
+health_listen = "127.0.0.1:8792"
+
+[kis_fills]
+enabled = true
+```
+
+`GET /healthz`에는 모듈별 `state`와 `restarts`가 표시됩니다. 활성 모듈이 모두 실행
+중이면 HTTP 200입니다. 활성 모듈이 시작 중이거나 재시작 대기 중이거나
+`failed` 상태이면 HTTP 503입니다. KIS 세션 점유와 cache-only 승인키의 영구 실패,
+Toss 개인 스트림의 인증 중단은 재시도하지 않습니다. gatewayd는 별도 리스너에서
+기존 `GET /healthz`를 제공합니다.
+`kis_session`은 KIS 모듈이 사용하는 공유 세션입니다. 실행 상태는 프로세스 내부의
+모듈 상태를 나타냅니다. 시세 신선도와 업스트림 API 가용성은 기존 모듈 로그를 확인합니다.
+모듈이 종료되면 해당 모듈을 1초부터 최대 1분까지 지수 백오프로 다시 시작합니다.
 
 ## Configuration
 
@@ -247,6 +292,24 @@ list of at most 40 symbols. It appends every tick to the Redis Stream
 the execution ledger. It is off unless `[quotes] enabled = true`. The KIS
 websocket stays dedicated to `fills:kis`; the quote reader never uses KIS.
 
+### Toss 개인 주문과 시세 프레임을 같은 연결에 기록
+
+`[toss_ws]`는 개인 주문용 웹소켓 연결 하나에 선택한 Toss 체결(`trade`)과
+호가(`orderbook`) 구독도 함께 선언합니다. `symbols_file`은 `kr 005930`처럼
+시장과 코드를 한 줄에 하나씩 적으며 최대 40개를 받습니다. 설정은 기본
+비활성화입니다. 개인 주문 구독 1개와 시세 구독 심볼당 2개를 합쳐 Toss의
+연결당 100개 한도를 넘으면 설정을 거부합니다.
+`fillwire serve`에서 `[toss_ws] enabled = true`로 켜며, 개인 주문과 시세
+구독은 같은 Toss 연결을 사용합니다.
+
+주문 프레임은 `directory/toss-order/<UTC 날짜>/<account_seq>.jsonl`에,
+시세 프레임은 `directory/toss-quote/<UTC 날짜>/<account_seq>.jsonl`에
+`received_at`(로컬 수신 시각), `kind`, `topic`, 세션 ID, 원본 JSON과 함께
+추가됩니다. 시세 기록은 별도 bounded queue와 기록기를 사용해 날짜 압축이
+주문 프레임 수신을 막지 않게 합니다. 구문이 잘못됐거나 구독 심볼과 맞지 않는
+프레임은 버리고 malformed 카운터를 올립니다. 이 기능은 Redis 시세 스트림이나
+원장에 쓰지 않고 주문도 내지 않습니다.
+
 Protocol source: the Toss Open API realtime AsyncAPI document, version 1.2.2
 (`https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json`). The
 test fixtures in `internal/quote/testdata` follow it, and some are its own
@@ -257,13 +320,14 @@ examples.
 Toss allows **two websocket connections per account**. When a third opens,
 Toss accepts it and closes the oldest one without a close code. So:
 
-- fillwire's quote reader is the only Toss websocket client and uses exactly
-  one connection. The second connection is a spare.
+- `[quotes]` uses one quote-reader connection. `[toss_ws]` uses one connection
+  for `personal:order` and its optional trade/orderbook frames. If both are
+  enabled, they use the two connections Toss allows; the order and quote
+  channels in `[toss_ws]` do not open another connection.
 - **auto_trader never opens the Toss websocket.** Any other client that needs
-  it must be agreed first, because two more connections would evict fillwire's.
-- fillwire enforces the one connection in process: its dialer refuses a second
-  dial while a connection is open, and every reconnect closes the old
-  connection before dialing (break before make).
+  it must be agreed first, because a third connection would evict the oldest.
+- Each fillwire reader reconnects by closing its previous connection before
+  dialing again (break before make).
 
 ### Access token: read-only, never issued (Redis source)
 
@@ -972,9 +1036,9 @@ Authentication is a dedicated ingest token sent verbatim — no `Bearer` prefix 
 
 ## KIS mock websocket recorder
 
-`[kis_mock_ws]` is disabled by default. Enable it, set domestic `symbols` and `recording_directory`, and set `[kis].endpoint = "mock"` and `account_mode = "mock"`. Set `app_key_env = "KIS_MOCK_APP_KEY"` and `app_secret_env = "KIS_MOCK_APP_SECRET"` for the auto_trader mock credential names. Run `fillwire kis-mock-ws`; it refuses non-mock settings before dialing. It records domestic `H0STCNT0`/`H0STASP0`, overseas `H0GSCNI9`, and futures/options notices in `internal/recording`. The VTS futures notice TR defaults to `H0IFCNI0`, following the current official `fuopt_ccnl_notice` sample; confirm this default in the first mock session. Set `[kis_mock_ws].futures_notice_tr_id = "H0IFCNI9"` to switch to the legacy mock label. Frames under either ID are decoded and recorded. The session allows at most 41 registrations, matching fillwire's existing conservative setting; the exact KIS limit remains unverified. Until the shared serve registry is available, the command is the standalone wiring; registry integration is one `kismockws.New(config)` entry under `kis_mock_ws`.
+`[kis_mock_ws]` is disabled by default. Enable it, set domestic `symbols` and `recording_directory`, and set `[kis].endpoint = "mock"` and `account_mode = "mock"`. Set `app_key_env = "KIS_MOCK_APP_KEY"` and `app_secret_env = "KIS_MOCK_APP_SECRET"` for the auto_trader mock credential names. Run `fillwire kis-mock-ws`; it refuses non-mock settings before dialing. It records domestic `H0STCNT0`/`H0STASP0`, overseas `H0GSCNI9`, and futures/options notices in `internal/recording`. The VTS futures notice TR defaults to `H0IFCNI9`, matching the KIS mock-notice pattern and legacy mock label; this default is unverified until the first mock session. Set `[kis_mock_ws].futures_notice_tr_id = "H0IFCNI0"` to switch to the current official sample's ID. Frames under either ID are decoded and recorded. The session allows at most 41 registrations, matching fillwire's existing conservative setting; the exact KIS limit remains unverified. The command remains available as `fillwire kis-mock-ws` alongside the shared `serve` registry.
 
-`[kis_mock_ws]`는 기본적으로 꺼져 있습니다. 활성화하고 국내 `symbols`, `recording_directory`를 설정한 뒤 `[kis].endpoint = "mock"`, `account_mode = "mock"`로 맞춥니다. auto_trader 모의 환경변수 이름은 `app_key_env = "KIS_MOCK_APP_KEY"`, `app_secret_env = "KIS_MOCK_APP_SECRET"`입니다. `fillwire kis-mock-ws`로 실행하며 연결 전에 모의 설정이 아닌 경우 거부합니다. 국내 `H0STCNT0`/`H0STASP0`, 해외 `H0GSCNI9`, 선물옵션 통보를 `internal/recording`에 기록합니다. VTS 선물옵션 통보 TR 기본값은 최신 공식 `fuopt_ccnl_notice` 샘플을 따르는 `H0IFCNI0`이며, 첫 모의 세션에서 확인해야 합니다. 레거시 모의 라벨로 전환하려면 `[kis_mock_ws].futures_notice_tr_id = "H0IFCNI9"`로 설정합니다. 두 ID의 프레임을 모두 디코딩하고 기록합니다. 주문 또는 ledger ingest 경로는 사용하지 않습니다. 세션 등록은 fillwire의 기존 보수적 설정인 최대 41건이며, KIS 공식 한도는 확인되지 않았습니다. 공용 serve registry가 준비될 때까지 이 명령이 독립 실행 wiring이며, 이후 `kis_mock_ws` 설정에 `kismockws.New(config)` 한 줄로 연결합니다.
+`[kis_mock_ws]`는 기본적으로 꺼져 있습니다. 활성화하고 국내 `symbols`, `recording_directory`를 설정한 뒤 `[kis].endpoint = "mock"`, `account_mode = "mock"`로 맞춥니다. auto_trader 모의 환경변수 이름은 `app_key_env = "KIS_MOCK_APP_KEY"`, `app_secret_env = "KIS_MOCK_APP_SECRET"`입니다. `fillwire kis-mock-ws`로 실행하며 연결 전에 모의 설정이 아닌 경우 거부합니다. 국내 `H0STCNT0`/`H0STASP0`, 해외 `H0GSCNI9`, 선물옵션 통보를 `internal/recording`에 기록합니다. VTS 선물옵션 통보 TR 기본값은 KIS 모의 통보 패턴 및 레거시 모의 라벨과 일치하는 `H0IFCNI9`이며, 첫 모의 세션 전까지 검증되지 않았습니다. 현재 공식 샘플의 ID로 전환하려면 `[kis_mock_ws].futures_notice_tr_id = "H0IFCNI0"`로 설정합니다. 두 ID의 프레임을 모두 디코딩하고 기록합니다. 주문 또는 ledger ingest 경로는 사용하지 않습니다. 세션 등록은 fillwire의 기존 보수적 설정인 최대 41건이며, KIS 공식 한도는 확인되지 않았습니다. 공용 `serve` registry와 함께 `fillwire kis-mock-ws` 명령도 계속 사용할 수 있습니다.
 
 The KIS raw websocket frame is not forwarded. `raw_payload_json` is a reparsable structured object containing `tr`, decrypted `fields`, and `received_at`, plus duplicate-hint metadata when applicable. It contains no approval key or ingest credential.
 
@@ -1049,6 +1113,25 @@ Upbit 기록기를 단독으로 실행해 확인하려면 다음 명령을 사�
 fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fillwire/recordings
 ```
 
+## 키움 모의 웹소켓 기록기 (기본 비활성화)
+
+`[kiwoom_mock_kr]`와 `[kiwoom_mock_us]`는 서로 다른 모의 계정 reader입니다. 설정한 국내·미국 종목 수의 합은 최대 200개이며, 제한을 넘으면 접속 전에 설정을 거부합니다. 미국 심볼은 Kiwoom 거래소 코드 `ND`(NASDAQ), `NY`(NYSE), `NA`(AMEX)를 각각 지정합니다. 각 reader는 해당 계정 전용 `KIWOOM_MOCK_*` 환경 변수 이름만 설정에서 읽고, 모의 OAuth에서 받은 토큰으로만 `wss://mockapi.kiwoom.com:10000/api/websocket`에 로그인합니다. 라이브 호스트는 dial 전에 거부합니다.
+
+미국 심볼 설정 예시:
+
+```toml
+[kiwoom_mock_us]
+symbols = [{ code = "NVDA", exchange = "ND" }, { code = "IBM", exchange = "NY" }]
+```
+
+```sh
+fillwire kiwoom-kr --config /etc/fillwire/fillwire.toml
+fillwire kiwoom-us --config /etc/fillwire/fillwire.toml
+```
+
+국내 심볼은 `0B`, `0D`, `0H`, `1h`를 구독하고, 미국 심볼은 `FE`, `FT`를 구독합니다. 같은 세션에서 국내 계좌는 `00`, `04`, 미국 계좌는 `F4`, `F5` 계좌 스트림을 받습니다. 받은 프레임은 `<directory>/kiwoom-kr/` 또는 `kiwoom-us/` 아래 UTC 날짜별 JSONL 기록에 `received_at`과 함께 추가합니다. 기록기에는 원장 ingest나 주문 경로가 없습니다.
+
+프로토콜 근거: 키움 공식 [OAuth 접근토큰 발급(au10001)](https://openapi.kiwoom.com/guide/apiGuideContents/a1/au10001), [국내 주식체결(0B)](https://openapi.kiwoom.com/guide/apiGuideContents/14/0B), [미국 10호가(FE)](https://openapi.kiwoom.com/guide/apiGuideContents/14/FE), [미국 실시간 TR 목록(F4/F5/FE/FT 포함)](https://openapi.kiwoom.com/m/guide/apiguide), [웹소켓 연결 및 LOGIN 안내](https://openapi.kiwoom.com/m/guide/index), [주문체결(00)의 공통 등록 형식 및 200종목 한도](https://openapi.kiwoom.com/m/guide/apiguide/14/00).
 ## Alpaca paper 스트림 기록기 (기본 비활성화)
 
 `[alpaca] enabled = true`와 `symbols` 종목 목록 및 `directory`를 설정하면 `fillwire alpaca --config fillwire.toml`이 Alpaca paper 계정의 `trade_updates`와 IEX의 주식 trade/quote/minute bar 프레임을 UTC 날짜별 JSONL 파일에 기록합니다. 명령은 paper 거래 스트림 `wss://paper-api.alpaca.markets/stream`에만 연결하며 라이브 거래 스트림 호스트는 다이얼 전에 거부합니다. 구독 전에 API 인증을 수행합니다. 주문 제출이나 ledger ingest를 호출하지 않습니다.
@@ -1056,6 +1139,10 @@ fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fil
 키 값은 설정 파일에 넣지 않습니다. 프로세스는 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `ALPACA_DATA_API_KEY_ID`, `ALPACA_DATA_API_SECRET_KEY` 환경 변수에서 읽습니다. 기본 IEX feed는 무료 market-data plan에서 제공되는 feed입니다. 연결이 끊기면 재시도하며, 형식이 잘못된 프레임은 버립니다. 기록은 `<directory>/alpaca-trade-updates/<UTC 날짜>/trade_updates.jsonl` 및 `<directory>/alpaca-iex/<UTC 날짜>/market_data.jsonl`에 추가됩니다.
 
 Trading stream의 인증, `trade_updates` 구독 및 fill 이벤트 형식은 [Alpaca WebSocket Streaming 문서](https://docs.alpaca.markets/us/docs/websocket-streaming)를 따릅니다. IEX endpoint와 trades/quotes/bars 구독 형식은 [Alpaca Market Data WebSocket 문서](https://docs.alpaca.markets/us/docs/streaming-market-data) 및 [market data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq)를 따릅니다.
+
+## Binance Spot Demo 스트림 기록기 (기본 비활성화)
+
+`[binance_demo] enabled = true`와 `symbols`, `directory`를 설정하면 `fillwire serve`가 Spot Demo 시장 스트림과 서명된 사용자 스트림을 기록합니다. `user_stream`은 기본적으로 켜져 있으며, `false`로 설정하면 시장 스트림만 기록합니다. 사용자 스트림 키는 `BINANCE_SPOT_DEMO_API_KEY`와 `BINANCE_SPOT_DEMO_API_SECRET` 환경 변수에서 읽습니다(각각 `BINANCE_DEMO_API_KEY`와 `BINANCE_DEMO_API_SECRET`을 대체 이름으로 사용할 수 있습니다). 키 값은 설정이나 로그에 기록하지 않습니다. 시장·사용자 프레임은 `received_at`과 함께 JSONL에 추가되며, 거부된 사용자 구독도 기록합니다. 사용자 구독이 거부되어도 시장 스트림은 계속됩니다. 이 모듈은 demo 전용 호스트만 다이얼하고 주문 또는 ledger ingest를 수행하지 않습니다. 단독 실행은 `fillwire binance-demo --symbols BTCUSDT --record-dir /var/lib/fillwire/recordings`입니다.
 
 ## 재연결 reconcile 트리거 (기본 비활성화)
 

@@ -18,24 +18,9 @@ import (
 )
 
 type fileConfig struct {
-	Books bookSettings `toml:"books"`
-	KIS   struct {
-		Broker        string           `toml:"broker"`
-		Endpoint      string           `toml:"endpoint"`
-		AccountMode   string           `toml:"account_mode"`
-		ApprovalMode  string           `toml:"approval_mode"`
-		RefreshMargin string           `toml:"approval_refresh_margin"`
-		Venue         string           `toml:"venue"`
-		HTSID         string           `toml:"hts_id"`
-		AppKeyEnv     string           `toml:"app_key_env"`
-		AppSecretEnv  string           `toml:"app_secret_env"`
-		EventBuffer   int              `toml:"event_buffer"`
-		DupTrackMax   int              `toml:"dup_track_max"`
-		Gatewayd      gatewaydSettings `toml:"gatewayd"`
-	} `toml:"kis"`
-	Redis struct {
-		URL string `toml:"url"`
-	} `toml:"redis"`
+	Books  bookSettings  `toml:"books"`
+	KIS    kisSettings   `toml:"kis"`
+	Redis  redisSettings `toml:"redis"`
 	Stream struct {
 		Key          string `toml:"key"`
 		MaxLen       int64  `toml:"max_len"`
@@ -63,6 +48,24 @@ type fileConfig struct {
 	Alerts struct {
 		RateLimit string `toml:"rate_limit"`
 	} `toml:"alerts"`
+}
+
+type kisSettings struct {
+	Broker        string           `toml:"broker"`
+	Endpoint      string           `toml:"endpoint"`
+	AccountMode   string           `toml:"account_mode"`
+	ApprovalMode  string           `toml:"approval_mode"`
+	RefreshMargin string           `toml:"approval_refresh_margin"`
+	Venue         string           `toml:"venue"`
+	HTSID         string           `toml:"hts_id"`
+	AppKeyEnv     string           `toml:"app_key_env"`
+	AppSecretEnv  string           `toml:"app_secret_env"`
+	EventBuffer   int              `toml:"event_buffer"`
+	DupTrackMax   int              `toml:"dup_track_max"`
+	Gatewayd      gatewaydSettings `toml:"gatewayd"`
+}
+type redisSettings struct {
+	URL string `toml:"url"`
 }
 
 // gatewaydSettings configures the optional approval ensure client used when
@@ -104,16 +107,26 @@ func loadConfig(path string) (runtimeConfig, error) {
 	if err != nil {
 		return runtimeConfig{}, fmt.Errorf("config: read file: %w", err)
 	}
+	return parseConfig(contents, true)
+}
+
+// parseConfig resolves the legacy side lanes only for the standalone run.
+func parseConfig(contents []byte, includeSideLanes bool) (runtimeConfig, error) {
+	var err error
 	var cfg runtimeConfig
 	if err := toml.Unmarshal(contents, &cfg.fileConfig); err != nil {
 		return runtimeConfig{}, errors.New("config: invalid TOML")
 	}
-	// The promoted KIS quote lane resolves before validation and before the
-	// credential checks: its REST recovery sends the app key and secret, and
-	// validateStatic and the env lookup must read the same settings.
-	cfg.kisQuotes = resolveKisQuoteSettings(contents)
-	if cfg.kisFutures, err = resolveKisFuturesSettings(contents); err != nil {
-		return runtimeConfig{}, err
+	if includeSideLanes {
+		// The promoted KIS quote lane resolves before validation and before the
+		// credential checks: its REST recovery sends the app key and secret, and
+		// validateStatic and the env lookup must read the same settings.
+		cfg.kisQuotes = resolveKisQuoteSettings(contents)
+		if cfg.kisFutures, err = resolveKisFuturesSettings(contents); err != nil {
+			return runtimeConfig{}, err
+		}
+	} else {
+		cfg.Books = bookSettings{}
 	}
 	if err := validateGatewaydTableKeys(contents); err != nil {
 		return runtimeConfig{}, err
@@ -171,11 +184,8 @@ func loadConfig(path string) (runtimeConfig, error) {
 		return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.Ingest.TokenEnv)
 	}
 	if cfg.kisCredentialsRequired() {
-		if cfg.appKey, ok = os.LookupEnv(cfg.KIS.AppKeyEnv); !ok || cfg.appKey == "" {
-			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppKeyEnv)
-		}
-		if cfg.appSecret, ok = os.LookupEnv(cfg.KIS.AppSecretEnv); !ok || cfg.appSecret == "" {
-			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
+		if err := cfg.loadKISCredentials(); err != nil {
+			return runtimeConfig{}, err
 		}
 	}
 	if cfg.usesGatewayd() && strings.TrimSpace(cfg.KIS.Gatewayd.TokenEnv) != "" {
@@ -183,16 +193,18 @@ func loadConfig(path string) (runtimeConfig, error) {
 			return runtimeConfig{}, fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.Gatewayd.TokenEnv)
 		}
 	}
-	// The quote lane resolves last and cannot fail this function.
-	cfg.quotes = resolveQuoteSettings(contents, cfg)
-	if cfg.recording, err = resolveRecordingSettings(contents); err != nil {
-		return runtimeConfig{}, err
-	}
-	if cfg.upbit, err = resolveUpbitSettings(contents); err != nil {
-		return runtimeConfig{}, err
-	}
-	if cfg.tossWS, err = resolveTossWSSettings(contents, cfg.KIS.Gatewayd); err != nil {
-		return runtimeConfig{}, err
+	if includeSideLanes {
+		// The quote lane resolves last and cannot fail this function.
+		cfg.quotes = resolveQuoteSettings(contents, cfg)
+		if cfg.recording, err = resolveRecordingSettings(contents); err != nil {
+			return runtimeConfig{}, err
+		}
+		if cfg.upbit, err = resolveUpbitSettings(contents); err != nil {
+			return runtimeConfig{}, err
+		}
+		if cfg.tossWS, err = resolveTossWSSettings(contents, cfg.KIS.Gatewayd); err != nil {
+			return runtimeConfig{}, err
+		}
 	}
 	if cfg.reconcile, err = resolveReconcileSettings(contents); err != nil {
 		return runtimeConfig{}, err
@@ -217,10 +229,18 @@ func (cfg runtimeConfig) kisCredentialsRequired() bool {
 	return cfg.KIS.ApprovalMode == "" || cfg.Books.Enabled || quotes
 }
 
-func (cfg runtimeConfig) validateStatic() error {
-	if cfg.KIS.Broker != "kis" {
-		return errors.New("config: broker must be kis")
+func (cfg *runtimeConfig) loadKISCredentials() error {
+	var ok bool
+	if cfg.appKey, ok = os.LookupEnv(cfg.KIS.AppKeyEnv); !ok || cfg.appKey == "" {
+		return fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppKeyEnv)
 	}
+	if cfg.appSecret, ok = os.LookupEnv(cfg.KIS.AppSecretEnv); !ok || cfg.appSecret == "" {
+		return fmt.Errorf("config: required environment variable %s is unset", cfg.KIS.AppSecretEnv)
+	}
+	return nil
+}
+
+func (cfg runtimeConfig) validateKISConnection() error {
 	if cfg.KIS.ApprovalMode != "" && cfg.KIS.ApprovalMode != reader.ApprovalModeCacheOnly && !cfg.usesGatewayd() {
 		return errors.New("config: unsupported KIS approval_mode")
 	}
@@ -256,6 +276,16 @@ func (cfg runtimeConfig) validateStatic() error {
 	}
 	if cfg.KIS.AccountMode != cfg.KIS.Endpoint {
 		return errors.New("config: account_mode must match KIS endpoint")
+	}
+	return nil
+}
+
+func (cfg runtimeConfig) validateStatic() error {
+	if cfg.KIS.Broker != "kis" {
+		return errors.New("config: broker must be kis")
+	}
+	if err := cfg.validateKISConnection(); err != nil {
+		return err
 	}
 	if strings.TrimSpace(cfg.KIS.Venue) == "" || strings.TrimSpace(cfg.KIS.HTSID) == "" {
 		return errors.New("config: venue and HTS ID are required")

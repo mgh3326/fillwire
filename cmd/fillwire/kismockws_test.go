@@ -87,3 +87,13 @@ enabled = false
 		t.Fatalf("disabled config error = %v", err)
 	}
 }
+
+func TestDispatchKISMockWSCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fillwire.toml")
+	if err := os.WriteFile(path, []byte("[kis_mock_ws]\nenabled = false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatch([]string{"kis-mock-ws", "-config", path}); got != 78 {
+		t.Fatalf("dispatch exit code = %d, want 78", got)
+	}
+}

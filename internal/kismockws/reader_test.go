@@ -141,7 +141,7 @@ func TestModuleUsesConfiguredFuturesNoticeTR(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	module, err := New(Config{
 		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
-		FuturesNoticeTR: TRFuturesNoticeLegacy, RecordingDirectory: t.TempDir(),
+		FuturesNoticeTR: TRFuturesNoticeAlt, RecordingDirectory: t.TempDir(),
 		Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
 		Dialer: ws.DialerFunc(func(_ context.Context, _ string) (ws.Transport, error) { return transport, nil }),
 	})
@@ -172,8 +172,8 @@ func TestModuleUsesConfiguredFuturesNoticeTR(t *testing.T) {
 	transport.mu.Lock()
 	got := slices.Clone(transport.trs)
 	transport.mu.Unlock()
-	if !slices.Contains(got, TRFuturesNoticeLegacy) || slices.Contains(got, TRFuturesNotice) {
-		t.Fatalf("subscriptions = %v, want configured TR %s only", got, TRFuturesNoticeLegacy)
+	if !slices.Contains(got, TRFuturesNoticeAlt) || slices.Contains(got, TRFuturesNotice) {
+		t.Fatalf("subscriptions = %v, want configured TR %s only", got, TRFuturesNoticeAlt)
 	}
 }
 
@@ -240,7 +240,7 @@ func TestModuleCanSelectLegacyFuturesTR(t *testing.T) {
 	defer cancel()
 	module, err := New(Config{
 		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
-		FuturesNoticeTR: TRFuturesNoticeLegacy, RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		FuturesNoticeTR: TRFuturesNoticeAlt, RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
 		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
 	})
 	if err != nil {
@@ -255,8 +255,8 @@ func TestModuleCanSelectLegacyFuturesTR(t *testing.T) {
 		got := slices.Clone(transport.trs)
 		transport.mu.Unlock()
 		if count == 5 {
-			if !slices.Contains(got, TRFuturesNoticeLegacy) {
-				t.Fatalf("subscriptions %v lack configurable futures TR %s", got, TRFuturesNoticeLegacy)
+			if !slices.Contains(got, TRFuturesNoticeAlt) {
+				t.Fatalf("subscriptions %v lack configurable futures TR %s", got, TRFuturesNoticeAlt)
 			}
 			break
 		}

@@ -78,7 +78,7 @@ func New(cfg Config) (*Module, error) {
 	if cfg.FuturesNoticeTR == "" {
 		cfg.FuturesNoticeTR = TRFuturesNotice
 	}
-	if cfg.FuturesNoticeTR != TRFuturesNotice && cfg.FuturesNoticeTR != TRFuturesNoticeLegacy {
+	if cfg.FuturesNoticeTR != TRFuturesNotice && cfg.FuturesNoticeTR != TRFuturesNoticeAlt {
 		return nil, errors.New("kismockws: unsupported futures notice TR")
 	}
 	seen := make(map[string]bool, len(cfg.Symbols))
