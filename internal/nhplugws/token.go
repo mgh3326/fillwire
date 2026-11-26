@@ -97,3 +97,12 @@ func (s *OAuthTokenSource) Token(ctx context.Context) (string, error) {
 	s.expiresAt = s.now().Add(time.Duration(seconds * float64(time.Second)))
 	return s.token, nil
 }
+
+func (s *OAuthTokenSource) Invalidate(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token != "" && s.token == token {
+		s.token = ""
+		s.expiresAt = time.Time{}
+	}
+}

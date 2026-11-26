@@ -87,20 +87,21 @@ func runNHPlugWSCommand(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return runNHPlugWS(ctx, settings.file, tokens.Token)
+	return runNHPlugWS(ctx, settings.file, tokens.Token, tokens.Invalidate)
 }
 
-func runNHPlugWS(ctx context.Context, cfg nhplugWSFileConfig, token nhplugws.TokenSource) (runErr error) {
+func runNHPlugWS(ctx context.Context, cfg nhplugWSFileConfig, token nhplugws.TokenSource, invalidate func(string)) (runErr error) {
 	sink, err := recording.NewSink(cfg.Directory, nhplugws.Name)
 	if err != nil {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
 	reader, err := nhplugws.New(nhplugws.Config{
-		Endpoint: nhplugws.MockEndpoint,
-		UserID:   cfg.UserID,
-		Quotes:   cfg.Quotes,
-		Token:    token,
+		Endpoint:        nhplugws.MockEndpoint,
+		UserID:          cfg.UserID,
+		Quotes:          cfg.Quotes,
+		Token:           token,
+		InvalidateToken: invalidate,
 		Append: func(record nhplugws.Record) error {
 			return sink.Append(nhplugws.Name, "frames", record.ReceivedAt, record)
 		},

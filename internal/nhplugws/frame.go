@@ -20,6 +20,11 @@ type Record struct {
 	TRCD       string          `json:"tr_cd,omitempty"`
 	TRKey      json.RawMessage `json:"tr_key,omitempty"`
 	Raw        json.RawMessage `json:"raw"`
+	ackType    string
+	ackCode    string
+	ackMessage string
+	ackKeys    []string
+	isAck      bool
 }
 
 type inboundFrame struct {
@@ -54,5 +59,23 @@ func parseFrame(raw []byte) (Record, bool) {
 	} else if rawKey := body["tr_key"]; len(rawKey) > 0 {
 		trKey = rawKey
 	}
-	return Record{Kind: "frame", TRCD: code, TRKey: trKey, Raw: append(json.RawMessage(nil), raw...)}, true
+	record := Record{Kind: "frame", TRCD: code, TRKey: trKey, Raw: append(json.RawMessage(nil), raw...)}
+	if rawType, hasType := frame.Header["tr_type"]; hasType {
+		record.isAck = true
+		if json.Unmarshal(rawType, &record.ackType) != nil || json.Unmarshal(frame.Header["rsp_cd"], &record.ackCode) != nil {
+			return Record{}, false
+		}
+		_ = json.Unmarshal(frame.Header["rsp_msg"], &record.ackMessage)
+		if rawKey := body["tr_key"]; len(rawKey) > 0 {
+			if json.Unmarshal(rawKey, &record.ackKeys) != nil {
+				var key string
+				if json.Unmarshal(rawKey, &key) == nil {
+					record.ackKeys = []string{key}
+				} else {
+					return Record{}, false
+				}
+			}
+		}
+	}
+	return record, true
 }

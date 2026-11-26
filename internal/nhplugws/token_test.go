@@ -46,4 +46,18 @@ func TestOAuthTokenSourceUsesSDKApprovalFormAndCaches(t *testing.T) {
 	if err != nil || token != "fixture-token" || requestCount != 1 {
 		t.Fatalf("cached token = %q, requests=%d, error=%v", token, requestCount, err)
 	}
+	source.Invalidate("different-token")
+	if _, err := source.Token(context.Background()); err != nil || requestCount != 1 {
+		t.Fatalf("unmatched invalidation changed cache: requests=%d, error=%v", requestCount, err)
+	}
+	source.Invalidate("fixture-token")
+	if _, err := source.Token(context.Background()); err != nil || requestCount != 2 {
+		t.Fatalf("matched invalidation did not refresh: requests=%d, error=%v", requestCount, err)
+	}
+}
+
+func TestOAuthEndpointIsPinnedToNHPLUGAuthHost(t *testing.T) {
+	if OAuthEndpoint != "https://api.nhplug.com:8443/oauth2/token" {
+		t.Fatalf("OAuth endpoint = %q", OAuthEndpoint)
+	}
 }
