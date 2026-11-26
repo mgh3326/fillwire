@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/recording"
 	"github.com/mgh3326/fillwire/internal/tokenfetch"
 )
@@ -150,6 +151,119 @@ func TestFakeServerRecordsDocumentedOrder(t *testing.T) {
 	}
 	if reader.malformed.Load() != 2 || strings.Contains(logs.String(), fakeToken) || bytes.Contains(file, []byte("synthetic-toss-ws")) {
 		t.Fatal("malformed frames or credential handling incorrect")
+	}
+}
+
+func TestDeclarationIncludesOrdersAndConfiguredQuoteChannels(t *testing.T) {
+	declaration, topics, err := buildDeclaration("request-1", "3", []quote.Symbol{
+		{Market: quote.MarketKR, Code: "005930"},
+		{Market: quote.MarketUS, Code: "AAPL"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"id":"request-1"},{"codes":["3"],"type":"personal:order"},{"codes":["005930"],"type":"trade:kr"},{"codes":["005930"],"type":"orderbook:kr"},{"codes":["AAPL"],"type":"trade:us"},{"codes":["AAPL"],"type":"orderbook:us"}]`
+	if string(declaration) != want {
+		t.Fatalf("declaration = %s, want %s", declaration, want)
+	}
+	if strings.Join(topics, ",") != "personal:order:3,trade:kr:005930,orderbook:kr:005930,trade:us:AAPL,orderbook:us:AAPL" {
+		t.Fatalf("topics = %v", topics)
+	}
+}
+
+func TestReaderRecordsDocumentedQuoteFramesAndCountsMalformed(t *testing.T) {
+	trade := fixture(t, "trade-kr.json")
+	book := fixture(t, "orderbook-kr-asyncapi-example.json")
+	var cancel context.CancelFunc
+	ctx, stop := context.WithCancel(context.Background())
+	cancel = stop
+	frames := make(chan []byte, 4)
+	var declaration []byte
+	var records []Record
+	var reader *Reader
+	before := time.Now()
+	reader, err := New(Config{
+		AccountSeq: "3", Tokens: testTokens{},
+		Symbols: []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}},
+		Append: func(record Record) error {
+			if (record.Kind == "trade" || record.Kind == "orderbook") && !reader.Health() {
+				t.Error("reader was unhealthy after subscription acknowledgement")
+			}
+			records = append(records, record)
+			if record.Kind == "trade" {
+				cancel()
+			}
+			return nil
+		},
+		Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+			return fakeSocket{
+				write: func(raw []byte) error {
+					declaration = append([]byte(nil), raw...)
+					_, topics, err := buildDeclaration(requestID(raw), "3", []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}})
+					if err != nil {
+						return err
+					}
+					ack, _ := json.Marshal(map[string]any{"type": "subscriptions", "id": requestID(raw), "subscribed": topics, "rejected": []any{}})
+					frames <- ack
+					frames <- book
+					frames <- []byte(`{"type":"message","topic":"trade:kr:005930","data":{"price":4}} trailing`)
+					frames <- trade
+					return nil
+				},
+				read: func(ctx context.Context) ([]byte, error) {
+					select {
+					case raw := <-frames:
+						return raw, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+				close: func() {},
+			}, 0, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v", err)
+	}
+	if reader.Health() {
+		t.Fatal("reader remained healthy after its connection closed")
+	}
+	receivedAfter := time.Now()
+	if !bytes.Contains(declaration, []byte(`"type":"personal:order"`)) ||
+		!bytes.Contains(declaration, []byte(`"type":"trade:kr"`)) ||
+		!bytes.Contains(declaration, []byte(`"type":"orderbook:kr"`)) {
+		t.Fatalf("declaration missing a channel: %s", declaration)
+	}
+	var quoteRecords []Record
+	for _, record := range records {
+		if record.Kind == "trade" || record.Kind == "orderbook" {
+			quoteRecords = append(quoteRecords, record)
+		}
+	}
+	if len(quoteRecords) != 2 || quoteRecords[0].Kind != "orderbook" || quoteRecords[1].Kind != "trade" ||
+		!bytes.Equal(bytes.TrimSpace(quoteRecords[0].Raw), bytes.TrimSpace(book)) || !bytes.Equal(bytes.TrimSpace(quoteRecords[1].Raw), bytes.TrimSpace(trade)) {
+		t.Fatalf("quote records = %+v", quoteRecords)
+	}
+	for _, record := range quoteRecords {
+		if record.ReceivedAt.Before(before) || record.ReceivedAt.After(receivedAfter) || record.Topic == "" || record.SessionID == "" {
+			t.Fatalf("quote record missing receipt metadata: %+v", record)
+		}
+	}
+	if reader.malformed.Load() != 1 {
+		t.Fatalf("malformed count = %d, want 1", reader.malformed.Load())
+	}
+}
+
+func TestReaderRejectsMoreThan100Subscriptions(t *testing.T) {
+	symbols := make([]quote.Symbol, 50)
+	for i := range symbols {
+		symbols[i] = quote.Symbol{Market: quote.MarketKR, Code: fmt.Sprintf("%06d", i)}
+	}
+	if _, err := New(Config{AccountSeq: "3", Tokens: testTokens{}, Append: func(Record) error { return nil }, Symbols: symbols}); err == nil {
+		t.Fatal("configuration with 101 subscriptions was accepted")
 	}
 }
 
