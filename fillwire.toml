@@ -123,6 +123,13 @@ access_token_source = "" # "" with access_token_env, or "redis"
 enabled = false
 directory = "/var/lib/fillwire/recordings"
 
+# 토스 개인 주문과 선택 시세 프레임은 웹소켓 하나를 공유하며 기본 비활성화입니다.
+[toss_ws]
+enabled = false
+account_seq = ""
+directory = "/var/lib/fillwire/recordings"
+symbols_file = "" # 선택 사항: 줄마다 "<kr|us> <code>", 최대 40개
+
 # Upbit 공개 호가 및 체결 기록기. API 키와 비공개 웹소켓을 사용하지 않습니다.
 [upbit]
 enabled = false

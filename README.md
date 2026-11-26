@@ -248,6 +248,21 @@ list of at most 40 symbols. It appends every tick to the Redis Stream
 the execution ledger. It is off unless `[quotes] enabled = true`. The KIS
 websocket stays dedicated to `fills:kis`; the quote reader never uses KIS.
 
+### Toss 개인 주문과 시세 프레임을 같은 연결에 기록
+
+`[toss_ws]`는 개인 주문용 웹소켓 연결 하나에 선택한 Toss 체결(`trade`)과
+호가(`orderbook`) 구독도 함께 선언합니다. `symbols_file`은 `kr 005930`처럼
+시장과 코드를 한 줄에 하나씩 적으며 최대 40개를 받습니다. 설정은 기본
+비활성화입니다. 개인 주문 구독 1개와 시세 구독 심볼당 2개를 합쳐 Toss의
+연결당 100개 한도를 넘으면 설정을 거부합니다.
+`serve` 통합 전에는 `fillwire tossws -config FILE`로 이 스트림만 실행합니다.
+
+수신 프레임은 `directory/toss-order/<UTC 날짜>/<account_seq>.jsonl`에
+`received_at`(로컬 수신 시각), `kind`, `topic`, 세션 ID, 원본 JSON과 함께
+추가됩니다. 구문이 잘못됐거나 구독 심볼과 맞지 않는 프레임은 버리고
+malformed 카운터를 올립니다. 이 기능은 Redis 시세 스트림이나 원장에 쓰지
+않고 주문도 내지 않습니다.
+
 Protocol source: the Toss Open API realtime AsyncAPI document, version 1.2.2
 (`https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json`). The
 test fixtures in `internal/quote/testdata` follow it, and some are its own
@@ -258,13 +273,14 @@ examples.
 Toss allows **two websocket connections per account**. When a third opens,
 Toss accepts it and closes the oldest one without a close code. So:
 
-- fillwire's quote reader is the only Toss websocket client and uses exactly
-  one connection. The second connection is a spare.
+- `[quotes]` uses one quote-reader connection. `[toss_ws]` uses one connection
+  for `personal:order` and its optional trade/orderbook frames. If both are
+  enabled, they use the two connections Toss allows; the order and quote
+  channels in `[toss_ws]` do not open another connection.
 - **auto_trader never opens the Toss websocket.** Any other client that needs
-  it must be agreed first, because two more connections would evict fillwire's.
-- fillwire enforces the one connection in process: its dialer refuses a second
-  dial while a connection is open, and every reconnect closes the old
-  connection before dialing (break before make).
+  it must be agreed first, because a third connection would evict the oldest.
+- Each fillwire reader reconnects by closing its previous connection before
+  dialing again (break before make).
 
 ### Access token: read-only, never issued (Redis source)
 

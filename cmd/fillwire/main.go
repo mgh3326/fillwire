@@ -26,6 +26,16 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "tossws" {
+		if err := runTossWSCommand(os.Args[2:]); err != nil && !errors.Is(err, context.Canceled) {
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "upbit" {
 		if err := runUpbitCommand(os.Args[2:]); err != nil && !errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, err)
