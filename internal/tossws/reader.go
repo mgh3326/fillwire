@@ -15,29 +15,36 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/tokenfetch"
 )
 
 const (
-	Endpoint     = "wss://openapi-ws.tossinvest.com/ws/v1"
+	Endpoint     = quote.Endpoint
 	pingInterval = 60 * time.Second
 	ioTimeout    = 10 * time.Second
+	readIdle     = 3 * pingInterval
+	reissueGap   = time.Minute
 )
 
 var (
-	ErrAccountNotFound = errors.New("Toss WS subscription rejected: account-not-found")
-	ErrRejected        = errors.New("Toss WS subscription rejected")
-	ErrAck             = errors.New("Toss WS invalid subscription acknowledgement")
-	ErrForbidden       = errors.New("Toss WS handshake forbidden: HTTP 403")
-	ErrRecord          = errors.New("Toss WS JSONL append failed")
-	errToken           = errors.New("Toss WS gatewayd token unavailable")
-	errAuth            = errors.New("Toss WS token rejected")
-	errDial            = errors.New("Toss WS handshake failed")
-	errWrite           = errors.New("Toss WS declaration write failed")
-	errClose           = errors.New("Toss WS unexpected close; possible connection eviction")
-	errShutdown        = errors.New("Toss WS server-shutdown")
-	errPing            = errors.New("Toss WS PING write failed")
-	errRate            = errors.New("Toss WS rate-limit-exceeded")
+	ErrAccountNotFound  = errors.New("Toss WS subscription rejected: account-not-found")
+	ErrRejected         = errors.New("Toss WS subscription rejected")
+	ErrAck              = errors.New("Toss WS invalid subscription acknowledgement")
+	ErrAuthAfterReissue = errors.New("Toss WS replacement token rejected")
+	ErrForbidden        = errors.New("Toss WS handshake forbidden: HTTP 403")
+	ErrRecord           = errors.New("Toss WS JSONL append failed")
+	errToken            = errors.New("Toss WS gatewayd token unavailable")
+	errAckTimeout       = errors.New("Toss WS subscription acknowledgement timed out")
+	errReadIdle         = errors.New("Toss WS inbound traffic timed out")
+	errServer           = errors.New("Toss WS unrecognized server error")
+	errAuth             = errors.New("Toss WS token rejected")
+	errDial             = errors.New("Toss WS handshake failed")
+	errWrite            = errors.New("Toss WS declaration write failed")
+	errClose            = errors.New("Toss WS unexpected close; possible connection eviction")
+	errShutdown         = errors.New("Toss WS server-shutdown")
+	errPing             = errors.New("Toss WS PING write failed")
+	errRate             = errors.New("Toss WS rate-limit-exceeded")
 )
 
 type Socket interface {
@@ -117,18 +124,33 @@ func (r *Reader) Run(ctx context.Context) error {
 	}
 	defer r.running.Store(false)
 	var rejected string
+	var nextReissue time.Time
+	var replacementUsed bool
 	delay := time.Second
 	for ctx.Err() == nil {
-		token, err := r.token(ctx, rejected)
+		var token tokenfetch.Token
+		err := errToken
+		if rejected == "" || !r.cfg.Clock.Now().Before(nextReissue) {
+			if rejected != "" {
+				// Count the attempt even when gatewayd reports a failure.
+				nextReissue = r.cfg.Clock.Now().Add(reissueGap)
+			}
+			token, err = r.token(ctx, rejected)
+		}
 		if err == nil {
+			replacementUsed = replacementUsed || rejected != ""
 			rejected = ""
 			start := r.cfg.Clock.Now()
 			err = r.session(ctx, token.Value())
-			if err == errAuth {
-				rejected = token.Value()
-			}
 			if r.cfg.Clock.Now().Sub(start) >= pingInterval {
 				delay = time.Second
+				replacementUsed = false
+			}
+			if err == errAuth {
+				if replacementUsed {
+					return ErrAuthAfterReissue
+				}
+				rejected = token.Value()
 			}
 		}
 		if ctx.Err() != nil {
@@ -209,11 +231,17 @@ func (r *Reader) session(ctx context.Context, token string) error {
 		<-pingDone
 	}()
 	for {
-		kind, raw, err := conn.Read(sessionCtx)
+		readCtx, cancel := context.WithTimeout(sessionCtx, readIdle)
+		kind, raw, err := conn.Read(readCtx)
+		timedOut := errors.Is(readCtx.Err(), context.DeadlineExceeded)
+		cancel()
 		at := r.cfg.Clock.Now().UTC()
 		if err != nil {
 			if context.Cause(sessionCtx) == errPing {
 				return errPing
+			}
+			if timedOut {
+				return errReadIdle
 			}
 			return errClose
 		}
@@ -242,7 +270,7 @@ func (r *Reader) ack(ctx context.Context, conn Socket, id, topic string) error {
 		kind, raw, err := conn.Read(ctx)
 		if err != nil {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return ErrAck
+				return errAckTimeout
 			}
 			return errClose
 		}
@@ -295,7 +323,7 @@ func serverError(frame object) error {
 	case "rate-limit-exceeded", "internal-error":
 		return errRate
 	default:
-		return ErrAck
+		return errServer
 	}
 }
 

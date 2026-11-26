@@ -292,3 +292,109 @@ func TestPingAndReconnectWithFakeClock(t *testing.T) {
 		}
 	})
 }
+
+type retryTokens struct {
+	testTokens
+	attempts []time.Time
+}
+
+func (s *retryTokens) Reissue(_ context.Context, rejected string) (tokenfetch.Token, error) {
+	if rejected != fakeToken {
+		return tokenfetch.Token{}, errors.New("unexpected rejected token")
+	}
+	s.attempts = append(s.attempts, time.Now())
+	if len(s.attempts) == 1 {
+		return tokenfetch.Token{}, errors.New("simulated gatewayd timeout")
+	}
+	return tokenfetch.NewToken("replacement", time.Now().Add(time.Hour), "test"), nil
+}
+
+func TestRepeatedUnauthorizedBoundsReissue(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		tokens := &retryTokens{}
+		var dials int
+		reader, err := New(Config{AccountSeq: "3", Tokens: tokens,
+			Append: func(Record) error { return nil },
+			Dial: func(_ context.Context, _ string, h http.Header) (Socket, int, error) {
+				dials++
+				want := "Bearer " + fakeToken
+				if dials == 2 {
+					want = "Bearer replacement"
+				}
+				if h.Get("Authorization") != want {
+					t.Error("unexpected token presented")
+				}
+				return nil, http.StatusUnauthorized, errors.New("simulated unauthorized")
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runErr := reader.Run(ctx)
+		if runErr == nil || runErr.Error() != "Toss WS replacement token rejected" || dials != 2 || len(tokens.attempts) != 2 {
+			t.Fatalf("run = %v, dials = %d, attempts = %d", runErr, dials, len(tokens.attempts))
+		}
+		if got := tokens.attempts[1].Sub(tokens.attempts[0]); got < time.Minute {
+			t.Fatalf("retried gatewayd after %v", got)
+		}
+	})
+}
+
+func TestTransientReadFailuresReconnect(t *testing.T) {
+	for _, scenario := range []string{"ack-timeout", "read-idle", "unknown-server-error"} {
+		t.Run(scenario, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
+				defer cancel()
+				var dials, closes int
+				var id string
+				var markers []Record
+				var pings atomic.Int32
+				reader, err := New(Config{AccountSeq: "3", Tokens: testTokens{},
+					Append: func(r Record) error { markers = append(markers, r); return nil },
+					Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+						dials++
+						if dials == 2 {
+							cancel()
+						}
+						acknowledged := false
+						return fakeSocket{
+							write: func(raw []byte) error {
+								if string(raw) == "PING" {
+									pings.Add(1)
+								} else {
+									id = requestID(raw)
+								}
+								return nil
+							},
+							read: func(ctx context.Context) ([]byte, error) {
+								if dials == 1 && scenario != "ack-timeout" && !acknowledged {
+									acknowledged = true
+									return fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3"],"rejected":[]}`, id), nil
+								}
+								if dials == 1 && scenario == "unknown-server-error" {
+									return []byte(`{"type":"error","error":{"code":"unknown","message":"test"}}`), nil
+								}
+								<-ctx.Done()
+								return nil, ctx.Err()
+							},
+							close: func() { closes++ },
+						}, 0, nil
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := reader.Run(ctx); !errors.Is(err, context.Canceled) || dials != 2 || closes != 2 ||
+					len(markers) != 2 || markers[1].Kind != "resync_needed" {
+					t.Fatalf("run = %v, dials = %d, closes = %d, markers = %d", err, dials, closes, len(markers))
+				}
+				if scenario == "read-idle" && pings.Load() < 2 {
+					t.Fatal("expected successful PING writes before idle reconnect")
+				}
+			})
+		})
+	}
+}
