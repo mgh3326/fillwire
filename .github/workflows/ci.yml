@@ -66,6 +66,10 @@ jobs:
       # Go packages are already covered by the vet and test steps above.
       - name: edge deploy-pull script test
         run: sh scripts/edge/deploy-pull_test.sh
+      - name: pi deployment script tests
+        run: |
+          bash scripts/publish-image_test.sh
+          bash scripts/deploy-serve_test.sh
       # The main stage's image build is publish (below), which builds and
       # pushes the same image to GHCR. Pull requests keep the local build.
       - name: container build

@@ -1,0 +1,20 @@
+[Unit]
+Description=Fillwire quote collector (digest pinned)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+StartLimitIntervalSec=120
+StartLimitBurst=4
+
+[Service]
+Type=exec
+EnvironmentFile=/var/lib/fillwire-deploy/quote-collector.service.image
+ExecStartPre=/bin/bash /usr/local/sbin/deploy-serve.sh quote-collector --check
+ExecStart=/usr/bin/docker run --rm --pull=never --name quote-collector --network host --memory 256m --memory-swap 256m --env-file /etc/fillwire/quote-collector.env --volume /etc/fillwire/quote-collector:/etc/fillwire:ro --volume /var/lib/quote-collector:/data:rw ${IMAGE} market-tap -enabled -targets /etc/fillwire/targets.json -calendar /etc/fillwire/calendar.json -out /data/bars.jsonl -token-source gatewayd-fetch -gatewayd-url http://127.0.0.1:8791 -gatewayd-token-env GATEWAYD_FETCH_TOKEN -gatewayd-provider kis-live
+ExecStop=/usr/bin/docker stop --time 30 quote-collector
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

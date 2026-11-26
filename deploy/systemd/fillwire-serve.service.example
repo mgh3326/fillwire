@@ -1,0 +1,20 @@
+[Unit]
+Description=Fillwire serve (digest pinned)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+StartLimitIntervalSec=120
+StartLimitBurst=4
+
+[Service]
+Type=exec
+EnvironmentFile=/var/lib/fillwire-deploy/fillwire-serve.service.image
+ExecStartPre=/bin/bash /usr/local/sbin/deploy-serve.sh fillwire-serve --check
+ExecStart=/usr/bin/docker run --rm --pull=never --name fillwire-serve --network host --memory 256m --memory-swap 256m --env-file /etc/fillwire/serve.env --volume /etc/fillwire/serve:/etc/fillwire:ro --volume /var/lib/fillwire-serve:/data:rw ${IMAGE} serve -config /etc/fillwire/serve.toml
+ExecStop=/usr/bin/docker stop --time 30 fillwire-serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target
