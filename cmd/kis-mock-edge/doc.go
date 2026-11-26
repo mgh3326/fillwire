@@ -9,8 +9,5 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "resolve" {
-		os.Exit(kismockedge.RunResolve(context.Background(), os.Args[2:], os.Getenv, os.Stdout, os.Stderr))
-	}
-	os.Exit(kismockedge.Run(context.Background(), os.Getenv, os.Stderr))
+	os.Exit(kismockedge.RunCLI(context.Background(), os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }

@@ -1,4 +1,4 @@
-package main
+package execmockcmd
 
 import (
 	"bufio"
@@ -30,7 +30,7 @@ import (
 
 func liveIntent(t *testing.T) exec.Intent {
 	t.Helper()
-	data, err := os.ReadFile("testdata/intent.json")
+	data, err := os.ReadFile("../../cmd/execmock/testdata/intent.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestSendRequiresMockConfigAndExplicitFlag(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := "[e1]\naccount = " + strconvQuote(tc.account) + "\nsend_enabled = " + map[bool]string{true: "true", false: "false"}[tc.enabled] + "\n"
-			args := []string{"-config", writeConfig(t, body), "-intent", "testdata/intent.json", "-live-book"}
+			args := []string{"-config", writeConfig(t, body), "-intent", "../../cmd/execmock/testdata/intent.json", "-live-book"}
 			if tc.flag {
 				args = append(args, "-send")
 			}

@@ -62,7 +62,7 @@ func TestBinaryHasNoOrderPathOrNetworkDial(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "execsim")
 	goTool(t, "build", "-o", binary, ".")
 	symbols := string(goTool(t, "tool", "nm", binary))
-	for _, want := range []string{"main.run", "internal/exec/upbit.NewReplay"} {
+	for _, want := range []string{"internal/execsimcmd.Run", "internal/exec/upbit.NewReplay"} {
 		if !strings.Contains(symbols, want) {
 			t.Fatalf("symbol table lacks %s; the scan would pass vacuously", want)
 		}

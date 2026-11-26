@@ -172,21 +172,27 @@ func startUpbitLane(settings upbitSettings, logger *slog.Logger) upbitLane {
 	if !settings.enabled {
 		return upbitLane{}
 	}
-	reader, err := upbit.New(upbit.Config{Markets: settings.markets, Root: settings.directory, Endpoint: settings.endpoint, RetryMin: settings.retryMin, RetryMax: settings.retryMax, Logger: logger.With("lane", "upbit")})
-	if err != nil {
-		logger.Error("Upbit 기록기를 시작하지 못했습니다", "reason", err.Error())
-		return upbitLane{}
-	}
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := reader.Run(ctx); err != nil && ctx.Err() == nil {
+		if err := runUpbitRecorder(ctx, settings, logger, nil); err != nil && ctx.Err() == nil {
 			logger.Error("Upbit 기록기가 중지되었습니다", "reason", err.Error())
 		}
 	}()
 	return upbitLane{stop: stop, done: done}
 }
+func runUpbitRecorder(ctx context.Context, settings upbitSettings, logger *slog.Logger, ready func()) error {
+	reader, err := upbit.New(upbit.Config{Markets: settings.markets, Root: settings.directory, Endpoint: settings.endpoint, RetryMin: settings.retryMin, RetryMax: settings.retryMax, Logger: logger.With("lane", "upbit")})
+	if err != nil {
+		return err
+	}
+	if ready != nil {
+		ready()
+	}
+	return reader.Run(ctx)
+}
+
 func (l upbitLane) halt() {
 	if l.stop != nil {
 		l.stop()

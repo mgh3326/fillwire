@@ -1,4 +1,4 @@
-package main
+package execmockcmd
 
 import (
 	"bytes"
@@ -39,16 +39,16 @@ func e1Server(t *testing.T) (*httptest.Server, *atomic.Int64) {
 
 func execmock(args ...string) (code int, stdout, stderr string) {
 	var out, errb bytes.Buffer
-	code = run(args, &out, &errb)
+	code = Run(args, &out, &errb)
 	return code, out.String(), errb.String()
 }
 
 func TestDryRunPrintsRequests(t *testing.T) {
-	code, out, errs := execmock("-config", "testdata/dry-run.toml", "-intent", "testdata/intent.json", "-in", evidence, "-dry-run")
+	code, out, errs := execmock("-config", "../../cmd/execmock/testdata/dry-run.toml", "-intent", "../../cmd/execmock/testdata/intent.json", "-in", evidence, "-dry-run")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errs)
 	}
-	testutil.Golden(t, "testdata/dry-run.golden.jsonl", []byte(out))
+	testutil.Golden(t, "../../cmd/execmock/testdata/dry-run.golden.jsonl", []byte(out))
 	// The dry run goes through the E1 client and lands where execsim's fake
 	// gateway lands for the same intent and rule.
 	lines := strings.Split(strings.TrimSpace(out), "\n")
@@ -56,7 +56,7 @@ func TestDryRunPrintsRequests(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
 		t.Fatal(err)
 	}
-	golden, err := os.ReadFile("../execsim/testdata/sim.golden.jsonl")
+	golden, err := os.ReadFile("../../cmd/execsim/testdata/sim.golden.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestDryRunPrintsRequests(t *testing.T) {
 func TestDryRunSendsNothing(t *testing.T) {
 	srv, hits := e1Server(t)
 	cfg := writeConfig(t, "[e1]\naccount = \"kis_mock\"\nsend_enabled = true\nurl = \""+srv.URL+"\"\n")
-	code, out, errs := execmock("-config", cfg, "-intent", "testdata/intent.json", "-in", evidence, "-dry-run")
+	code, out, errs := execmock("-config", cfg, "-intent", "../../cmd/execmock/testdata/intent.json", "-in", evidence, "-dry-run")
 	if code != 0 || hits.Load() != 0 || strings.Count(out, `"dry_run":true`) != 5 {
 		t.Fatalf("exit %d hits %d stderr %s\n%s", code, hits.Load(), errs, out)
 	}
@@ -90,7 +90,7 @@ func TestConfigThatWouldSendSendsNothing(t *testing.T) {
 		{"unknown key", "[e1]\naccount = \"kis_mock\"\nlive = true\n", 78},
 	}
 	for _, c := range cases {
-		code, out, errs := execmock("-config", writeConfig(t, c.toml), "-intent", "testdata/intent.json", "-in", evidence)
+		code, out, errs := execmock("-config", writeConfig(t, c.toml), "-intent", "../../cmd/execmock/testdata/intent.json", "-in", evidence)
 		if code != c.code || out != "" {
 			t.Errorf("%s: exit %d stdout %q stderr %q, want exit %d", c.name, code, out, errs, c.code)
 		}
@@ -101,7 +101,7 @@ func TestConfigThatWouldSendSendsNothing(t *testing.T) {
 }
 
 func TestRecordedDryRunBodiesStayWithinIntentBounds(t *testing.T) {
-	data, err := os.ReadFile("testdata/intent.json")
+	data, err := os.ReadFile("../../cmd/execmock/testdata/intent.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestRecordedDryRunBodiesStayWithinIntentBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, out, errs := execmock("-config", "testdata/dry-run.toml", "-intent", "testdata/intent.json", "-in", evidence, "-dry-run")
+	code, out, errs := execmock("-config", "../../cmd/execmock/testdata/dry-run.toml", "-intent", "../../cmd/execmock/testdata/intent.json", "-in", evidence, "-dry-run")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errs)
 	}
@@ -150,13 +150,13 @@ func TestExitCodesFollowSharedTable(t *testing.T) {
 		want           int
 	}{
 		{"unknown rule is usage", "", []string{"-in", evidence, "-dry-run", "-rule", "sideways"}, 2},
-		{"missing config file is config", "", []string{"-config", "testdata/absent.toml"}, 78},
+		{"missing config file is config", "", []string{"-config", "../../cmd/execmock/testdata/absent.toml"}, 78},
 		{"plaintext remote Redis is config", "redis://redis.example.invalid:6379/0", []string{"-live-book", "-dry-run"}, 78},
 		{"unparsable Redis URL is config", "", []string{"-live-book", "-dry-run"}, 78},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("EXECMOCK_EXIT_REDIS_URL", tc.redisURL)
-			args := append([]string{"-config", mock, "-intent", "testdata/intent.json"}, tc.args...)
+			args := append([]string{"-config", mock, "-intent", "../../cmd/execmock/testdata/intent.json"}, tc.args...)
 			code, _, errs := execmock(args...)
 			if code != tc.want {
 				t.Fatalf("exit %d, want %d: %s", code, tc.want, errs)
