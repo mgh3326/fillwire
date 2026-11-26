@@ -162,10 +162,11 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 				case <-timer.C:
 				}
 			}
-			if err := subscribeWithRetry(sessionCtx, session, registration[0], registration[1]); err != nil {
-				if sessionCtx.Err() != nil {
-					return
-				}
+			err, canceled := subscribeRegistration(sessionCtx, session, registration[0], registration[1])
+			if canceled {
+				return
+			}
+			if err != nil {
 				m.setError("subscription failed")
 				m.cfg.Logger.Error("KIS mock websocket subscription failed", "tr", registration[0])
 				attachErr <- fmt.Errorf("kismockws: subscription failed for %s: %w", registration[0], err)
@@ -286,6 +287,14 @@ func subscribeWithRetry(ctx context.Context, session reader.Session, tr, key str
 			delay = subscribeRetryMax
 		}
 	}
+}
+
+func subscribeRegistration(ctx context.Context, session reader.Session, tr, key string) (error, bool) {
+	err := subscribeWithRetry(ctx, session, tr, key)
+	if err != nil && ctx.Err() != nil {
+		return nil, true
+	}
+	return err, false
 }
 
 func record(sink *recording.Sink, stream string, at time.Time, value any) error {
