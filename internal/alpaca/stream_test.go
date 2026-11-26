@@ -63,6 +63,7 @@ func TestTradeFillAndMarketFramesAreRecordedWithReceivedAt(t *testing.T) {
 	trade := &fakeSocket{reads: []readResult{
 		{websocket.MessageBinary, []byte(`{"stream":"authorization","data":{"status":"authorized","action":"authenticate"}}`), nil},
 		{websocket.MessageBinary, []byte(`{"stream":"listening","data":{"streams":["trade_updates"]}}`), nil},
+		{websocket.MessageBinary, []byte(`not-json`), nil},
 		{websocket.MessageBinary, fixtures("trade_fill.json"), nil},
 		{websocket.MessageBinary, fixtures("trade_partial_fill.json"), nil},
 	}}
@@ -101,6 +102,9 @@ func TestTradeFillAndMarketFramesAreRecordedWithReceivedAt(t *testing.T) {
 	marketRecords := readRecords(t, filepath.Join(module.cfg.Root, MarketStream, at.UTC().Format("2006-01-02"), "market_data.jsonl"))
 	if len(marketRecords) != 3 || marketRecords[0].Kind != "trade" || marketRecords[1].Kind != "quote" || marketRecords[2].Kind != "bar" {
 		t.Fatalf("market records = %#v", marketRecords)
+	}
+	if got := module.malformed.Load(); got != 1 {
+		t.Fatalf("malformed frames = %d, want 1", got)
 	}
 	for _, record := range append(tradeRecords, marketRecords...) {
 		if !record.ReceivedAt.Equal(at.UTC()) {
