@@ -26,6 +26,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "kis-mock-ws" {
+		if err := runKISMockWSCommand(os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) && !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "upbit-fills" {
 		if err := runUpbitFillsCommand(os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
