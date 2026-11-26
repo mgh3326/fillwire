@@ -15,7 +15,6 @@ import (
 	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/kisfutures"
-	"github.com/mgh3326/fillwire/internal/kiwoomws"
 	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
@@ -27,59 +26,44 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "nhplug-ws" {
-		if err := runNHPlugWSCommand(os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) && !errors.Is(err, context.Canceled) {
+	os.Exit(dispatch(os.Args[1:]))
+}
+
+func runCLI(args []string) int {
+	if len(args) > 0 && args[0] == "upbit" {
+		if err := runUpbitCommand(args[1:]); err != nil && !errors.Is(err, context.Canceled) {
+			if errors.Is(err, flag.ErrHelp) {
+				return 0
+			}
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	}
-	if len(os.Args) > 1 && os.Args[1] == "alpaca" {
-		os.Exit(runAlpacaCLI(os.Args[2:]))
-	}
-	if len(os.Args) > 1 && os.Args[1] == "upbit-fills" {
-		if err := runUpbitFillsCommand(os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) {
+	if len(args) > 0 && args[0] == "coverage" {
+		if err := runCoverageCommand(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return 0
+			}
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return 2
 		}
-		return
+		return 0
 	}
-	if len(os.Args) > 1 && os.Args[1] == "upbit" {
-		if err := runUpbitCommand(os.Args[2:]); err != nil && !errors.Is(err, context.Canceled) {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+	flags := flag.NewFlagSet("fillwire", flag.ContinueOnError)
+	configPath := flags.String("config", "fillwire.toml", "path to fillwire TOML configuration")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
 		}
-		return
+		return 2
 	}
-	if len(os.Args) > 1 && os.Args[1] == "kiwoom-kr" {
-		if err := runKiwoomCommand(kiwoomws.AccountKR, os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "kiwoom-us" {
-		if err := runKiwoomCommand(kiwoomws.AccountUS, os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "coverage" {
-		if err := runCoverageCommand(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		return
-	}
-	configPath := flag.String("config", "fillwire.toml", "path to fillwire TOML configuration")
-	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	alerter := alert.FromEnv(logger, alert.DefaultRateLimit)
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		logger.Error("startup configuration failed", "reason", err.Error())
-		os.Exit(exitCodeWithAlert(reader.ErrApprovalConfig, alerter))
+		return exitCodeWithAlert(reader.ErrApprovalConfig, alerter)
 	}
 	alerter.SetRateLimit(cfg.alertRateLimit)
 
@@ -87,8 +71,9 @@ func main() {
 	defer stop()
 	if err := run(ctx, cfg, logger, alerter); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("fillwire stopped", "reason", safeRuntimeError(err))
-		os.Exit(exitCodeWithAlert(err, alerter))
+		return exitCodeWithAlert(err, alerter)
 	}
+	return 0
 }
 
 func exitCodeWithAlert(err error, alerter alert.Alerter) int {
@@ -108,7 +93,10 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, alerter al
 	return runWithDependencies(ctx, cfg, logger, runDependencies{alerter: alerter})
 }
 
+type fillSource func(context.Context, chan<- ws.Event, func(), func()) error
+
 type runDependencies struct {
+	sharedFills      fillSource
 	approvalRedis    redis.UniversalClient
 	approvalFallback ws.ApprovalKeyProvider
 	gatewaydEnsurer  reader.GatewaydEnsurer
@@ -157,18 +145,8 @@ func (i kisApprovalIssuer) Issue(ctx context.Context) (string, error) {
 	return result.ApprovalKey, nil
 }
 
-func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies) error {
-	redisOptions, err := redis.ParseURL(cfg.Redis.URL)
-	if err != nil {
-		return fmt.Errorf("%w: invalid Redis URL", reader.ErrApprovalConfig)
-	}
-	redisClient := redis.NewClient(redisOptions)
-	defer redisClient.Close()
-	approvalRedis := dependencies.approvalRedis
-	if approvalRedis == nil {
-		approvalRedis = redisClient
-	}
-
+func newKISApproval(cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies, approvalRedis redis.UniversalClient) (ws.ApprovalKeyProvider, *reader.ApprovalProvider, error) {
+	var err error
 	// Only approval_mode "" issues approval keys, through the KIS REST
 	// client; cache-only reads the shared cache and gatewayd delegates to
 	// the ensure endpoint, so neither constructs an issuing client.
@@ -185,7 +163,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			RequestTimeout: reader.ApprovalIssueTimeout,
 		})
 		if err != nil {
-			return fmt.Errorf("%w: KIS REST client", reader.ErrApprovalConfig)
+			return nil, nil, fmt.Errorf("%w: KIS REST client", reader.ErrApprovalConfig)
 		}
 		issuer = kisApprovalIssuer{client: kisClient}
 	}
@@ -210,13 +188,13 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		if fetcher == nil {
 			client, err := tokenfetch.NewClient(cfg.KIS.Gatewayd.URL, cfg.gatewaydToken)
 			if err != nil {
-				return fmt.Errorf("%w: gatewayd fetch client", reader.ErrApprovalConfig)
+				return nil, nil, fmt.Errorf("%w: gatewayd fetch client", reader.ErrApprovalConfig)
 			}
 			fetcher = client
 		}
 		fetchApproval, err := reader.NewApprovalProviderGatewaydFetch(fetcher, cfg.KIS.AccountMode, margin, logger)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		approvalSource, approvalAlert = fetchApproval, fetchApproval.SetTransientAlert
 	case reader.ApprovalModeGatewayd:
@@ -225,7 +203,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			var err error
 			ensurer, err = reader.NewGatewaydClient(cfg.KIS.Gatewayd.URL, cfg.KIS.Gatewayd.TokenHeader, cfg.gatewaydToken)
 			if err != nil {
-				return fmt.Errorf("%w: gatewayd client", reader.ErrApprovalConfig)
+				return nil, nil, fmt.Errorf("%w: gatewayd client", reader.ErrApprovalConfig)
 			}
 		}
 		approval, err = reader.NewApprovalProviderGatewayd(approvalRedis, ensurer, cfg.KIS.AccountMode, margin, logger)
@@ -233,7 +211,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		approval, err = reader.NewApprovalProviderConfig(approvalRedis, issuer, cfg.KIS.ApprovalMode, cfg.KIS.AccountMode, margin, logger)
 	}
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if approval != nil {
 		approvalSource, approvalAlert = approval, approval.SetTransientAlert
@@ -242,6 +220,30 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		approvalAlert(func() {
 			dependencies.alerter.Alert(context.Background(), "transient", "fillwire approval refresh failed; retrying while cached key remains valid")
 		})
+	}
+
+	return approvalSource, approval, nil
+}
+
+func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies) error {
+	redisOptions, err := redis.ParseURL(cfg.Redis.URL)
+	if err != nil {
+		return fmt.Errorf("%w: invalid Redis URL", reader.ErrApprovalConfig)
+	}
+	redisClient := redis.NewClient(redisOptions)
+	defer redisClient.Close()
+	approvalRedis := dependencies.approvalRedis
+	if approvalRedis == nil {
+		approvalRedis = redisClient
+	}
+
+	var approvalSource ws.ApprovalKeyProvider
+	var approval *reader.ApprovalProvider
+	if dependencies.sharedFills == nil {
+		approvalSource, approval, err = newKISApproval(cfg, logger, dependencies, approvalRedis)
+		if err != nil {
+			return err
+		}
 	}
 
 	bookEvent, stopBooks, err := startBooks(ctx, cfg, logger)
@@ -322,7 +324,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	readerCtx, stopReader := context.WithCancel(context.Background())
 	defer stopReader()
 	refreshDone := make(chan error, 1)
-	if cfg.KIS.ApprovalMode == "" {
+	if dependencies.sharedFills == nil && cfg.KIS.ApprovalMode == "" {
 		go func() {
 			if err := approval.RefreshLoop(readerCtx); err != nil {
 				refreshDone <- err
@@ -363,6 +365,12 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	}
 	go func() {
 		defer close(events)
+		if dependencies.sharedFills != nil {
+			readerDone <- runAttempt(func() error {
+				return dependencies.sharedFills(readerCtx, events, onSubscribed, onReconnected)
+			})
+			return
+		}
 		readerDone <- reader.New(reader.Config{
 			OnSubscribed:  onSubscribed,
 			OnReconnected: onReconnected,

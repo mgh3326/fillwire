@@ -70,11 +70,7 @@ func runAlpacaCLI(args []string) int {
 		return 2
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	module, err := alpaca.New(alpaca.Config{
-		PaperKeyEnv: alpacaPaperKeyEnv, PaperSecretEnv: alpacaPaperSecretEnv,
-		DataKeyEnv: alpacaDataKeyEnv, DataSecretEnv: alpacaDataSecretEnv,
-		Symbols: settings.Symbols, Root: settings.Directory, Logger: logger,
-	})
+	module, err := newAlpaca(settings, logger)
 	if err != nil {
 		logger.Error("Alpaca 설정 오류", "reason", err.Error())
 		return 2
@@ -86,4 +82,12 @@ func runAlpacaCLI(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func newAlpaca(settings alpacaFileConfig, logger *slog.Logger) (*alpaca.Module, error) {
+	return alpaca.New(alpaca.Config{
+		PaperKeyEnv: alpacaPaperKeyEnv, PaperSecretEnv: alpacaPaperSecretEnv,
+		DataKeyEnv: alpacaDataKeyEnv, DataSecretEnv: alpacaDataSecretEnv,
+		Symbols: settings.Symbols, Root: settings.Directory, Logger: logger,
+	})
 }

@@ -14,12 +14,13 @@ import (
 // enter this binary. The E1 gateway client and the KIS executor are absent by
 // design; the Upbit shadow path has no send mode.
 var allowedDeps = map[string]bool{
-	"github.com/mgh3326/fillwire/cmd/execupbit":       true,
-	"github.com/mgh3326/fillwire/internal/exec/upbit": true,
-	"github.com/mgh3326/fillwire/internal/exitcode":   true,
-	"github.com/mgh3326/fillwire/internal/jsonx":      true,
-	"github.com/mgh3326/fillwire/internal/recording":  true,
-	"github.com/mgh3326/fillwire/internal/upbit":      true,
+	"github.com/mgh3326/fillwire/cmd/execupbit":         true,
+	"github.com/mgh3326/fillwire/internal/execupbitcmd": true,
+	"github.com/mgh3326/fillwire/internal/exec/upbit":   true,
+	"github.com/mgh3326/fillwire/internal/exitcode":     true,
+	"github.com/mgh3326/fillwire/internal/jsonx":        true,
+	"github.com/mgh3326/fillwire/internal/recording":    true,
+	"github.com/mgh3326/fillwire/internal/upbit":        true,
 	// The public market websocket client; it has no order endpoint.
 	"github.com/coder/websocket":                true,
 	"github.com/coder/websocket/internal/bpool": true,
@@ -84,7 +85,7 @@ func TestBinaryHasNoOrderEndpoint(t *testing.T) {
 
 	symbols := string(goTool(t, "tool", "nm", binary))
 	// Positive controls: the scan sees this binary's own code.
-	for _, want := range []string{"main.run", "internal/exec/upbit.NewPlan"} {
+	for _, want := range []string{"internal/execupbitcmd.Run", "internal/exec/upbit.NewPlan"} {
 		if !strings.Contains(symbols, want) {
 			t.Fatalf("symbol table lacks %s; the scan would pass vacuously", want)
 		}

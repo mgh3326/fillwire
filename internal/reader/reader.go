@@ -39,8 +39,12 @@ var ErrEventsClosed = errors.New("reader: KIS event stream closed unexpectedly")
 
 // Config selects a matched KIS endpoint/TR pair and a websocket transport.
 type Config struct {
-	BookSymbols []string       // optional read-only subscriptions on this same session
-	OnBook      func(ws.Event) // must not block the fills reader
+	// SharedSession delegates subscription ownership and fill delivery to the caller.
+	// Its ready callback must only publish the session, never wait for a subscription.
+	SharedSession func(Session)
+	OnFill        func(context.Context, ws.Event)
+	BookSymbols   []string       // optional read-only subscriptions on this same session
+	OnBook        func(ws.Event) // must not block the fills reader
 	// OnSession, if set, receives the live session and the reader's run
 	// context once the fills and book subscriptions are active. It runs on
 	// its own goroutine: a promoted quote lane adds and removes subscriptions
@@ -166,10 +170,10 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(r.cfg.HTSID) == "" {
+	if r.cfg.SharedSession == nil && strings.TrimSpace(r.cfg.HTSID) == "" {
 		return errors.New("reader: HTS ID is required")
 	}
-	if out == nil {
+	if out == nil && r.cfg.OnFill == nil {
 		return errors.New("reader: output channel is required")
 	}
 
@@ -211,16 +215,24 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 	}
 	defer conn.Close()
 
-	if err := conn.Subscribe(ctx, tr, r.cfg.HTSID); err != nil {
-		if ctx.Err() != nil {
-			return nil
+	if r.cfg.SharedSession != nil {
+		session, ok := conn.(Session)
+		if !ok {
+			return errors.New("reader: transport lacks subscription control")
 		}
-		if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
-			if terminal := observer.cacheOnlyFailure(); terminal != nil {
-				return terminal
+		r.cfg.SharedSession(session)
+	} else {
+		if err := conn.Subscribe(ctx, tr, r.cfg.HTSID); err != nil {
+			if ctx.Err() != nil {
+				return nil
 			}
+			if observer, ok := r.cfg.Approval.(terminalApprovalFailure); ok {
+				if terminal := observer.cacheOnlyFailure(); terminal != nil {
+					return terminal
+				}
+			}
+			return err
 		}
-		return err
 	}
 	for _, symbol := range r.cfg.BookSymbols {
 		if err := conn.Subscribe(ctx, "H0STASP0", symbol); err != nil && r.cfg.Logger != nil {
@@ -287,6 +299,10 @@ func (r *Reader) Run(ctx context.Context, out chan<- ws.Event) error {
 					r.cfg.OnFutures(event)
 					continue
 				}
+			}
+			if r.cfg.OnFill != nil {
+				r.cfg.OnFill(ctx, event)
+				continue
 			}
 			select {
 			case out <- event:
