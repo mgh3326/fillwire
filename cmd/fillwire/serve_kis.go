@@ -294,7 +294,7 @@ func (s *kisSession) wait(ctx context.Context) error {
 		if s.terminal != nil {
 			return s.terminal
 		}
-		return reader.ErrEventsClosed
+		return errors.Join(errSharedKISStopped, reader.ErrEventsClosed)
 	}
 }
 

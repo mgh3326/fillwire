@@ -406,3 +406,24 @@ func TestKISAuxiliaryInvalidSettingsArePermanent(t *testing.T) {
 		})
 	}
 }
+
+func TestKISAuxiliarySharedGenerationExitRetriesWithoutAlert(t *testing.T) {
+	ctx := context.Background()
+	hub := newKISHub()
+	session := &kisSession{ctx: ctx, finished: make(chan struct{})}
+	hub.publish(session)
+	hub.finish(session, errors.New("fixture transport failure"))
+	for _, name := range []string{"kis_quotes", "kis_futures"} {
+		fake := &failingAlerter{}
+		run := alertKISFailures(name, func(ctx context.Context, _ func()) error {
+			return session.wait(ctx)
+		}, fake)
+		err := run(ctx, func() {})
+		if !errors.Is(err, reader.ErrEventsClosed) || errors.Is(err, errModuleStopped) {
+			t.Fatalf("%s shared-generation exit must remain retryable: %v", name, err)
+		}
+		if len(fake.classes) != 0 {
+			t.Errorf("%s emitted alerts for a shared-generation exit: %v", name, fake.classes)
+		}
+	}
+}

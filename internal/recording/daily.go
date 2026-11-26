@@ -380,6 +380,7 @@ func (w *DailyWriter) Close() error {
 // Sink manages independent per-stream and per-name day writers.
 type Sink struct {
 	mu      sync.Mutex
+	pending sync.WaitGroup
 	root    string
 	writers map[string]*DailyWriter
 	locks   map[string]*StreamLock
@@ -413,13 +414,22 @@ func (s *Sink) lockStream(stream string) error {
 }
 
 func (s *Sink) Append(stream, name string, at time.Time, value any) error {
+	w, err := s.beginAppend(stream, name)
+	if err != nil {
+		return err
+	}
+	defer s.pending.Done()
+	return w.Append(at, value)
+}
+
+func (s *Sink) beginAppend(stream, name string) (*DailyWriter, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return errors.New("recording: 싱크가 닫혔습니다")
+		return nil, errors.New("recording: 싱크가 닫혔습니다")
 	}
 	if err := s.lockStream(stream); err != nil {
-		return err
+		return nil, err
 	}
 	key := stream + "/" + name
 	w := s.writers[key]
@@ -427,11 +437,12 @@ func (s *Sink) Append(stream, name string, at time.Time, value any) error {
 		var err error
 		w, err = NewDailyWriter(s.root, stream, name)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		s.writers[key] = w
 	}
-	return w.Append(at, value)
+	s.pending.Add(1)
+	return w, nil
 }
 func (s *Sink) Close() error {
 	s.mu.Lock()
@@ -440,6 +451,9 @@ func (s *Sink) Close() error {
 		return nil
 	}
 	s.closed = true
+	// Appends register under mu and finish without it. Keep the process
+	// locks until all accepted writes and writer closes have completed.
+	s.pending.Wait()
 	var errs []error
 	for _, w := range s.writers {
 		if err := w.Close(); err != nil {

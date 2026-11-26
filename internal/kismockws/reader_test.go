@@ -1,11 +1,13 @@
 package kismockws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -190,7 +192,7 @@ func TestModuleReturnsRecordingErrorAfterAppendFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	module.appendRecord = func(string, time.Time, any) error { return errors.New("disk full") }
+	module.appendRecord = func(*recording.Sink, string, time.Time, any) error { return errors.New("disk full") }
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -368,29 +370,49 @@ func TestSubscribeRegistrationTreatsShutdownAsClean(t *testing.T) {
 	}
 }
 
+type blockingQuoteRecord struct {
+	value   any
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (r blockingQuoteRecord) MarshalJSON() ([]byte, error) {
+	close(r.started)
+	<-r.release
+	return json.Marshal(r.value)
+}
+
 func TestSlowQuoteWriterDropsOverflowAndDrains(t *testing.T) {
+	var logs bytes.Buffer
 	transport := newAckTransport()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	module, err := New(Config{
 		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
 		RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
 		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	quoteStarted, releaseQuote, noticeWritten := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	quotesWritten := 0
-	module.appendRecord = func(stream string, _ time.Time, _ any) error {
-		if stream != quoteRecordingName {
-			close(noticeWritten)
-			return nil
+	quotesWritten, noticesWritten := 0, 0
+	const noticeCount = readerOutputBuffer + 2
+	module.appendRecord = func(sink *recording.Sink, name string, at time.Time, value any) error {
+		if name == quoteRecordingName && quotesWritten == 0 {
+			value = blockingQuoteRecord{value: value, started: quoteStarted, release: releaseQuote}
 		}
-		quotesWritten++
-		if quotesWritten == 1 {
-			close(quoteStarted)
-			<-releaseQuote
+		if err := record(sink, name, at, value); err != nil {
+			return err
+		}
+		if name == quoteRecordingName {
+			quotesWritten++
+		} else if name == futuresRecordingName {
+			noticesWritten++
+			if noticesWritten == noticeCount {
+				close(noticeWritten)
+			}
 		}
 		return nil
 	}
@@ -402,8 +424,13 @@ func TestSlowQuoteWriterDropsOverflowAndDrains(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Errorf("Run: %v", err)
 		}
-		if !t.Failed() && quotesWritten != 33 {
-			t.Errorf("recorded %d quotes, want one in flight plus 32 queued", quotesWritten)
+		if !t.Failed() {
+			if quotesWritten != quoteQueueSize+1 {
+				t.Errorf("recorded %d quotes, want one in flight plus %d queued", quotesWritten, quoteQueueSize)
+			}
+			if !strings.Contains(logs.String(), "dropped_quotes=2") {
+				t.Error("shutdown log did not report the two discarded quotes")
+			}
 		}
 	}()
 	for {
@@ -429,17 +456,22 @@ func TestSlowQuoteWriterDropsOverflowAndDrains(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("quote writer did not start")
 	}
-	for i := 0; i < 34; i++ {
+	for i := 0; i < quoteQueueSize+2; i++ {
 		select {
 		case transport.reads <- frame:
 		case <-ctx.Done():
 			t.Fatal("blocked quote writer stalled the reader")
 		}
 	}
-	select {
-	case transport.reads <- []byte("0|H0IFCNI0|001|malformed"):
-	case <-ctx.Done():
-		t.Fatal("could not deliver notice after quote burst")
+	noticeFields := make([]string, 22)
+	noticeFields[5], noticeFields[11], noticeFields[12], noticeFields[13] = "0", "0", "2", "2"
+	noticeFrame := []byte("0|" + TRFuturesNoticeAlt + "|001|" + strings.Join(noticeFields, "^"))
+	for i := 0; i < noticeCount; i++ {
+		select {
+		case transport.reads <- noticeFrame:
+		case <-ctx.Done():
+			t.Fatal("blocked quote write stalled socket draining")
+		}
 	}
 	select {
 	case <-noticeWritten:

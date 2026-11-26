@@ -56,7 +56,7 @@ type Health struct {
 // Module records KIS mock quote and notice frames without ingesting them.
 type Module struct {
 	cfg          Config
-	appendRecord func(stream string, at time.Time, value any) error
+	appendRecord func(sink *recording.Sink, name string, at time.Time, value any) error
 
 	connected     atomic.Bool
 	malformed     atomic.Uint64
@@ -143,6 +143,7 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
+	initialDrops := m.droppedQuotes.Load()
 	quoteEvents := make(chan ws.Event, quoteQueueSize)
 	quoteWriterDone := make(chan struct{})
 	go func() {
@@ -251,6 +252,9 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		close(quoteEvents)
 		drain()
 		<-quoteWriterDone
+		if dropped := m.droppedQuotes.Load() - initialDrops; dropped > 0 {
+			m.cfg.Logger.Warn("KIS mock quote recording queue overflowed", "dropped_quotes", dropped)
+		}
 		m.connected.Store(false)
 		var subscriptionErr error
 		select {
@@ -379,11 +383,9 @@ func (m *Module) append(sink *recording.Sink, name string, at time.Time, value a
 	}
 	appendRecord := m.appendRecord
 	if appendRecord == nil {
-		appendRecord = func(stream string, at time.Time, value any) error {
-			return record(sink, stream, at, value)
-		}
+		appendRecord = record
 	}
-	if err := appendRecord(name, at, value); err != nil {
+	if err := appendRecord(sink, name, at, value); err != nil {
 		m.setWriteError(err)
 		m.setError("recording append failed")
 		if m.cfg.Logger != nil {
