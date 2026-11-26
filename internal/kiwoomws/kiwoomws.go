@@ -2,6 +2,7 @@
 package kiwoomws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,11 +25,16 @@ const (
 	NameUS                = "kiwoom-us"
 	MaxSymbols            = 200
 	ioTimeout             = 10 * time.Second
+	readIdleLimit         = 90 * time.Second
 )
 
 var (
 	ErrLiveEndpoint = errors.New("키움 모의 웹소켓 호스트만 허용됩니다")
 	ErrAppend       = errors.New("키움 웹소켓 프레임 기록에 실패했습니다")
+	errTokenFailure = errors.New("키움 모의 OAuth 토큰 발급을 중단합니다")
+	errLoginReject  = errors.New("키움 모의 웹소켓 로그인이 거부되었습니다")
+	errRegReject    = errors.New("키움 모의 웹소켓 구독이 거부되었습니다")
+	errReadIdle     = errors.New("키움 모의 웹소켓 유휴 읽기 제한을 초과했습니다")
 	symbolPattern   = regexp.MustCompile(`^[A-Za-z0-9._-]{1,16}$`)
 )
 
@@ -77,6 +83,7 @@ type Config struct {
 
 type Reader struct {
 	cfg       Config
+	readIdle  time.Duration
 	running   atomic.Bool
 	connected atomic.Bool
 	malformed atomic.Uint64
@@ -104,7 +111,7 @@ func New(cfg Config) (*Reader, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Reader{cfg: cfg}, nil
+	return &Reader{cfg: cfg, readIdle: readIdleLimit}, nil
 }
 
 // ValidateEndpoint allows only the fixed Kiwoom mock WebSocket endpoint.
@@ -193,6 +200,10 @@ func (r *Reader) Run(ctx context.Context) error {
 		if errors.Is(err, ErrAppend) {
 			return err
 		}
+		if permanentSessionError(err) {
+			r.cfg.Logger.Error("키움 모의 웹소켓을 중단합니다", "account", r.cfg.Account, "reason", safeReason(err))
+			return err
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -216,13 +227,27 @@ func safeReason(err error) string {
 	if err == nil {
 		return "연결 종료"
 	}
+	switch {
+	case errors.Is(err, errTokenFailure):
+		return "모의 OAuth 토큰 발급 실패"
+	case errors.Is(err, errLoginReject):
+		return "모의 WebSocket 로그인 거부"
+	case errors.Is(err, errRegReject):
+		return "모의 WebSocket 구독 거부"
+	case errors.Is(err, errReadIdle):
+		return "모의 WebSocket 유휴 읽기 시간 초과"
+	}
 	return "연결 또는 프로토콜 오류"
+}
+
+func permanentSessionError(err error) bool {
+	return errors.Is(err, errTokenFailure) || errors.Is(err, errLoginReject) || errors.Is(err, errRegReject)
 }
 
 func (r *Reader) session(ctx context.Context) error {
 	token, err := r.cfg.Token(ctx)
 	if err != nil || strings.TrimSpace(token) == "" {
-		return errors.New("키움 모의 OAuth 토큰을 사용할 수 없습니다")
+		return errTokenFailure
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, ioTimeout)
 	conn, err := r.cfg.Dial(dialCtx, r.cfg.Endpoint)
@@ -248,8 +273,14 @@ func (r *Reader) session(ctx context.Context) error {
 	r.connected.Store(true)
 	defer r.connected.Store(false)
 	for {
-		_, raw, err := conn.Read(ctx)
+		readCtx, cancel := context.WithTimeout(ctx, r.readIdle)
+		_, raw, err := conn.Read(readCtx)
+		idleExpired := ctx.Err() == nil && errors.Is(readCtx.Err(), context.DeadlineExceeded)
+		cancel()
 		if err != nil {
+			if idleExpired {
+				return errReadIdle
+			}
 			return errors.New("키움 모의 웹소켓 수신이 중단되었습니다")
 		}
 		if err := r.handleFrame(conn, ctx, raw, token); err != nil {
@@ -277,7 +308,7 @@ func (r *Reader) readUntilLogin(ctx context.Context, conn Socket, token string) 
 			continue
 		}
 		if head.ReturnCode == nil || *head.ReturnCode != 0 {
-			return errors.New("키움 모의 웹소켓 로그인이 거부되었습니다")
+			return errLoginReject
 		}
 		return nil
 	}
@@ -288,8 +319,8 @@ func (r *Reader) handleFrame(conn Socket, ctx context.Context, raw []byte, token
 	var head struct {
 		TRNM string `json:"trnm"`
 	}
-	if json.Unmarshal(raw, &frame) != nil || frame == nil || json.Unmarshal(raw, &head) != nil || strings.TrimSpace(head.TRNM) == "" || (token != "" && strings.Contains(string(raw), token)) {
-		r.malformed.Add(1)
+	if json.Unmarshal(raw, &frame) != nil || frame == nil || json.Unmarshal(raw, &head) != nil || strings.TrimSpace(head.TRNM) == "" || (token != "" && frameContainsToken(raw, token)) {
+		r.recordMalformed()
 		return nil
 	}
 	if err := r.cfg.Append(Frame{Account: r.cfg.Account, ReceivedAt: time.Now().UTC(), Raw: append(json.RawMessage(nil), raw...)}); err != nil {
@@ -305,10 +336,35 @@ func (r *Reader) handleFrame(conn Socket, ctx context.Context, raw []byte, token
 			ReturnCode *int `json:"return_code"`
 		}
 		if json.Unmarshal(raw, &ack) != nil || ack.ReturnCode == nil || *ack.ReturnCode != 0 {
-			return errors.New("키움 모의 웹소켓 구독이 거부되었습니다")
+			return errRegReject
 		}
 	}
 	return nil
+}
+
+func (r *Reader) recordMalformed() {
+	count := r.malformed.Add(1)
+	if count&(count-1) == 0 {
+		r.cfg.Logger.Warn("키움 모의 웹소켓 잘못된 프레임을 버렸습니다", "malformed_frames", count)
+	}
+}
+
+// frameContainsToken checks the raw frame and its decoded strings so JSON
+// escapes cannot hide a reflected access token in a key or nested value.
+func frameContainsToken(raw []byte, token string) bool {
+	if bytes.Contains(raw, []byte(token)) {
+		return true
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	for {
+		item, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if value, ok := item.(string); ok && strings.Contains(value, token) {
+			return true
+		}
+	}
 }
 
 func write(ctx context.Context, conn Socket, payload []byte) error {
