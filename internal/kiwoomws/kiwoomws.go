@@ -198,6 +198,9 @@ func (r *Reader) Run(ctx context.Context) error {
 		if errors.Is(err, ErrAppend) {
 			return err
 		}
+		if ctx.Err() != nil {
+			return nil
+		}
 		if errors.Is(err, ErrPermanentAuth) {
 			r.cfg.Logger.Error("키움 모의 웹소켓 실행 중단", "account", r.cfg.Account, "reason", safeReason(err), "malformed_frames", r.malformed.Load())
 			return ErrPermanentAuth
@@ -230,8 +233,14 @@ func safeReason(err error) string {
 
 func (r *Reader) session(ctx context.Context) error {
 	token, err := r.cfg.Token(ctx)
-	if err != nil || strings.TrimSpace(token) == "" {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, ErrPermanentAuth) {
 		return ErrPermanentAuth
+	}
+	if err != nil || strings.TrimSpace(token) == "" {
+		return errors.New("키움 모의 OAuth 토큰을 사용할 수 없습니다")
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, ioTimeout)
 	conn, err := r.cfg.Dial(dialCtx, r.cfg.Endpoint)
