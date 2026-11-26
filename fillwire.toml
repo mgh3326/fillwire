@@ -123,6 +123,13 @@ access_token_source = "" # "" with access_token_env, or "redis"
 enabled = false
 directory = "/var/lib/fillwire/recordings"
 
+# fillwire serve의 토스 개인 주문과 선택 시세 프레임은 연결을 공유하며 기본 비활성화입니다.
+[toss_ws]
+enabled = false
+account_seq = ""
+directory = "/var/lib/fillwire/recordings"
+symbols_file = "" # 선택 사항: 줄마다 "<kr|us> <code>", 최대 40개
+
 # 키움 모의 웹소켓 기록기. 계정별로 따로 실행합니다:
 # fillwire kiwoom-kr 또는 fillwire kiwoom-us
 [kiwoom_mock_kr]

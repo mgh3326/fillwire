@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	mathrand "math/rand/v2"
 	"net/http"
@@ -20,11 +21,13 @@ import (
 )
 
 const (
-	Endpoint     = quote.Endpoint
-	pingInterval = 60 * time.Second
-	ioTimeout    = 10 * time.Second
-	readIdle     = 3 * pingInterval
-	authWindow   = 10 * time.Minute
+	Endpoint         = quote.Endpoint
+	MaxSubscriptions = 100
+	pingInterval     = 60 * time.Second
+	ioTimeout        = 10 * time.Second
+	readIdle         = 3 * pingInterval
+	authWindow       = 10 * time.Minute
+	quoteQueueSize   = 2048
 )
 
 var (
@@ -73,23 +76,38 @@ func (wallClock) Now() time.Time                         { return time.Now() }
 func (wallClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 type Config struct {
-	AccountSeq string
-	Tokens     TokenSource
-	Append     func(Record) error
-	Dial       Dialer
-	Clock      Clock
-	Logger     *slog.Logger
+	AccountSeq  string
+	Symbols     []quote.Symbol
+	Tokens      TokenSource
+	Append      func(Record) error
+	AppendQuote func(Record) error
+	Dial        Dialer
+	Clock       Clock
+	Logger      *slog.Logger
 }
 
 type Reader struct {
-	cfg       Config
-	running   atomic.Bool
-	malformed atomic.Uint64
+	cfg            Config
+	decoder        *quote.Decoder
+	topics         []string
+	running        atomic.Bool
+	healthy        atomic.Bool
+	malformed      atomic.Uint64
+	rejectedQuotes atomic.Uint64
+	droppedQuotes  atomic.Uint64
+	quoteRecords   chan Record
 }
+
+// Health reports whether this reader has an acknowledged live connection.
+func (r *Reader) Health() bool { return r.healthy.Load() }
 
 func New(cfg Config) (*Reader, error) {
 	if !ValidAccountSeq(cfg.AccountSeq) || cfg.Tokens == nil || cfg.Append == nil {
 		return nil, errors.New("Toss WS requires account_seq, gatewayd token source and recorder")
+	}
+	_, topics, err := buildDeclaration("validation", cfg.AccountSeq, cfg.Symbols)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Dial == nil {
 		cfg.Dial = dial
@@ -100,7 +118,56 @@ func New(cfg Config) (*Reader, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Reader{cfg: cfg}, nil
+	if cfg.AppendQuote == nil {
+		cfg.AppendQuote = cfg.Append
+	}
+	return &Reader{cfg: cfg, decoder: quote.NewDecoder(cfg.Symbols), topics: topics}, nil
+}
+
+// buildDeclaration creates Toss's full-replacement subscription declaration.
+// One personal-order subscription is always present; each configured symbol
+// consumes one trade and one orderbook subscription.
+func buildDeclaration(id, account string, symbols []quote.Symbol) ([]byte, []string, error) {
+	if !ValidAccountSeq(account) {
+		return nil, nil, errors.New("Toss WS requires a valid account_seq")
+	}
+	if 1+2*len(symbols) > MaxSubscriptions {
+		return nil, nil, fmt.Errorf("Toss WS subscription count exceeds %d", MaxSubscriptions)
+	}
+	seen := make(map[quote.Symbol]struct{}, len(symbols))
+	byMarket := map[string][]string{}
+	for _, symbol := range symbols {
+		if !quote.ValidSymbol(symbol) {
+			return nil, nil, errors.New("Toss WS contains an invalid quote symbol")
+		}
+		if _, ok := seen[symbol]; ok {
+			return nil, nil, errors.New("Toss WS contains a duplicate quote symbol")
+		}
+		seen[symbol] = struct{}{}
+		byMarket[symbol.Market] = append(byMarket[symbol.Market], symbol.Code)
+	}
+	declaration := []any{
+		map[string]string{"id": id},
+		map[string]any{"type": channel, "codes": []string{account}},
+	}
+	topics := []string{channel + ":" + account}
+	for _, market := range []string{quote.MarketKR, quote.MarketUS} {
+		codes := byMarket[market]
+		if len(codes) == 0 {
+			continue
+		}
+		for _, kind := range []string{"trade", "orderbook"} {
+			declaration = append(declaration, map[string]any{"type": kind + ":" + market, "codes": codes})
+			for _, code := range codes {
+				topics = append(topics, kind+":"+market+":"+code)
+			}
+		}
+	}
+	payload, err := json.Marshal(declaration)
+	if err != nil {
+		return nil, nil, err
+	}
+	return payload, topics, nil
 }
 
 func dial(ctx context.Context, endpoint string, headers http.Header) (Socket, int, error) {
@@ -125,6 +192,21 @@ func (r *Reader) Run(ctx context.Context) error {
 		return errors.New("Toss WS reader is already running")
 	}
 	defer r.running.Store(false)
+	r.quoteRecords = make(chan Record, quoteQueueSize)
+	quoteWriterDone := make(chan struct{})
+	go func() {
+		defer close(quoteWriterDone)
+		for record := range r.quoteRecords {
+			if err := r.cfg.AppendQuote(record); err != nil {
+				r.dropQuote("append failed")
+			}
+		}
+	}()
+	defer func() {
+		close(r.quoteRecords)
+		<-quoteWriterDone
+		r.quoteRecords = nil
+	}()
 	var rejected string
 	var recoveryStarted time.Time
 	delay := time.Second
@@ -235,18 +317,22 @@ func (r *Reader) session(ctx context.Context, conn Socket, token, id string) err
 		return ErrRecord
 	}
 
-	declaration := []map[string]any{{"id": id}, {"type": channel, "codes": []string{r.cfg.AccountSeq}}}
-	payload, _ := json.Marshal(declaration)
+	payload, topics, err := buildDeclaration(id, r.cfg.AccountSeq, r.cfg.Symbols)
+	if err != nil {
+		return err
+	}
 	if write(ctx, conn, payload) != nil {
 		return errWrite
 	}
 	firstPing := r.cfg.Clock.After(pingInterval)
 	ackCtx, cancel := context.WithTimeout(ctx, ioTimeout)
-	err := r.ack(ackCtx, conn, id, topic)
+	err = r.ack(ackCtx, conn, id, topics)
 	cancel()
 	if err != nil {
 		return err
 	}
+	r.healthy.Store(true)
+	defer r.healthy.Store(false)
 
 	sessionCtx, stop := context.WithCancelCause(ctx)
 	pingDone := make(chan struct{})
@@ -282,18 +368,50 @@ func (r *Reader) session(ctx context.Context, conn Socket, token, id string) err
 			if err := serverError(frame); err != nil {
 				return err
 			}
-		case frame["type"] == "message" && orderData(frame, topic, r.cfg.AccountSeq) && !containsToken(raw, token):
-			data, _ := json.Marshal(frame["data"])
-			if err := r.cfg.Append(Record{Kind: "order", ReceivedAt: at, SessionID: id, Topic: topic, Data: data, Raw: raw}); err != nil {
-				return ErrRecord
+		case frame["type"] == "message":
+			topicValue, _ := frame["topic"].(string)
+			if quoteTopic(topicValue) {
+				recorded, err := r.recordQuote(raw, topicValue, at, id, token)
+				if err != nil {
+					return err
+				}
+				if recorded {
+					continue
+				}
+				r.dropMalformed()
+				continue
 			}
-			continue
+			if orderData(frame, topic, r.cfg.AccountSeq) && !containsToken(raw, token) {
+				data, _ := json.Marshal(frame["data"])
+				if err := r.cfg.Append(Record{Kind: "order", ReceivedAt: at, SessionID: id, Topic: topic, Data: data, Raw: raw}); err != nil {
+					return ErrRecord
+				}
+				continue
+			}
 		}
 		r.dropMalformed()
 	}
 }
 
-func (r *Reader) ack(ctx context.Context, conn Socket, id, topic string) error {
+func quoteTopic(topic string) bool {
+	return strings.HasPrefix(topic, "trade:") || strings.HasPrefix(topic, "orderbook:")
+}
+
+func (r *Reader) recordQuote(raw []byte, topic string, at time.Time, id, token string) (bool, error) {
+	frame := r.decoder.Decode(raw)
+	if frame.Kind != quote.FrameMessage || (frame.Drop != "" && frame.Drop != quote.DropOutOfSession && frame.Drop != quote.DropEmptyBook && frame.Drop != quote.DropNoTimestamp) || containsToken(raw, token) {
+		return false, nil
+	}
+	record := Record{Kind: strings.SplitN(topic, ":", 2)[0], ReceivedAt: at, SessionID: id, Topic: topic, Raw: raw}
+	select {
+	case r.quoteRecords <- record:
+	default:
+		r.dropQuote("queue full")
+	}
+	return true, nil
+}
+
+func (r *Reader) ack(ctx context.Context, conn Socket, id string, topics []string) error {
 	for {
 		kind, raw, err := conn.Read(ctx)
 		if err != nil {
@@ -324,16 +442,52 @@ func (r *Reader) ack(ctx context.Context, conn Socket, id, topic string) error {
 			if frame["id"] != id || !subOK || !rejectOK {
 				return ErrAck
 			}
+			want := make(map[string]struct{}, len(topics))
+			for _, topic := range topics {
+				want[topic] = struct{}{}
+			}
+			seen := make(map[string]struct{}, len(topics))
 			for _, item := range rejected {
 				rejection, _ := item.(object)
-				if rejection["code"] == "account-not-found" {
+				topic, topicOK := rejection["target"].(string)
+				code, codeOK := rejection["code"].(string)
+				if !topicOK || !codeOK || code == "" {
+					return ErrAck
+				}
+				if _, expected := want[topic]; !expected {
+					return ErrAck
+				}
+				if _, duplicate := seen[topic]; duplicate {
+					return ErrAck
+				}
+				seen[topic] = struct{}{}
+				if topic == channel+":"+r.cfg.AccountSeq && code == "account-not-found" {
 					return ErrAccountNotFound
 				}
+				if topic == channel+":"+r.cfg.AccountSeq {
+					return ErrRejected
+				}
+				count := r.rejectedQuotes.Add(1)
+				r.cfg.Logger.Warn("Toss quote subscription rejected", "target", topic, "code", code, "rejected_quotes", count)
 			}
-			if len(rejected) != 0 {
-				return ErrRejected
+			for _, item := range subscribed {
+				topic, ok := item.(string)
+				if !ok {
+					return ErrAck
+				}
+				if _, ok := want[topic]; !ok {
+					return ErrAck
+				}
+				if _, duplicate := seen[topic]; duplicate {
+					return ErrAck
+				}
+				seen[topic] = struct{}{}
 			}
-			if len(subscribed) != 1 || subscribed[0] != topic {
+			personalOrder := channel + ":" + r.cfg.AccountSeq
+			if _, ok := seen[personalOrder]; !ok {
+				return ErrAck
+			}
+			if len(seen) != len(want) {
 				return ErrAck
 			}
 			return nil
@@ -386,6 +540,13 @@ func (r *Reader) dropMalformed() {
 	// Log early and at powers of two during a sustained malformed burst.
 	if count&(count-1) == 0 {
 		r.cfg.Logger.Warn("Toss WS malformed frame dropped", "malformed_frames", count)
+	}
+}
+
+func (r *Reader) dropQuote(reason string) {
+	count := r.droppedQuotes.Add(1)
+	if count == 1 || count&(count-1) == 0 {
+		r.cfg.Logger.Warn("Toss quote record dropped", "reason", reason, "dropped_quotes", count)
 	}
 }
 

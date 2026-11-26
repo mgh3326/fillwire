@@ -9,21 +9,25 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/gatewayd"
+	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/recording"
 	"github.com/mgh3326/fillwire/internal/tokenfetch"
 	"github.com/mgh3326/fillwire/internal/tossws"
 )
 
 const tossOrderStream = "toss-order"
+const tossQuoteStream = "toss-quote"
 
 type tossWSFileConfig struct {
-	Enabled    bool   `toml:"enabled"`
-	AccountSeq string `toml:"account_seq"`
-	Directory  string `toml:"directory"`
+	Enabled     bool   `toml:"enabled"`
+	AccountSeq  string `toml:"account_seq"`
+	Directory   string `toml:"directory"`
+	SymbolsFile string `toml:"symbols_file"`
 }
 
 type tossWSSettings struct {
 	tossWSFileConfig
+	symbols    []quote.Symbol
 	fetchURL   string
 	credential string
 }
@@ -39,6 +43,14 @@ func resolveTossWSSettings(contents []byte, g gatewaydSettings) (tossWSSettings,
 	if !tossws.ValidAccountSeq(f.AccountSeq) || strings.TrimSpace(f.Directory) == "" {
 		return tossWSSettings{}, errors.New("toss_ws: 활성화하려면 숫자 문자열 account_seq와 directory가 필요합니다")
 	}
+	var symbols []quote.Symbol
+	if strings.TrimSpace(f.SymbolsFile) != "" {
+		loaded, loadErr := quote.LoadSymbols(f.SymbolsFile)
+		if loadErr != nil {
+			return tossWSSettings{}, errors.New("toss_ws: symbols_file 거부됨")
+		}
+		symbols = loaded
+	}
 	if g.TokenHeader == "" {
 		g.TokenHeader = "Authorization"
 	}
@@ -51,7 +63,7 @@ func resolveTossWSSettings(contents []byte, g gatewaydSettings) (tossWSSettings,
 	if !ok || credential == "" {
 		return tossWSSettings{}, errors.New("toss_ws: gatewayd 인증 환경 변수가 설정되지 않았습니다")
 	}
-	return tossWSSettings{tossWSFileConfig: f, fetchURL: base, credential: credential}, nil
+	return tossWSSettings{tossWSFileConfig: f, symbols: symbols, fetchURL: base, credential: credential}, nil
 }
 
 func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger) func() {
@@ -78,20 +90,32 @@ func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger
 	if err != nil {
 		return errors.New("Toss WS gatewayd client setup failed")
 	}
-	sink, err := recording.NewSink(settings.Directory, tossOrderStream)
+	orderSink, err := recording.NewSink(settings.Directory, tossOrderStream)
 	if err != nil {
 		return err
 	}
+	quoteSink, err := recording.NewSink(settings.Directory, tossQuoteStream)
+	if err != nil {
+		_ = orderSink.Close()
+		return err
+	}
 	defer func() {
-		if err := sink.Close(); err != nil {
-			logger.Error("Toss WS JSONL recorder close failed", "reason", err)
+		if err := orderSink.Close(); err != nil {
+			logger.Error("Toss WS order recorder close failed", "reason", err)
+		}
+		if err := quoteSink.Close(); err != nil {
+			logger.Error("Toss WS quote recorder close failed", "reason", err)
 		}
 	}()
 	reader, err := tossws.New(tossws.Config{
 		AccountSeq: settings.AccountSeq,
+		Symbols:    settings.symbols,
 		Tokens:     tokenfetch.NewHolder(client, string(gatewayd.ProviderToss), 2*time.Minute, false, nil),
 		Append: func(r tossws.Record) error {
-			return sink.Append(tossOrderStream, settings.AccountSeq, r.ReceivedAt, r)
+			return orderSink.Append(tossOrderStream, settings.AccountSeq, r.ReceivedAt, r)
+		},
+		AppendQuote: func(r tossws.Record) error {
+			return quoteSink.Append(tossQuoteStream, settings.AccountSeq, r.ReceivedAt, r)
 		},
 		Logger: logger,
 	})
