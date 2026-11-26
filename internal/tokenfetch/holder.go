@@ -64,6 +64,18 @@ func (h *Holder) Current(ctx context.Context) (token Token, degraded bool, err e
 	return Token{}, false, err
 }
 
+// Refresh bypasses the local cache without asking gatewayd to replace a
+// shared token. Gatewayd may return the same token under its normal policy.
+func (h *Holder) Refresh(ctx context.Context) (Token, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	token, err := h.fetcher.Fetch(ctx, h.provider, "")
+	if err == nil {
+		h.adopt(token)
+	}
+	return token, err
+}
+
 // Reissue is for a token the broker rejected. It sends that token's hash, so
 // gatewayd reissues if it is still current and otherwise answers with the
 // newer token it already has; either answer is adopted. A held token equal to

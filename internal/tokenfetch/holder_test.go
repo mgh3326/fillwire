@@ -151,3 +151,18 @@ func TestHolderWithoutKeepLiveFailsClosed(t *testing.T) {
 		t.Fatalf("Current = %v %v %v", token, degraded, err)
 	}
 }
+
+func TestHolderRefreshBypassesLocalCacheWithoutRejectingSharedToken(t *testing.T) {
+	server, holder, _ := newHolder(t, time.Hour)
+	first, _, err := holder.Current(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetched, err := holder.Refresh(t.Context())
+	if err != nil || fetched.Value() != first.Value() {
+		t.Fatalf("ordinary fetch should return the same still-valid token: %v", err)
+	}
+	if calls := server.Calls(); len(calls) != 2 || calls[1].Failed != "" {
+		t.Fatal("refresh must make one fetch without a failed token hash")
+	}
+}

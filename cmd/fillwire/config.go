@@ -95,6 +95,7 @@ type runtimeConfig struct {
 	kisFutures     kisFuturesSettings
 	recording      recordingSettings
 	upbit          upbitSettings
+	tossWS         tossWSSettings
 	reconcile      reconcileSettings
 }
 
@@ -188,6 +189,9 @@ func loadConfig(path string) (runtimeConfig, error) {
 		return runtimeConfig{}, err
 	}
 	if cfg.upbit, err = resolveUpbitSettings(contents); err != nil {
+		return runtimeConfig{}, err
+	}
+	if cfg.tossWS, err = resolveTossWSSettings(contents, cfg.KIS.Gatewayd); err != nil {
 		return runtimeConfig{}, err
 	}
 	if cfg.reconcile, err = resolveReconcileSettings(contents); err != nil {
