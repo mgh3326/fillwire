@@ -13,7 +13,7 @@ type registration struct {
 }
 
 type registrationData struct {
-	Item []string `json:"item"`
+	Item any      `json:"item"`
 	Type []string `json:"type"`
 }
 
@@ -29,23 +29,31 @@ var accountTypes = map[Account][]string{
 
 // BuildSubscription creates the documented initial REG message. Account
 // events use item [""] because they are scoped to the access-token account.
-func BuildSubscription(account Account, symbols []string) ([]byte, error) {
+func BuildSubscription(account Account, symbols []Symbol) ([]byte, error) {
 	if account != AccountKR && account != AccountUS {
 		return nil, errors.New("Kiwoom WS 계정 유형이 잘못되었습니다")
 	}
-	if err := ValidateSymbols(symbols); err != nil {
+	if err := ValidateSymbols(account, symbols); err != nil {
 		return nil, err
 	}
 	data := make([]registrationData, 0, 2)
 	if len(symbols) > 0 {
-		data = append(data, registrationData{Item: append([]string(nil), symbols...), Type: append([]string(nil), quoteTypes[account]...)})
+		if account == AccountKR {
+			items := make([]string, len(symbols))
+			for i, symbol := range symbols {
+				items[i] = symbol.Code
+			}
+			data = append(data, registrationData{Item: items, Type: append([]string(nil), quoteTypes[account]...)})
+		} else {
+			data = append(data, registrationData{Item: append([]Symbol(nil), symbols...), Type: append([]string(nil), quoteTypes[account]...)})
+		}
 	}
 	data = append(data, registrationData{Item: []string{""}, Type: append([]string(nil), accountTypes[account]...)})
 	return json.Marshal(registration{TRNM: "REG", GroupNo: "1", Refresh: "0", Data: data})
 }
 
 // BuildRemoval creates a documented REMOVE message for the same account data.
-func BuildRemoval(account Account, symbols []string) ([]byte, error) {
+func BuildRemoval(account Account, symbols []Symbol) ([]byte, error) {
 	payload, err := BuildSubscription(account, symbols)
 	if err != nil {
 		return nil, err

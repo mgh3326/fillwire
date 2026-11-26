@@ -16,6 +16,14 @@ import (
 )
 
 type kiwoomAccountConfig struct {
+	Enabled      bool              `toml:"enabled"`
+	Symbols      []kiwoomws.Symbol `toml:"symbols"`
+	Directory    string            `toml:"directory"`
+	AppKeyEnv    string            `toml:"app_key_env"`
+	AppSecretEnv string            `toml:"app_secret_env"`
+}
+
+type kiwoomKRConfig struct {
 	Enabled      bool     `toml:"enabled"`
 	Symbols      []string `toml:"symbols"`
 	Directory    string   `toml:"directory"`
@@ -41,24 +49,34 @@ func runKiwoomCommand(account kiwoomws.Account, args []string) error {
 	if err != nil {
 		return err
 	}
-	var krCfg, usCfg kiwoomAccountConfig
-	if _, err := strictTable(contents, "kiwoom_mock_kr", &krCfg); err != nil {
+	var krRaw kiwoomKRConfig
+	var usCfg kiwoomAccountConfig
+	if _, err := strictTable(contents, "kiwoom_mock_kr", &krRaw); err != nil {
 		return err
 	}
 	if _, err := strictTable(contents, "kiwoom_mock_us", &usCfg); err != nil {
 		return err
 	}
-	krSymbols, usSymbols := []string(nil), []string(nil)
-	if krCfg.Enabled {
-		krSymbols = krCfg.Symbols
+	krSymbols := make([]kiwoomws.Symbol, 0, len(krRaw.Symbols))
+	if krRaw.Enabled {
+		for _, code := range krRaw.Symbols {
+			krSymbols = append(krSymbols, kiwoomws.Symbol{Code: code})
+		}
 	}
+	usSymbols := []kiwoomws.Symbol(nil)
 	if usCfg.Enabled {
 		usSymbols = usCfg.Symbols
 	}
 	if err := kiwoomws.ValidateCombinedSymbols(krSymbols, usSymbols); err != nil {
 		return err
 	}
-	selected := krCfg
+	selected := kiwoomAccountConfig{
+		Enabled:      krRaw.Enabled,
+		Symbols:      krSymbols,
+		Directory:    krRaw.Directory,
+		AppKeyEnv:    krRaw.AppKeyEnv,
+		AppSecretEnv: krRaw.AppSecretEnv,
+	}
 	if account == kiwoomws.AccountUS {
 		selected = usCfg
 	}

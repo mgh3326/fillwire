@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -53,13 +54,15 @@ func TestMockEndpointPolicy(t *testing.T) {
 func TestBuildSubscriptionMatchesKiwoomDocs(t *testing.T) {
 	for _, tc := range []struct {
 		account     Account
+		symbols     []Symbol
+		wantItems   []any
 		wantQuotes  []string
 		wantAccount []string
 	}{
-		{AccountKR, []string{"0B", "0D", "0H", "1h"}, []string{"00", "04"}},
-		{AccountUS, []string{"FE", "FT"}, []string{"F4", "F5"}},
+		{AccountKR, []Symbol{{Code: "005930"}}, []any{"005930"}, []string{"0B", "0D", "0H", "1h"}, []string{"00", "04"}},
+		{AccountUS, []Symbol{{Code: "NVDA", Exchange: "ND"}}, []any{map[string]any{"jmcode": "NVDA", "stex_tp": "ND"}}, []string{"FE", "FT"}, []string{"F4", "F5"}},
 	} {
-		payload, err := BuildSubscription(tc.account, []string{"005930"})
+		payload, err := BuildSubscription(tc.account, tc.symbols)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -70,10 +73,10 @@ func TestBuildSubscriptionMatchesKiwoomDocs(t *testing.T) {
 		if got.TRNM != "REG" || got.GroupNo != "1" || got.Refresh != "0" || len(got.Data) != 2 {
 			t.Fatalf("registration header/data = %+v", got)
 		}
-		if strings.Join(got.Data[0].Item, ",") != "005930" || strings.Join(got.Data[0].Type, ",") != strings.Join(tc.wantQuotes, ",") {
+		if !reflect.DeepEqual(got.Data[0].Item, tc.wantItems) || strings.Join(got.Data[0].Type, ",") != strings.Join(tc.wantQuotes, ",") {
 			t.Errorf("quote registration = %+v", got.Data[0])
 		}
-		if strings.Join(got.Data[1].Item, ",") != "" || strings.Join(got.Data[1].Type, ",") != strings.Join(tc.wantAccount, ",") {
+		if !reflect.DeepEqual(got.Data[1].Item, []any{""}) || strings.Join(got.Data[1].Type, ",") != strings.Join(tc.wantAccount, ",") {
 			t.Errorf("account registration = %+v", got.Data[1])
 		}
 	}
@@ -88,7 +91,7 @@ func TestBuildSubscriptionMatchesKiwoomDocs(t *testing.T) {
 }
 
 func TestBuildRemovalAndCombinedSymbolLimit(t *testing.T) {
-	removal, err := BuildRemoval(AccountKR, []string{"005930"})
+	removal, err := BuildRemoval(AccountKR, []Symbol{{Code: "005930"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,18 +99,36 @@ func TestBuildRemovalAndCombinedSymbolLimit(t *testing.T) {
 	if err := json.Unmarshal(removal, &got); err != nil || got.TRNM != "REMOVE" || got.Refresh != "1" {
 		t.Fatalf("removal = %+v, err=%v", got, err)
 	}
-	if err := ValidateCombinedSymbols(makeSymbols(101), makeSymbols(100)); err == nil {
+	removal, err = BuildRemoval(AccountUS, []Symbol{{Code: "NVDA", Exchange: "ND"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(removal, &got); err != nil || got.TRNM != "REMOVE" || !reflect.DeepEqual(got.Data[0].Item, []any{map[string]any{"jmcode": "NVDA", "stex_tp": "ND"}}) {
+		t.Fatalf("US removal quote registration = %+v, err=%v", got, err)
+	}
+	if err := ValidateCombinedSymbols(makeSymbols(101), makeUSSymbols(100)); err == nil {
 		t.Fatal("201 combined symbols accepted")
 	}
-	if err := ValidateCombinedSymbols(makeSymbols(100), makeSymbols(100)); err != nil {
+	if err := ValidateCombinedSymbols(makeSymbols(100), makeUSSymbols(100)); err != nil {
 		t.Fatalf("200 combined symbols rejected: %v", err)
+	}
+	if err := ValidateSymbols(AccountUS, []Symbol{{Code: "NVDA"}}); err == nil {
+		t.Fatal("US symbol without exchange was accepted")
 	}
 }
 
-func makeSymbols(n int) []string {
-	items := make([]string, n)
+func makeSymbols(n int) []Symbol {
+	items := make([]Symbol, n)
 	for i := range items {
-		items[i] = "S" + string(rune('A'+i/26)) + string(rune('A'+i%26))
+		items[i] = Symbol{Code: "S" + string(rune('A'+i/26)) + string(rune('A'+i%26))}
+	}
+	return items
+}
+
+func makeUSSymbols(n int) []Symbol {
+	items := makeSymbols(n)
+	for i := range items {
+		items[i].Exchange = "ND"
 	}
 	return items
 }
@@ -118,7 +139,7 @@ func TestDocumentedFramesRecordedAndMalformedCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	var records []Frame
-	r, err := New(Config{Account: AccountKR, Symbols: []string{"005930"}, Token: func(context.Context) (string, error) { return "mock-token", nil }, Append: func(f Frame) error { records = append(records, f); return nil }})
+	r, err := New(Config{Account: AccountKR, Symbols: []Symbol{{Code: "005930"}}, Token: func(context.Context) (string, error) { return "mock-token", nil }, Append: func(f Frame) error { records = append(records, f); return nil }})
 	if err != nil {
 		t.Fatal(err)
 	}

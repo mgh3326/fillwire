@@ -134,6 +134,7 @@ app_secret_env = "KIWOOM_MOCK_APP_SECRET"
 
 [kiwoom_mock_us]
 enabled = false
+# symbols = [{ code = "NVDA", exchange = "ND" }]
 symbols = []
 directory = "/var/lib/fillwire/recordings"
 app_key_env = "KIWOOM_MOCK_US_APP_KEY"

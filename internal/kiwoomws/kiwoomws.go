@@ -39,6 +39,13 @@ const (
 	AccountUS Account = "us"
 )
 
+// Symbol identifies a quote symbol. US symbols require the Kiwoom exchange
+// code; KR symbols leave Exchange empty.
+type Symbol struct {
+	Code     string `toml:"code" json:"jmcode"`
+	Exchange string `toml:"exchange" json:"stex_tp,omitempty"`
+}
+
 type Frame struct {
 	Account    Account         `json:"account"`
 	ReceivedAt time.Time       `json:"received_at"`
@@ -61,7 +68,7 @@ type Dialer func(context.Context, string) (Socket, error)
 type Config struct {
 	Account  Account
 	Endpoint string
-	Symbols  []string
+	Symbols  []Symbol
 	Token    func(context.Context) (string, error)
 	Append   func(Frame) error
 	Dial     Dialer
@@ -88,7 +95,7 @@ func New(cfg Config) (*Reader, error) {
 	if cfg.Token == nil || cfg.Append == nil {
 		return nil, errors.New("키움 웹소켓에는 토큰 발급기와 기록기가 필요합니다")
 	}
-	if err := ValidateSymbols(cfg.Symbols); err != nil {
+	if err := ValidateSymbols(cfg.Account, cfg.Symbols); err != nil {
 		return nil, err
 	}
 	if cfg.Dial == nil {
@@ -110,31 +117,40 @@ func ValidateEndpoint(endpoint string) error {
 	return nil
 }
 
-func ValidateSymbols(symbols []string) error {
+func ValidateSymbols(account Account, symbols []Symbol) error {
 	if len(symbols) > MaxSymbols {
 		return fmt.Errorf("키움 웹소켓 설정 종목 수가 %d개를 초과했습니다", MaxSymbols)
 	}
 	seen := make(map[string]struct{}, len(symbols))
 	for _, symbol := range symbols {
-		if !symbolPattern.MatchString(symbol) {
+		if !symbolPattern.MatchString(symbol.Code) {
 			return errors.New("키움 웹소켓 종목 코드가 잘못되었습니다")
 		}
-		if _, ok := seen[symbol]; ok {
+		if account == AccountKR && symbol.Exchange != "" {
+			return errors.New("키움 국내주식 종목에는 거래소 코드가 없어야 합니다")
+		}
+		if account == AccountUS && symbol.Exchange != "ND" && symbol.Exchange != "NY" && symbol.Exchange != "NA" {
+			return errors.New("키움 미국주식 거래소 코드는 ND, NY 또는 NA여야 합니다")
+		}
+		if account != AccountKR && account != AccountUS {
+			return errors.New("키움 웹소켓 계정은 kr 또는 us여야 합니다")
+		}
+		if _, ok := seen[symbol.Code]; ok {
 			return errors.New("키움 웹소켓 종목 코드가 중복되었습니다")
 		}
-		seen[symbol] = struct{}{}
+		seen[symbol.Code] = struct{}{}
 	}
 	return nil
 }
 
-func ValidateCombinedSymbols(kr, us []string) error {
+func ValidateCombinedSymbols(kr, us []Symbol) error {
 	if len(kr)+len(us) > MaxSymbols {
 		return fmt.Errorf("키움 국내·미국 웹소켓 종목 합계가 %d개를 초과했습니다", MaxSymbols)
 	}
-	if err := ValidateSymbols(kr); err != nil {
+	if err := ValidateSymbols(AccountKR, kr); err != nil {
 		return err
 	}
-	return ValidateSymbols(us)
+	return ValidateSymbols(AccountUS, us)
 }
 
 func (r *Reader) Name() string {
