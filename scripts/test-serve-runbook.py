@@ -1,9 +1,11 @@
 """Check the deployment copies and runbook against the built CLI."""
 
+import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,5 +54,64 @@ stop_serve = rollback.index("sudo systemctl disable --now fillwire-serve.service
 assert stop_collector < stop_serve
 for unit in ("fillwire-rec.service", "fillwire.service", "broker-edge.service", "gatewayd.service"):
     assert f"sudo systemctl disable {unit}\n" in cutover, unit
-    assert f"sudo systemctl enable --now {unit}\n" in rollback, unit
-print("cutover and rollback document inverse systemd boot settings")
+assert 'cat "$state/boot-id" /proc/sys/kernel/random/boot_id' in cutover
+assert 'systemctl is-active "$unit.service"' in cutover
+assert "journalctl -b " in cutover
+
+blocks = re.findall(r"```sh\n(.*?)```", runbook, re.S)
+for block in blocks:
+    subprocess.run(["bash", "-n"], input=block, text=True, check=True)
+restore = next(block for block in blocks if 'test -f "$state/complete"' in block)
+# Roll back during handoff, when boot flags can still be unchanged, or after
+# disabling the units. Runtime state is independent of either boot state.
+with tempfile.TemporaryDirectory() as home:
+    state = Path(home) / "fillwire-cutover-state"
+    state.mkdir()
+    (state / "complete").touch()
+    (state / "units").write_text(
+        "gatewayd.service enabled active\n"
+        "broker-edge.service enabled inactive\n"
+        "fillwire.service disabled active\n"
+        "fillwire-rec.service disabled inactive\n"
+    )
+    (state / "kis-container").write_text("at-kis-ws true\n")
+    mock = r"""
+sudo() { "$@"; }
+systemctl() {
+    local action=$1 unit=$2 file
+    case "$action" in
+        enable|disable|is-enabled) file="$HOME/$unit.boot" ;;
+        start|stop|is-active) file="$HOME/$unit.runtime" ;;
+        *) return 2 ;;
+    esac
+    case "$action" in
+        enable) echo enabled > "$file" ;;
+        disable) echo disabled > "$file" ;;
+        start) echo active > "$file" ;;
+        stop) echo inactive > "$file" ;;
+        is-enabled) cat "$file"; test "$(cat "$file")" = enabled ;;
+        is-active) cat "$file"; test "$(cat "$file")" = active ;;
+    esac
+}
+docker() {
+    case "$1" in
+        start) test "$2" = at-kis-ws && echo true > "$HOME/kis-running" ;;
+        container) test "$5" = at-kis-ws && cat "$HOME/kis-running" ;;
+        logs) test "$4" = at-kis-ws ;;
+        *) return 2 ;;
+    esac
+}
+"""
+    for boot_changed in (False, True):
+        for line in (state / "units").read_text().splitlines():
+            unit, boot, _ = line.split()
+            (Path(home) / f"{unit}.boot").write_text(
+                ("disabled" if boot_changed else boot) + "\n"
+            )
+            (Path(home) / f"{unit}.runtime").write_text("inactive\n")
+        (Path(home) / "kis-running").write_text("false\n")
+        subprocess.run(
+            ["bash"], input=mock + restore, text=True, check=True,
+            env={**os.environ, "HOME": home},
+        )
+print("cutover and rollback restore boot and runtime states independently")
