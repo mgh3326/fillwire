@@ -63,6 +63,23 @@ func (store *fakeRedisStore) Get(_ context.Context, key string) (string, bool, e
 func (store *fakeRedisStore) Set(_ context.Context, key, value string, ttl time.Duration) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	return store.setLocked(key, value, ttl)
+}
+
+func (store *fakeRedisStore) SetIfLockOwned(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	lock := store.locks[lockKey]
+	if lock.value != lockValue || !store.now().Before(lock.expiresAt) {
+		return errRedisUnavailable
+	}
+	return store.setLocked(key, value, ttl)
+}
+
+func (store *fakeRedisStore) setLocked(key, value string, ttl time.Duration) error {
 	if store.setErr != nil {
 		return store.setErr
 	}

@@ -28,6 +28,7 @@ type RedisStore interface {
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
 	SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	CompareAndDelete(ctx context.Context, key, value string) error
+	SetIfLockOwned(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error
 }
 
 // RedisClient is a small RESP client for the issuer's GET, SET, SET NX EX,
@@ -150,6 +151,20 @@ func (client *RedisClient) CompareAndDelete(ctx context.Context, key, value stri
 	const releaseScript = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
 	reply, err := client.execute(ctx, "EVAL", releaseScript, "1", key, value)
 	if err != nil || reply.kind != ':' {
+		return errRedisUnavailable
+	}
+	return nil
+}
+
+// SetIfLockOwned publishes the value only while the same Redis lock is held.
+func (client *RedisClient) SetIfLockOwned(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+	const script = "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]); return 1"
+	seconds, valid := redisTTLSeconds(ttl)
+	if !valid {
+		return errRedisUnavailable
+	}
+	reply, err := client.execute(ctx, "EVAL", script, "2", lockKey, key, lockValue, value, seconds)
+	if err != nil || reply.kind != ':' || reply.text != "1" {
 		return errRedisUnavailable
 	}
 	return nil

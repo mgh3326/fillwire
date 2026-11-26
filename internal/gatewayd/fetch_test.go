@@ -1016,7 +1016,9 @@ func TestFetchPanicFailsLeaderAndFollower(t *testing.T) {
 		t.Fatal("leader did not reach issuer")
 	}
 	waiting := make(chan struct{})
-	go post(observedDoneContext{ctx, waiting})
+	followerCtx, cancelFollower := context.WithCancel(t.Context())
+	defer cancelFollower()
+	go post(observedDoneContext{followerCtx, waiting})
 	select {
 	case <-waiting:
 	case <-ctx.Done():
@@ -1025,8 +1027,13 @@ func TestFetchPanicFailsLeaderAndFollower(t *testing.T) {
 	}
 	close(source.release)
 	for range 2 {
-		if status := <-replies; status != http.StatusServiceUnavailable {
-			t.Errorf("status = %d, want 503", status)
+		select {
+		case status := <-replies:
+			if status != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want 503", status)
+			}
+		case <-ctx.Done():
+			t.Fatal("leader or follower did not return")
 		}
 	}
 }
