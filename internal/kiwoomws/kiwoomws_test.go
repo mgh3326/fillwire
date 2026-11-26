@@ -1,12 +1,15 @@
 package kiwoomws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +34,15 @@ func (s *testSocket) Write(_ context.Context, _ websocket.MessageType, b []byte)
 	return nil
 }
 func (*testSocket) CloseNow() error { return nil }
+
+type idleTestSocket struct{}
+
+func (idleTestSocket) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	<-ctx.Done()
+	return 0, nil, ctx.Err()
+}
+func (idleTestSocket) Write(context.Context, websocket.MessageType, []byte) error { return nil }
+func (idleTestSocket) CloseNow() error                                            { return nil }
 
 func TestMockEndpointPolicy(t *testing.T) {
 	if err := ValidateEndpoint(MockWebSocketEndpoint); err != nil {
@@ -198,5 +210,122 @@ func TestMalformedAndReflectedTokenAreDropped(t *testing.T) {
 	}
 	if records != 0 || r.Health().MalformedFrames != 3 {
 		t.Fatalf("records=%d malformed=%d", records, r.Health().MalformedFrames)
+	}
+}
+
+func TestEscapedReflectedTokenIsDropped(t *testing.T) {
+	var records int
+	var logs bytes.Buffer
+	r, err := New(Config{Account: AccountUS, Token: func(context.Context) (string, error) { return "secret-token", nil }, Append: func(Frame) error { records++; return nil }, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &testSocket{}
+	for _, frame := range []string{
+		`{"trnm":"REAL","nested":{"value":"se\u0063ret-token"}}`,
+		`{"trnm":"REAL","nested":{"se\u0063ret-token":"reflected"}}`,
+		`{"trnm":"REAL","n":1e400,"value":"se\u0063ret-token"}`,
+	} {
+		if err := r.handleFrame(conn, context.Background(), []byte(frame), "secret-token"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if records != 0 || r.Health().MalformedFrames != 3 {
+		t.Fatalf("records=%d malformed=%d", records, r.Health().MalformedFrames)
+	}
+	if !strings.Contains(logs.String(), "malformed_frames=1") || !strings.Contains(logs.String(), "malformed_frames=2") {
+		t.Fatalf("malformed counts were not logged during the session: %s", logs.String())
+	}
+}
+
+func TestPermanentAuthFailuresStopTokenRefreshLoop(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reads [][]byte
+		token func(context.Context) (string, error)
+	}{
+		{name: "token", token: func(context.Context) (string, error) { return "", ErrPermanentAuth }},
+		{name: "login", reads: [][]byte{[]byte(`{"trnm":"LOGIN","return_code":1}`)}, token: func(context.Context) (string, error) { return "mock-token", nil }},
+		{name: "registration", reads: [][]byte{[]byte(`{"trnm":"LOGIN","return_code":0}`), []byte(`{"trnm":"REG","return_code":1}`)}, token: func(context.Context) (string, error) { return "mock-token", nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tokenRequests := 0
+			cfg := Config{
+				Account: AccountKR,
+				Token: func(ctx context.Context) (string, error) {
+					tokenRequests++
+					return tc.token(ctx)
+				},
+				Append: func(Frame) error { return nil },
+				Dial: func(context.Context, string) (Socket, error) {
+					return &testSocket{reads: append([][]byte(nil), tc.reads...)}, nil
+				},
+			}
+			r, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Run(context.Background()); !errors.Is(err, ErrPermanentAuth) {
+				t.Fatalf("Run error = %v, want permanent auth rejection", err)
+			}
+			if tokenRequests != 1 {
+				t.Fatalf("token requests = %d, want 1", tokenRequests)
+			}
+		})
+	}
+}
+
+func TestReadWithIdleLimit(t *testing.T) {
+	_, _, err := readWithIdleLimit(context.Background(), idleTestSocket{}, 10*time.Millisecond)
+	if !errors.Is(err, errReadIdle) {
+		t.Fatalf("idle read error = %v, want %v", err, errReadIdle)
+	}
+}
+
+func TestTransientTokenFailureRetries(t *testing.T) {
+	var calls atomic.Int32
+	r, err := New(Config{
+		Account: AccountKR,
+		Token: func(context.Context) (string, error) {
+			if calls.Add(1) == 1 {
+				return "", errors.New("temporary transport failure")
+			}
+			return "", ErrPermanentAuth
+		},
+		Append: func(Frame) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(context.Background()); !errors.Is(err, ErrPermanentAuth) {
+		t.Fatalf("Run error = %v, want permanent auth rejection on second attempt", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("token requests = %d, want a retry after the transient failure", got)
+	}
+}
+
+func TestCancellationDuringTokenRequestReturnsCleanly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	r, err := New(Config{
+		Account: AccountKR,
+		Token: func(ctx context.Context) (string, error) {
+			close(started)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+		Append: func(Frame) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { done <- r.Run(ctx) }()
+	<-started
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run after context cancellation = %v, want nil", err)
 	}
 }
