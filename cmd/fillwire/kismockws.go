@@ -36,9 +36,9 @@ type kisMockWSCommandConfig struct {
 	KISMockWS struct {
 		Enabled            bool     `toml:"enabled"`
 		Symbols            []string `toml:"symbols"`
+		FuturesNoticeTR    string   `toml:"futures_notice_tr_id"`
 		RecordingDirectory string   `toml:"recording_directory"`
 		SubscribePace      string   `toml:"subscribe_pace"`
-		FuturesNoticeTR    string   `toml:"futures_notice_tr"`
 	} `toml:"kis_mock_ws"`
 }
 
@@ -130,10 +130,9 @@ func runKISMockWSCommand(args []string) error {
 	refreshDone := make(chan error, 1)
 	go func() { refreshDone <- approval.RefreshLoop(ctx) }()
 	module, err := kismockws.New(kismockws.Config{
-		Endpoint: "mock", HTSID: cfg.KIS.HTSID, Symbols: cfg.KISMockWS.Symbols,
+		Endpoint: "mock", HTSID: cfg.KIS.HTSID, Symbols: cfg.KISMockWS.Symbols, FuturesNoticeTR: cfg.KISMockWS.FuturesNoticeTR,
 		RecordingDirectory: cfg.KISMockWS.RecordingDirectory, Approval: approval,
 		Dialer: ws.NewDialer(), Logger: logger, SubscribePace: pace,
-		FuturesNoticeTR: cfg.KISMockWS.FuturesNoticeTR,
 	})
 	if err != nil {
 		stop()

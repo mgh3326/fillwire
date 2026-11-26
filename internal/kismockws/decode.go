@@ -43,6 +43,10 @@ var futuresNoticeFields = []string{
 	"cntg_isnm", "oder_cond", "ord_grp", "ord_grpseq", "order_prc",
 }
 
+func isFuturesNoticeTR(tr string) bool {
+	return tr == TRFuturesNotice || tr == TRFuturesNoticeLegacy
+}
+
 // DecodeNotice maps the decrypted websocket fields to KIS's sample schema.
 // The count check fails closed so a changed wire layout is counted and dropped.
 func DecodeNotices(event ws.Event) ([]Notice, error) {

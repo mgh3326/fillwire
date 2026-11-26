@@ -170,6 +170,7 @@ access_token_source = "" # "" with access_token_env, or "redis"
 [kis_mock_ws]
 enabled = false
 symbols = [] # 예: ["005930", "000660"]
+futures_notice_tr_id = "H0IFCNI0" # 첫 모의 세션에서 확인 필요; H0IFCNI9로 전환 가능
 recording_directory = "/var/lib/fillwire/recordings"
 subscribe_pace = "500ms"
 

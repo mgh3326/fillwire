@@ -34,9 +34,9 @@ type Config struct {
 	Endpoint           string
 	HTSID              string
 	Symbols            []string
+	FuturesNoticeTR    string
 	RecordingDirectory string
 	Approval           ws.ApprovalKeyProvider
-	FuturesNoticeTR    string
 	Dialer             ws.Dialer
 	Logger             *slog.Logger
 	SubscribePace      time.Duration
@@ -211,7 +211,7 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		}).Run(runCtx, output)
 	}()
 	processEvent := func(event ws.Event) {
-		if event.TR == TROverseasNotice || event.TR == TRFuturesNotice || event.TR == TRFuturesNoticeLegacy {
+		if event.TR == TROverseasNotice || isFuturesNoticeTR(event.TR) {
 			m.recordNotice(sink, event, cancel)
 		}
 	}
@@ -342,7 +342,7 @@ func (m *Module) recordNotice(sink *recording.Sink, event ws.Event, cancel conte
 	}
 	for _, notice := range notices {
 		stream := overseasRecordingName
-		if event.TR == TRFuturesNotice || event.TR == TRFuturesNoticeLegacy {
+		if isFuturesNoticeTR(event.TR) {
 			stream = futuresRecordingName
 		}
 		if m.append(sink, stream, notice.ReceivedAt, notice, cancel) {

@@ -136,6 +136,47 @@ func TestModuleUsesVTSAndMockTRRegistrations(t *testing.T) {
 	}
 }
 
+func TestModuleUsesConfiguredFuturesNoticeTR(t *testing.T) {
+	transport := newAckTransport()
+	ctx, cancel := context.WithCancel(context.Background())
+	module, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		FuturesNoticeTR: TRFuturesNoticeLegacy, RecordingDirectory: t.TempDir(),
+		Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		Dialer: ws.DialerFunc(func(_ context.Context, _ string) (ws.Transport, error) { return transport, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- module.Run(ctx) }()
+	deadline := time.After(2 * time.Second)
+	for {
+		transport.mu.Lock()
+		count := len(transport.trs)
+		transport.mu.Unlock()
+		if count == 5 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("configured mock subscriptions did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	transport.mu.Lock()
+	got := slices.Clone(transport.trs)
+	transport.mu.Unlock()
+	if !slices.Contains(got, TRFuturesNoticeLegacy) || slices.Contains(got, TRFuturesNotice) {
+		t.Fatalf("subscriptions = %v, want configured TR %s only", got, TRFuturesNoticeLegacy)
+	}
+}
+
 func TestModuleReturnsRecordingErrorAfterAppendFailure(t *testing.T) {
 	transport := newAckTransport()
 	module, err := New(Config{
