@@ -154,7 +154,7 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 			return runKISQuotes(ctx, contents, hub, logger, futures, ready)
 		},
 		"kis_futures": func(ctx context.Context, ready func()) error {
-			return runKISFutures(ctx, contents, hub, logger, ready)
+			return runKISFutures(ctx, contents, hub, logger, books, ready)
 		},
 		"upbit": func(ctx context.Context, ready func()) error {
 			settings, err := resolveUpbitSettings(contents)

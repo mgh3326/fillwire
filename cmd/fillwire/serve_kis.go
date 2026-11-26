@@ -12,6 +12,8 @@ import (
 
 	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/kisfutures"
+	"github.com/mgh3326/fillwire/internal/kisquote"
+	"github.com/mgh3326/fillwire/internal/ratebudget"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/pelletier/go-toml/v2"
@@ -314,8 +316,15 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 	if cfg.recording, err = resolveRecordingSettings(contents); err != nil {
 		return err
 	}
-	if reserveFutures && cfg.kisQuotes.enabled {
-		cfg.kisQuotes.limit -= kisfutures.Registrations
+	if reserveFutures && cfg.KIS.Endpoint == "live" && cfg.kisQuotes.enabled {
+		// Keep futures capacity aside from the start, even if that worker
+		// restarts after quotes are attached. If futures cannot fit, it
+		// fails independently and quotes retain their configured limit.
+		limit := cfg.kisQuotes.limit - kisfutures.Registrations
+		slots, err := ratebudget.NewSlots(limit)
+		if err == nil && kisquote.ReserveSession(slots, fixedSessionSlots(cfg)) == nil {
+			cfg.kisQuotes.limit = limit
+		}
 	}
 	session, err := h.wait(ctx)
 	if err != nil {
@@ -364,7 +373,7 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 	return session.wait(ctx)
 }
 
-func runKISFutures(ctx context.Context, contents []byte, h *kisHub, logger *slog.Logger, ready func()) error {
+func runKISFutures(ctx context.Context, contents []byte, h *kisHub, logger *slog.Logger, books bool, ready func()) error {
 	var input struct {
 		KIS   kisSettings   `toml:"kis"`
 		Redis redisSettings `toml:"redis"`
@@ -379,7 +388,8 @@ func runKISFutures(ctx context.Context, contents []byte, h *kisHub, logger *slog
 	if settings.err != nil {
 		return settings.err
 	}
-	cfg := runtimeConfig{fileConfig: fileConfig{KIS: input.KIS, Redis: input.Redis}, kisFutures: settings}
+	cfg := runtimeConfig{fileConfig: fileConfig{KIS: input.KIS, Redis: input.Redis}, kisFutures: settings, kisQuotes: resolveKisQuoteSettings(contents)}
+	cfg.Books.Enabled = books
 	session, err := h.wait(ctx)
 	if err != nil {
 		return err
