@@ -101,8 +101,8 @@ cache contracts are separately pinned:
 The opt-in `kis-live-approval` and `kis-mock-approval` providers use the
 corresponding KIS credentials and `/oauth2/Approval` endpoint. They share the
 Python WebSocket approval-key cache and its 15-second issuance lock. The Redis
-value is the raw approval key with a 23-hour TTL; it is refreshed when at most
-60 seconds remain. `POST /v1/tokens/{provider}/ensure?force=true` forces an
+value is the raw approval key with a 23-hour TTL. Gatewayd refreshes it when
+at most two hours remain, matching the maximum supported reader margin. `POST /v1/tokens/{provider}/ensure?force=true` forces an
 approval-key replacement, publishing the new value atomically without first
 deleting the old value. Concurrent contenders wait for the lock holder.
 
@@ -112,8 +112,7 @@ deleting the old value. Concurrent contenders wait for the lock holder.
 reading Redis on every use. It composes the existing issuance path: a miss calls
 the same `Ensure` that `/ensure` calls (same Redis lock, leases, timeouts and
 Redis writes), then reads the Redis value **and** its remaining TTL in one
-script execution and keeps the result in gatewayd's memory. `/ensure` and
-`/healthz` are unchanged; Python keeps reading the same Redis keys.
+script execution. Python keeps reading the same Redis keys.
 
 - Request: `Authorization: Bearer <consumer credential>` and a JSON body of
   `{}` or `{"failed_token_sha256":"<64 lowercase hex>"}`; unknown fields are
@@ -123,11 +122,12 @@ script execution and keeps the result in gatewayd's memory. `/ensure` and
 - Errors never carry a token: `401 unauthenticated`, `403 provider_not_allowed`,
   `404 unknown_provider`, `400 bad_request`, `503 issue_unavailable`
   (body `{"error":"<code>"}`).
-- Without a failed hash, a token with more than 60 s left is served from memory
-  (zero Redis calls); otherwise `Ensure` runs. A failed hash equal to the
-  current token's hash forces a reissue under the lock; a different hash means
-  the caller is stale and gets the current token (read from Redis, never from
-  memory alone) without a reissue. A token confirmed failed is not served again
+- Without a failed hash, KIS access tokens with more than 60 seconds left
+  and approval keys with more than two hours left can be served from memory
+  without Redis calls. Toss always reads the shared Redis record so it sees
+  rotations from `/ensure` and periodic issuance. A failed hash equal to the
+  current token's hash forces a reissue under the lock. A stale hash gets the
+  current token from Redis if it is still fresh. A token confirmed failed is not served again
   until a different usable token replaces it; overlapping reports of the same
   failed token share one reissue attempt. If the token
   the caller reported as failed is still current after the reissue (contended
@@ -141,10 +141,9 @@ script execution and keeps the result in gatewayd's memory. `/ensure` and
 - The token never appears in logs, metrics labels, errors or recovered panics.
   `gatewayd_fetch_results_total{provider,result}` counts outcomes.
 
-**Assumption:** one gatewayd is the sole issuer for each credential. A token
-rotated by another issuer is noticed only through a consumer's failed-hash
-report. There is no revocation, withdrawal, lease-extension or multi-instance
-handling.
+**Assumption:** one gatewayd is the sole issuer for each credential. For
+providers with an in-memory fetch cache, a failed-hash report checks the
+shared Redis record even when the cached value is still fresh.
 
 `gatewayd` has no order, command, intent, or execution endpoint. It exposes
 loopback `GET /metrics` with standard Go/process collectors and a bounded

@@ -162,3 +162,9 @@ max_len = 100000
 buffer = 1024
 access_token_env = "KIS_MOCK_ACCESS_TOKEN"
 access_token_source = "" # "" with access_token_env, or "redis"
+
+# fillwire upbit-fills: private myOrder recording for comparison with at-upbit-ws.
+# Credentials come from UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY.
+[upbit_fills]
+enabled = false
+directory = "recordings"

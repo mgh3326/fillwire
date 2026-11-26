@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/mgh3326/fillwire/internal/tokenfetch"
 )
 
 const approvalTTL = 23 * time.Hour
@@ -70,7 +72,7 @@ func (s *approvalService) ensureReplacing(ctx context.Context, force bool, rejec
 	if err != nil {
 		return "", err
 	}
-	if ttl0 > tokenExpiryBuffer && !force {
+	if ttl0 > tokenfetch.MaxApprovalRefreshMargin && !force {
 		return EnsureStateFresh, nil
 	}
 	lock, err := newLockValue()
@@ -101,7 +103,7 @@ func (s *approvalService) ensureReplacing(ctx context.Context, force bool, rejec
 			if err != nil {
 				return "", err
 			}
-			if ttl > tokenExpiryBuffer && (!force || ttl > prevTTL) {
+			if ttl > tokenfetch.MaxApprovalRefreshMargin && (!force || ttl > prevTTL) {
 				return EnsureStateFresh, nil
 			}
 			if !held {
@@ -128,7 +130,7 @@ func (s *approvalService) ensureReplacing(ctx context.Context, force bool, rejec
 				if err != nil {
 					return "", err
 				}
-				if ttl > tokenExpiryBuffer {
+				if ttl > tokenfetch.MaxApprovalRefreshMargin {
 					return EnsureStateFresh, nil
 				}
 				return "", errLockWaitTimeout
@@ -150,7 +152,7 @@ func (s *approvalService) ensureReplacing(ctx context.Context, force bool, rejec
 			// Yield only to a replacement that is itself still usable.
 			if ttl, err := s.cachedTTL(ctx); err != nil {
 				return "", err
-			} else if ttl > tokenExpiryBuffer {
+			} else if ttl > tokenfetch.MaxApprovalRefreshMargin {
 				return EnsureStateFresh, nil
 			}
 		}
@@ -162,7 +164,7 @@ func (s *approvalService) ensureReplacing(ctx context.Context, force bool, rejec
 	if err != nil {
 		return "", err
 	}
-	if ttl > tokenExpiryBuffer && (!force || ttl > prevTTL) {
+	if ttl > tokenfetch.MaxApprovalRefreshMargin && (!force || ttl > prevTTL) {
 		return EnsureStateFresh, nil
 	}
 	issued, err := s.issuer.Issue(ctx, s.config.AppKey, s.config.AppSecret)

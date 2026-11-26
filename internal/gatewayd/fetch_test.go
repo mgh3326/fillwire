@@ -196,6 +196,13 @@ func newFetchHarness(t *testing.T, provider TokenProvider, consumers ...FetchCon
 	}
 }
 
+func (h *fetchHarness) reuseSource() string {
+	if h.provider == ProviderToss {
+		return "redis"
+	}
+	return "memory"
+}
+
 func (h *fetchHarness) issue(token string) {
 	h.issuer.mu.Lock()
 	defer h.issuer.mu.Unlock()
@@ -315,15 +322,20 @@ func TestFetchContractShapeAndIssueMiss(t *testing.T) {
 	})
 }
 
-func TestFetchMemoryHitMakesZeroRedisCalls(t *testing.T) {
+func TestFetchReusesFreshToken(t *testing.T) {
 	eachFetchProvider(t, func(t *testing.T, h *fetchHarness) {
 		h.issue("memory-token")
 		wantToken(t, h.fetchBody(`{}`), "memory-token", "issued")
 		before := h.store.total()
+		reads := h.store.of("read")
 		for range 3 {
-			wantToken(t, h.fetchBody(`{}`), "memory-token", "memory")
+			wantToken(t, h.fetchBody(`{}`), "memory-token", h.reuseSource())
 		}
-		if h.store.total() != before {
+		if h.provider == ProviderToss {
+			if got := h.store.of("read") - reads; got != 3 {
+				t.Fatalf("Toss fetches read %d shared snapshots, want 3", got)
+			}
+		} else if h.store.total() != before {
 			t.Fatalf("memory hits made %d Redis calls", h.store.total()-before)
 		}
 		if h.issuer.callCount() != 1 {
@@ -354,7 +366,7 @@ func TestFetchMemoryMissCallsEnsureOnceAndReadsRedisAtomically(t *testing.T) {
 		if h.issuer.callCount() != 1 {
 			t.Fatalf("issuer calls = %d, want 1", h.issuer.callCount())
 		}
-		wantToken(t, h.fetchBody(`{}`), "replacement-token", "memory")
+		wantToken(t, h.fetchBody(`{}`), "replacement-token", h.reuseSource())
 	})
 }
 
@@ -393,7 +405,7 @@ func TestFetchFailedHashEqualForcesReissue(t *testing.T) {
 		if h.issuer.callCount() != 2 {
 			t.Fatalf("issuer calls = %d, want 2 (a plain ensure would have reused the fresh token)", h.issuer.callCount())
 		}
-		wantToken(t, h.fetchBody(`{}`), "token-two", "memory")
+		wantToken(t, h.fetchBody(`{}`), "token-two", h.reuseSource())
 	})
 }
 
@@ -621,7 +633,7 @@ func TestFetchNeverEmitsTokenInLogsMetricsErrorsOrPanics(t *testing.T) {
 		h.issue(probe)
 		success := h.fetchBody(`{}`)
 		wantToken(t, success, probe, "issued")
-		wantToken(t, h.fetchBody(`{}`), probe, "memory")
+		wantToken(t, h.fetchBody(`{}`), probe, h.reuseSource())
 		record(h.fetchBody(`{"failed_token_sha256":"` + shaHex(probe) + `"}`)) // 503: same token again
 		record(h.fetchBody(`{"extra":"` + probe + `"}`))                       // 400
 		record(h.post(h.provider, "not-the-credential-"+probe, `{}`))          // 401
@@ -828,7 +840,7 @@ func TestFetchForcedReissueYieldsToAPeerThatPublishedBeforeTheLock(t *testing.T)
 		if h.issuer.callCount() != 0 {
 			t.Fatalf("issuer calls = %d, want 0: the forced path replaced a token a peer had just published", h.issuer.callCount())
 		}
-		wantToken(t, h.fetchBody(`{}`), "peer-token", "memory")
+		wantToken(t, h.fetchBody(`{}`), "peer-token", h.reuseSource())
 	})
 }
 
@@ -904,7 +916,7 @@ func TestFetchConfirmedFailedTokenIsNotServedWhileRecovering(t *testing.T) {
 		}
 		h.store.setErr = nil
 		wantToken(t, h.fetchBody(`{}`), "token-b", "issued")
-		wantToken(t, h.fetchBody(`{}`), "token-b", "memory")
+		wantToken(t, h.fetchBody(`{}`), "token-b", h.reuseSource())
 	})
 }
 
@@ -924,5 +936,23 @@ func TestFetchForcedApprovalReissueDoesNotYieldToANearlyExpiredPeerKey(t *testin
 			reply := h.fetchBody(`{"failed_token_sha256":"` + shaHex("rejected-key") + `"}`)
 			wantToken(t, reply, "fresh-key", "issued")
 		})
+	}
+}
+
+func TestFetchTossReadsTokenRotatedByEnsure(t *testing.T) {
+	h := newFetchHarness(t, ProviderToss)
+	h.issue("before-rotation")
+	wantToken(t, h.fetchBody(`{}`), "before-rotation", "issued")
+
+	h.clock.advance(3600*time.Second - 90*time.Second)
+	h.issue("after-rotation")
+	response := httptest.NewRecorder()
+	h.handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/tokens/toss/ensure", nil))
+	if response.Code != http.StatusOK || response.Body.String() != `{"state":"issued"}` {
+		t.Fatalf("ensure = %d %s, want issued", response.Code, response.Body)
+	}
+	wantToken(t, h.fetchBody(`{}`), "after-rotation", "redis")
+	if h.issuer.callCount() != 2 {
+		t.Fatalf("issuer calls = %d, want initial issue and one rotation", h.issuer.callCount())
 	}
 }
