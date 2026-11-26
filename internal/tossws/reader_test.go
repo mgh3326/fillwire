@@ -172,7 +172,7 @@ func TestDeclarationIncludesOrdersAndConfiguredQuoteChannels(t *testing.T) {
 }
 
 func TestReaderRecordsDocumentedQuoteFramesAndCountsMalformed(t *testing.T) {
-	trade := fixture(t, "trade-kr.json")
+	trade := fixture(t, "trade-us-asyncapi-example.json")
 	book := fixture(t, "orderbook-kr-asyncapi-example.json")
 	var cancel context.CancelFunc
 	ctx, stop := context.WithCancel(context.Background())
@@ -184,7 +184,7 @@ func TestReaderRecordsDocumentedQuoteFramesAndCountsMalformed(t *testing.T) {
 	before := time.Now()
 	reader, err := New(Config{
 		AccountSeq: "3", Tokens: testTokens{},
-		Symbols: []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}},
+		Symbols: []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}, {Market: quote.MarketUS, Code: "AAPL"}},
 		Append: func(record Record) error {
 			if (record.Kind == "trade" || record.Kind == "orderbook") && !reader.Health() {
 				t.Error("reader was unhealthy after subscription acknowledgement")
@@ -199,7 +199,7 @@ func TestReaderRecordsDocumentedQuoteFramesAndCountsMalformed(t *testing.T) {
 			return fakeSocket{
 				write: func(raw []byte) error {
 					declaration = append([]byte(nil), raw...)
-					_, topics, err := buildDeclaration(requestID(raw), "3", []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}})
+					_, topics, err := buildDeclaration(requestID(raw), "3", []quote.Symbol{{Market: quote.MarketKR, Code: "005930"}, {Market: quote.MarketUS, Code: "AAPL"}})
 					if err != nil {
 						return err
 					}
@@ -233,7 +233,7 @@ func TestReaderRecordsDocumentedQuoteFramesAndCountsMalformed(t *testing.T) {
 	}
 	receivedAfter := time.Now()
 	if !bytes.Contains(declaration, []byte(`"type":"personal:order"`)) ||
-		!bytes.Contains(declaration, []byte(`"type":"trade:kr"`)) ||
+		!bytes.Contains(declaration, []byte(`"type":"trade:us"`)) ||
 		!bytes.Contains(declaration, []byte(`"type":"orderbook:kr"`)) {
 		t.Fatalf("declaration missing a channel: %s", declaration)
 	}
