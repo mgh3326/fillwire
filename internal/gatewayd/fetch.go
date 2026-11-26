@@ -14,11 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-)
 
-// fetchFreshBuffer is how much life a token must have left to be served from
-// memory. It matches the 60 s margin used by the existing ensure path.
-const fetchFreshBuffer = 60 * time.Second
+	"github.com/mgh3326/fillwire/internal/tokenfetch"
+)
 
 const (
 	fetchSourceMemory = "memory"
@@ -149,9 +147,9 @@ type FetchResult struct {
 	Source    string        `json:"source"`
 }
 
-// FetchService hands tokens to authorized local consumers. Assumption: this
-// gatewayd is the sole issuer for each credential, so a token another issuer
-// rotates is noticed only through a consumer's failed_token_sha256 report.
+// FetchService hands tokens to authorized local consumers. Toss reads the
+// shared record on every request because issuing a new token invalidates the
+// previous one. Other providers can reuse a locally cached token.
 type FetchService struct {
 	store     TokenReadStore
 	providers map[TokenProvider]*fetchProvider
@@ -319,11 +317,22 @@ func (service *FetchService) fetch(ctx context.Context, provider TokenProvider, 
 }
 
 func (service *FetchService) memoryHit(state *fetchProvider, provider TokenProvider) (FetchResult, bool) {
+	// /ensure and the periodic issuer can rotate Toss independently of /fetch.
+	if provider == ProviderToss {
+		return FetchResult{}, false
+	}
 	entry := state.current()
-	if entry.usable(service.now(), fetchFreshBuffer) && entry.sha256 != state.rejectedSHA() {
+	if entry.usable(service.now(), fetchBuffer(provider)) && entry.sha256 != state.rejectedSHA() {
 		return entry.result(provider, fetchSourceMemory), true
 	}
 	return FetchResult{}, false
+}
+
+func fetchBuffer(provider TokenProvider) time.Duration {
+	if isApprovalProvider(provider) {
+		return tokenfetch.MaxApprovalRefreshMargin
+	}
+	return tokenExpiryBuffer
 }
 
 // refresh is the miss path, run by one request at a time per provider.
@@ -356,7 +365,7 @@ func (service *FetchService) refresh(ctx context.Context, provider TokenProvider
 			if current.sha256 == failedSHA || current.sha256 == rejected {
 				force, currentSHA = true, current.sha256
 				state.reject(currentSHA)
-			} else if current.usable(service.now(), fetchFreshBuffer) {
+			} else if current.usable(service.now(), fetchBuffer(provider)) {
 				state.remember(current)
 				return current.result(provider, fetchSourceRedis), nil
 			}

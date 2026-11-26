@@ -36,6 +36,11 @@ const (
 	maxBodyBytes   = 64 << 10
 )
 
+// MaxApprovalRefreshMargin is the largest refresh margin approval readers can
+// configure. Gatewayd uses it as its freshness threshold so a successful
+// ensure satisfies any supported reader margin.
+const MaxApprovalRefreshMargin = 2 * time.Hour
+
 // Sources gatewayd reports for a returned token.
 const (
 	SourceMemory = "memory"

@@ -265,3 +265,25 @@ func TestApprovalForceKeepsOldValueDuringIssue(t *testing.T) {
 		t.Fatal("replacement missing")
 	}
 }
+
+func TestApprovalRefreshesInsideReaderMargin(t *testing.T) {
+	each := []TokenProvider{ProviderKISLiveApproval, ProviderKISMockApproval}
+	for _, provider := range each {
+		t.Run(string(provider), func(t *testing.T) {
+			h := newFetchHarness(t, provider)
+			h.seed("previous-key")
+			wantToken(t, h.fetchBody(`{}`), "previous-key", "redis")
+			h.clock.advance(approvalTTL - 30*time.Minute)
+			h.issue("replacement-key")
+			response := httptest.NewRecorder()
+			h.handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/tokens/"+string(provider)+"/ensure", nil))
+			if response.Code != http.StatusOK || response.Body.String() != `{"state":"issued"}` {
+				t.Fatalf("ensure = %d %s, want issued", response.Code, response.Body)
+			}
+			wantToken(t, h.fetchBody(`{}`), "replacement-key", "redis")
+			if h.issuer.callCount() != 1 {
+				t.Fatalf("issuer calls = %d, want one approval refresh", h.issuer.callCount())
+			}
+		})
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/ctxwait"
+	"github.com/mgh3326/fillwire/internal/tokenfetch"
 	"github.com/mgh3326/go-kis/kis/ws"
 	"github.com/redis/go-redis/v9"
 )
@@ -28,7 +29,7 @@ const (
 	ApprovalPoll          = 250 * time.Millisecond
 	ApprovalIssueTimeout  = 10 * time.Second
 	DefaultRefreshMargin  = time.Hour
-	MaxRefreshMargin      = 2 * time.Hour
+	MaxRefreshMargin      = tokenfetch.MaxApprovalRefreshMargin
 	publishDeadline       = 14 * time.Second
 	refreshRetryMin       = time.Second
 	refreshRetryMax       = 30 * time.Second
