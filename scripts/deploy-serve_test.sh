@@ -58,7 +58,7 @@ case "$1" in
     : > "$TEST_STARTS"
     : > "$TEST_RESTARTS"
     ;;
-  start)
+  start|restart)
     rm -f "$TEST_STOPPED"
     : > "$TEST_TICK"
     [[ $(wc -l < "$TEST_STARTS") -lt 4 ]] || exit 1
@@ -79,7 +79,7 @@ case "$1" in
     wc -l < "$TEST_RESTARTS" | tr -d ' '
     ;;
 esac
-if [[ $1 == start && -f $TEST_FAILURE ]] && cmp -s "$TEST_FAILURE" "$TEST_CURRENT"; then
+if [[ ( $1 == start || $1 == restart ) && -f $TEST_FAILURE ]] && cmp -s "$TEST_FAILURE" "$TEST_CURRENT"; then
   exit 1
 fi
 MOCK
@@ -140,6 +140,8 @@ printf 'IMAGE=%s\n' "$b" > "$TEST_UNHEALTHY"
 refuse "$b"
 assert_pin "$current" "$a"
 assert_pin "$current.previous" "$b"
+
+unset TEST_UNHEALTHY
 
 for fault in TEST_REPLACE TEST_AUTO_RESTART; do
   export "$fault=$tmp/fault"
