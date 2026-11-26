@@ -2,8 +2,6 @@
 package upbitpriv
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"regexp"
@@ -28,7 +26,6 @@ type Record struct {
 	BrokerOrderID string    `json:"broker_order_id"`
 	TradeUUID     string    `json:"trade_uuid"`
 	Identifier    string    `json:"identifier,omitempty"`
-	FillSeq       uint32    `json:"fill_seq"`
 	FilledPrice   float64   `json:"filled_price"`
 	FilledQty     float64   `json:"filled_qty"`
 	FilledAt      time.Time `json:"filled_at"`
@@ -89,13 +86,10 @@ func decodeFrame(raw []byte, receivedAt time.Time) (*Record, error) {
 	if currency == "KRW" || currency == "USDT" {
 		symbol = asset
 	}
-	// Match auto_trader's stable trade UUID hash for cross-stream comparison.
-	digest := sha256.Sum256([]byte(frame.TradeID))
 	return &Record{
 		ReceivedAt: receivedAt.UTC(), Broker: "upbit", Venue: "upbit_" + strings.ToLower(currency),
 		Instrument: "crypto", Symbol: symbol, RawSymbol: frame.Market, Side: side,
 		BrokerOrderID: frame.OrderID, TradeUUID: frame.TradeID, Identifier: frame.ID,
-		FillSeq:     binary.BigEndian.Uint32(digest[:4]) & 0x7fffffff,
 		FilledPrice: frame.Price, FilledQty: frame.Volume, FilledAt: time.UnixMilli(frame.TradeMS).UTC(),
 		Currency: currency,
 	}, nil

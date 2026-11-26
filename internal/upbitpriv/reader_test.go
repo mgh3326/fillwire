@@ -36,7 +36,7 @@ func TestMyOrderFill(t *testing.T) {
 		Symbol: "BTC", RawSymbol: "KRW-BTC", Side: "buy", Currency: "KRW",
 		BrokerOrderID: "ac2dc2a3-fce9-40a2-a4f6-5987c25c438f",
 		TradeUUID:     "68315169-fba4-4175-ade3-aff14a616657", Identifier: "test-1",
-		FillSeq: 834460042, FilledPrice: 0.001453, FilledQty: 30925891.29839369,
+		FilledPrice: 0.001453, FilledQty: 30925891.29839369,
 		FilledAt: time.UnixMilli(1710751590421).UTC(),
 	}
 	if err != nil || got == nil || *got != want {
