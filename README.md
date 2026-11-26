@@ -1088,6 +1088,25 @@ Upbit 기록기를 단독으로 실행해 확인하려면 다음 명령을 사�
 fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fillwire/recordings
 ```
 
+## 키움 모의 웹소켓 기록기 (기본 비활성화)
+
+`[kiwoom_mock_kr]`와 `[kiwoom_mock_us]`는 서로 다른 모의 계정 reader입니다. 설정한 국내·미국 종목 수의 합은 최대 200개이며, 제한을 넘으면 접속 전에 설정을 거부합니다. 미국 심볼은 Kiwoom 거래소 코드 `ND`(NASDAQ), `NY`(NYSE), `NA`(AMEX)를 각각 지정합니다. 각 reader는 해당 계정 전용 `KIWOOM_MOCK_*` 환경 변수 이름만 설정에서 읽고, 모의 OAuth에서 받은 토큰으로만 `wss://mockapi.kiwoom.com:10000/api/websocket`에 로그인합니다. 라이브 호스트는 dial 전에 거부합니다.
+
+미국 심볼 설정 예시:
+
+```toml
+[kiwoom_mock_us]
+symbols = [{ code = "NVDA", exchange = "ND" }, { code = "IBM", exchange = "NY" }]
+```
+
+```sh
+fillwire kiwoom-kr --config /etc/fillwire/fillwire.toml
+fillwire kiwoom-us --config /etc/fillwire/fillwire.toml
+```
+
+국내 심볼은 `0B`, `0D`, `0H`, `1h`를 구독하고, 미국 심볼은 `FE`, `FT`를 구독합니다. 같은 세션에서 국내 계좌는 `00`, `04`, 미국 계좌는 `F4`, `F5` 계좌 스트림을 받습니다. 받은 프레임은 `<directory>/kiwoom-kr/` 또는 `kiwoom-us/` 아래 UTC 날짜별 JSONL 기록에 `received_at`과 함께 추가합니다. 기록기에는 원장 ingest나 주문 경로가 없습니다.
+
+프로토콜 근거: 키움 공식 [OAuth 접근토큰 발급(au10001)](https://openapi.kiwoom.com/guide/apiGuideContents/a1/au10001), [국내 주식체결(0B)](https://openapi.kiwoom.com/guide/apiGuideContents/14/0B), [미국 10호가(FE)](https://openapi.kiwoom.com/guide/apiGuideContents/14/FE), [미국 실시간 TR 목록(F4/F5/FE/FT 포함)](https://openapi.kiwoom.com/m/guide/apiguide), [웹소켓 연결 및 LOGIN 안내](https://openapi.kiwoom.com/m/guide/index), [주문체결(00)의 공통 등록 형식 및 200종목 한도](https://openapi.kiwoom.com/m/guide/apiguide/14/00).
 ## Alpaca paper 스트림 기록기 (기본 비활성화)
 
 `[alpaca] enabled = true`와 `symbols` 종목 목록 및 `directory`를 설정하면 `fillwire alpaca --config fillwire.toml`이 Alpaca paper 계정의 `trade_updates`와 IEX의 주식 trade/quote/minute bar 프레임을 UTC 날짜별 JSONL 파일에 기록합니다. 명령은 paper 거래 스트림 `wss://paper-api.alpaca.markets/stream`에만 연결하며 라이브 거래 스트림 호스트는 다이얼 전에 거부합니다. 구독 전에 API 인증을 수행합니다. 주문 제출이나 ledger ingest를 호출하지 않습니다.
