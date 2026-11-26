@@ -24,9 +24,9 @@
   실제 이미지와 `/healthz` 200, collector는 컨테이너의 실제 이미지와 실행 상태를 검사합니다.
   두 유닛 모두 같은 컨테이너가 자동 재시작 없이 6초 이상 연속으로 검사를 통과해야 합니다.
   두 검사와 별도로 기록의 신선도를 확인합니다. 성공한 교체의 직전 핀은 `.previous`에 남습니다.
-  이전 이미지의 로컬 캐시는 롤백을 위해 보존합니다. 배포가 강제 종료되어
-  `<unit>.service.lock`이 남으면 기존 배포 프로세스가 종료됐는지 확인하고, 현재 컨테이너
-  이미지와 핀을 대조한 뒤 잠금을 제거합니다.
+  이전 이미지의 로컬 캐시는 롤백을 위해 보존합니다. INT, TERM, HUP를 받으면 직전
+  핀 복구를 시도합니다. 강제 종료, 전원 장애, 복구 실패 뒤 `<unit>.service.image.pending`이
+  남으면 해당 유닛에 새 배포나 `--rollback`을 실행하기 전에 아래 복구 절차를 따릅니다.
 
 ```sh
 sudo systemctl daemon-reload
@@ -34,6 +34,26 @@ sudo bash /usr/local/sbin/deploy-serve.sh fillwire-serve "$PIN"
 sudo bash /usr/local/sbin/deploy-serve.sh quote-collector "$PIN"
 curl --fail http://127.0.0.1:8792/healthz
 ```
+
+배포 중단 뒤에는 해당 배포 프로세스와 그 하위 명령이 모두 끝났는지 먼저 확인합니다.
+다른 배포를 시작하지 않은 상태에서 남은 잠금만 정리합니다. 아래 `unit`에는 중단된
+유닛 이름(`fillwire-serve` 또는 `quote-collector`)을 지정합니다.
+
+```sh
+unit=fillwire-serve
+state=/var/lib/fillwire-deploy
+sudo ls -ld "$state/$unit.service.lock" "$state/$unit.service.image.pending"
+# 기존 배포가 끝났고 잠금 디렉터리가 남은 경우에만 실행합니다.
+sudo rm -f "$state/$unit.service.lock/pin"
+sudo rmdir "$state/$unit.service.lock"
+# .pending이 있는 경우 실행합니다. 정상 잠금 해제 후에도 실행할 수 있습니다.
+sudo bash /usr/local/sbin/deploy-serve.sh "$unit" --recover
+```
+
+`--recover`는 직전 핀을 복원하고 상태 검사를 다시 수행합니다. 첫 배포였다면 유닛을
+정지하고 현재 핀을 제거합니다. 복구에 실패하면 `.pending`을 보존하므로 오류 원인을 해결한
+뒤 같은 명령을 다시 실행합니다. 부팅 시 유닛은 현재 핀으로 시작할 수 있으므로 재부팅 뒤에도
+남은 `.pending`을 먼저 확인하고, 복구 후 실행 이미지와 출력의 신선도를 확인합니다.
 
 동일 호스트에서 이미지를 직접 실행할 때의 CLI 형식입니다. 첫 줄은 serve 유닛의
 인수입니다. 두 번째는 격리된 Redis에 collector의 출력도 남기는 운용 예입니다.
@@ -87,9 +107,44 @@ fillwire market-tap -enabled -targets /etc/fillwire/targets.json -calendar /etc/
 그림자 비교와 운영자 승인 후 다음 순서로 소유권을 넘깁니다. 각 단계에서 기존 컨테이너와
 리스너가 내려간 것을 확인하고 새 출력이 도착한 뒤 다음으로 넘어갑니다.
 
+첫 정지 전에 pi의 운영자 계정에서 기존 부팅 설정과 실행 상태를 따로 기록합니다.
+아래 목록에는 이 배치에서 변경할 유닛만 순서대로 남깁니다. 모의 주문 또는 토큰 발급을
+계속하는 유닛은 변경 대상에서 뺍니다. 주문 호출자를 중지할 경우 실제 타이머 이름을
+목록 끝에 추가합니다. `at-kis-ws`를 인계할 경우 실제 컨테이너 이름을 지정합니다.
+다음 명령이 오류를 내면 인계를 시작하기 전에 상태를 확인합니다. 중단 후에도 최초 기록을
+보존합니다.
+
+```sh
+(
+  set -eu
+  umask 077
+  state="$HOME/fillwire-cutover-state"
+  legacy_units='gatewayd.service broker-edge.service fillwire.service fillwire-rec.service'
+  kis_container='' # 인계 대상일 때 실제 at-kis-ws 컨테이너 이름
+  mkdir "$state"
+  for unit in $legacy_units; do
+    boot=$(systemctl is-enabled "$unit") || [ "$boot" = disabled ]
+    running=$(systemctl is-active "$unit") || [ "$running" = inactive ]
+    case "$boot:$running" in
+      enabled:active|enabled:inactive|disabled:active|disabled:inactive) ;;
+      *) echo "$unit $boot $running" >&2; exit 1 ;;
+    esac
+    printf '%s %s %s\n' "$unit" "$boot" "$running"
+  done > "$state/units"
+  if [ -n "$kis_container" ]; then
+    running=$(sudo docker container inspect --format '{{.State.Running}}' "$kis_container")
+    printf '%s %s\n' "$kis_container" "$running" > "$state/kis-container"
+  fi
+  cat /proc/sys/kernel/random/boot_id > "$state/boot-id"
+  touch "$state/complete"
+)
+```
+
 1. `fillwire-rec`를 정지하고 serve의 Upbit 공개 기록을 운영 디렉터리로 전환합니다.
 2. `fillwire.service`를 정지합니다. 같은 키의 소유자가 `at-kis-ws`인 배치에서는 그
-   컨테이너도 내려가 있는지 확인합니다. 운영 Redis 키와 ingest 설정을 준비한 serve가 KIS 체결·시세·선물 연결을 소유합니다.
+   컨테이너를 아래 명령으로 내리고
+   `sudo docker container inspect --format '{{.State.Running}}' "$kis_container"`가
+   `false`인지 확인합니다. 운영 Redis 키와 ingest 설정을 준비한 serve가 KIS 체결·시세·선물 연결을 소유합니다.
 3. `broker-edge-canary.timer` 등 기존 주문 호출자를 먼저 중지할 수 있는지 확인합니다.
    모의 주문 기능을 계속 쓰면 `kis-mock-edge`와 이를 실행하는 `broker-edge`를 유지합니다.
    주문 호출자가 없을 때만 해당 컨테이너의 실제 소유 유닛을 정지합니다.
@@ -100,10 +155,19 @@ fillwire market-tap -enabled -targets /etc/fillwire/targets.json -calendar /etc/
    broker-edge에 함께 묶인 배치에서는 3단계 정지 직후 이전합니다. 전환 전후에 토큰
    조회와 소비자 연결을 확인합니다. 기존 이미지와 유닛은 롤백에 쓸 수 있게 보존합니다.
 
+2단계에서 `at-kis-ws`를 넘기는 배치에만 아래를 실행합니다.
+
+```sh
+read -r kis_container running < "$HOME/fillwire-cutover-state/kis-container"
+sudo docker stop "$kis_container"
+sudo docker container inspect --format '{{.State.Running}}' "$kis_container"
+```
+
 각 인계가 확인되면 해당 단계에서 실제로 내린 기존 유닛의 부팅 자동 시작을 해제합니다.
 `broker-edge`가 모의 주문을 계속 처리하거나 독립 `gatewayd`가 토큰을 계속 발급하는
 배치에서는 해당 명령을 건너뜁니다. gatewayd가 broker-edge에 묶여 있는 배치에서는
-실제 소유 유닛만 비활성화합니다.
+실제 소유 유닛만 비활성화합니다. 3단계에서 정지한 타이머도 기록에 있는 실제 이름으로
+비활성화합니다(예: `sudo systemctl disable broker-edge-canary.timer`).
 
 ```sh
 sudo systemctl disable fillwire-rec.service
@@ -117,6 +181,37 @@ sudo systemctl disable gatewayd.service
 ```sh
 sudo systemctl enable fillwire-serve.service quote-collector.service
 ```
+
+운영자가 재부팅을 승인하면 `sudo systemctl reboot`를 실행합니다. pi에 다시 접속해
+아래를 실행합니다. 먼저 부팅 ID가 바뀌었는지 확인합니다. 새 유닛은 둘 다
+`enabled`, `active`이며 이번 부팅의 `NRestarts`는 0이어야 합니다. 변경한 기존 소유
+유닛은 `disabled`, `inactive`여야 합니다. 명령 실행 전 중단된 배포의 `.pending`을
+위 절차대로 복구합니다.
+
+```sh
+state="$HOME/fillwire-cutover-state"
+cat "$state/boot-id" /proc/sys/kernel/random/boot_id
+for unit in fillwire-serve quote-collector; do
+  systemctl is-enabled "$unit.service"
+  systemctl is-active "$unit.service"
+  systemctl show "$unit.service" --property=NRestarts --value
+  sudo docker container inspect --format '{{.State.Running}} {{.Config.Image}}' "$unit"
+done
+while read -r unit boot running; do
+  systemctl is-enabled "$unit"
+  systemctl is-active "$unit"
+done < "$state/units"
+if [ -s "$state/kis-container" ]; then
+  read -r kis_container running < "$state/kis-container"
+  sudo docker container inspect --format '{{.State.Running}}' "$kis_container"
+fi
+sudo journalctl -b -u fillwire-serve.service -u quote-collector.service --no-pager
+curl --fail http://127.0.0.1:8792/healthz
+```
+
+컨테이너의 `true` 출력과 각각의 배포 다이제스트를 대조합니다. 인계한 `at-kis-ws`가
+`false`인지 확인합니다. 현재 거래 세션에서 이번 부팅 이후 새 행이 도착하고 토큰 조회와
+소비자 연결이 정상인지 확인합니다. 검증이 실패하면 아래 데이터 경로 롤백을 실행합니다.
 
 ## Dagu 잡의 대체와 유지
 
@@ -152,14 +247,57 @@ sudo systemctl disable --now quote-collector.service
 sudo systemctl disable --now fillwire-serve.service
 ```
 
-인계에서 실제로 비활성화한 기존 유닛만 아래 순서로 복구합니다.
+두 새 유닛이 `inactive`이고 아래 목록에 두 컨테이너가 없는지 확인합니다. serve가
+gatewayd를 인계했다면 기존 발급자를 올리기 전에 `ss`에서 8791 리스너가 내려갔는지도
+확인합니다.
 
 ```sh
-sudo systemctl enable --now gatewayd.service
-sudo systemctl enable --now broker-edge.service
-sudo systemctl enable --now fillwire.service
-sudo systemctl enable --now fillwire-rec.service
+systemctl is-active quote-collector.service fillwire-serve.service
+sudo docker ps --format '{{.Names}}'
+sudo ss -ltn 'sport = :8791'
 ```
+
+첫 정지 전 기록으로 부팅 설정을 복원하고, 당시 실행 중이던 유닛은 재기동합니다.
+부팅 설정을 바꾸기 전에 인계가 실패해도 같은 절차를 적용합니다. 당시 비활성이던 유닛은
+정지 상태로 복원합니다. `at-kis-ws`가 당시 실행 중이었다면 새 KIS 소유자가 내려간
+것을 확인한 뒤 기존 컨테이너를 시작합니다.
+
+```sh
+(
+  set -eu
+  state="$HOME/fillwire-cutover-state"
+  test -f "$state/complete"
+  while read -r unit boot running; do
+    case "$boot" in
+      enabled) sudo systemctl enable "$unit" ;;
+      disabled) sudo systemctl disable "$unit" ;;
+    esac
+    case "$running" in
+      active) sudo systemctl start "$unit" ;;
+      inactive) sudo systemctl stop "$unit" ;;
+    esac
+    actual_boot=$(systemctl is-enabled "$unit") || [ "$actual_boot" = disabled ]
+    actual_running=$(systemctl is-active "$unit") || [ "$actual_running" = inactive ]
+    test "$actual_boot" = "$boot"
+    test "$actual_running" = "$running"
+  done < "$state/units"
+  if [ -s "$state/kis-container" ]; then
+    read -r kis_container running < "$state/kis-container"
+    if [ "$running" = true ]; then
+      sudo docker start "$kis_container"
+    elif [ "$(sudo docker container inspect --format '{{.State.Running}}' "$kis_container")" = true ]; then
+      sudo docker stop "$kis_container"
+    fi
+    test "$(sudo docker container inspect --format '{{.State.Running}}' "$kis_container")" = "$running"
+    if [ "$running" = true ]; then
+      sudo docker logs --since 2m "$kis_container"
+    fi
+  fi
+)
+```
+
+복구한 소유자의 로그에서 새 KIS 구독과 수신을 확인합니다. 8791 발급자를 복구했다면
+토큰 조회와 소비자 재연결도 확인합니다.
 
 정지한 Dagu 잡은 해당 운영 테이블과 누락 범위를 확인한 뒤 재개하고 Python 수집이
 다시 쓰는지 확인합니다.
