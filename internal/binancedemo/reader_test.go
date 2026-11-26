@@ -165,6 +165,136 @@ func TestRecordsReceivedAtAndSubscriptionRejectionLeavesMarketRunning(t *testing
 	}
 }
 
+func TestSuccessfulUserSubscriptionRecordsEventWithReceivedAt(t *testing.T) {
+	var mu sync.Mutex
+	var records []Record
+	clock := time.Date(2026, 11, 26, 8, 9, 10, 0, time.UTC)
+	socket := &successfulUserSocket{event: fixture(t, "executionReport.json")}
+	r, err := New(Config{
+		Symbols: []string{"BTCUSDT"}, EnableUserStream: true, APIKey: "test-key", APISecret: "test-secret",
+		Now: func() time.Time { return clock },
+		Append: func(record Record) error {
+			mu.Lock()
+			defer mu.Unlock()
+			records = append(records, record)
+			return nil
+		},
+		Dial: func(context.Context, string, string) (Socket, error) { return socket, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.session(ctx, userStream) }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && r.Health().UserEvents == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("session returned %v after cancellation", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(records) != 1 {
+		t.Fatalf("recorded %d user events, want one: %+v", len(records), records)
+	}
+	got := records[0]
+	if got.Kind != "user_event" || got.EventType != "executionReport" || !got.ReceivedAt.Equal(clock) || len(got.Payload) == 0 {
+		t.Fatalf("successful user stream record = %+v", got)
+	}
+}
+
+func TestRecordingFailureStopsRunAndCountsOnce(t *testing.T) {
+	marketFrame := fixture(t, "bookTicker.json")
+	r, err := New(Config{
+		Symbols: []string{"BTCUSDT"}, EnableUserStream: false,
+		Append: func(Record) error { return errors.New("disk full") },
+		Dial: func(context.Context, string, string) (Socket, error) {
+			return &fakeSocket{reads: [][]byte{marketFrame}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	select {
+	case err := <-done:
+		if err == nil || errors.Is(err, context.Canceled) {
+			t.Fatalf("record append failure returned %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		cancel()
+		err := <-done
+		if err == nil || errors.Is(err, context.Canceled) {
+			t.Fatalf("reader continued after failed append; Run returned %v", err)
+		}
+	}
+	if got := r.Health().RecordErrors; got != 1 {
+		t.Fatalf("record errors = %d, want one", got)
+	}
+}
+
+func TestSessionDialUsesBoundedContext(t *testing.T) {
+	var hasDeadline atomic.Bool
+	r, err := New(Config{
+		Symbols: []string{"BTCUSDT"}, EnableUserStream: false, Append: func(Record) error { return nil },
+		Dial: func(ctx context.Context, _, _ string) (Socket, error) {
+			_, ok := ctx.Deadline()
+			hasDeadline.Store(ok)
+			return nil, errors.New("stop after observing dial context")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.session(context.Background(), marketStream)
+	if !hasDeadline.Load() {
+		t.Fatal("dialer received a context without a deadline")
+	}
+}
+
+func TestFailedPingCancelsBlockedReadAndReconnects(t *testing.T) {
+	var pings atomic.Int64
+	r, err := New(Config{
+		Symbols: []string{"BTCUSDT"}, EnableUserStream: false, Append: func(Record) error { return nil },
+		Sleep: func(ctx context.Context, _ time.Duration) error {
+			timer := time.NewTimer(time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		},
+		Dial: func(context.Context, string, string) (Socket, error) {
+			return &pingFailSocket{pings: &pings}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) && (pings.Load() == 0 || r.Health().Reconnects == 0) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v after cancellation", err)
+	}
+	if pings.Load() == 0 || r.Health().Reconnects == 0 {
+		t.Fatalf("failed ping did not reconnect: pings=%d health=%+v", pings.Load(), r.Health())
+	}
+}
+
 func TestCredentialsUseOnlyDocumentedNamesAndFallback(t *testing.T) {
 	key, secret, ok := Credentials(map[string]string{APIKeyEnv: "primary", APISecretEnv: "secret"})
 	if !ok || key != "primary" || secret != "secret" {
@@ -238,9 +368,39 @@ func (s *fakeSocket) Read(ctx context.Context) (websocket.MessageType, []byte, e
 	return websocket.MessageText, nil, ctx.Err()
 }
 func (*fakeSocket) Write(context.Context, websocket.MessageType, []byte) error { return nil }
+func (*fakeSocket) Ping(context.Context) error                                 { return nil }
 func (*fakeSocket) CloseNow() error                                            { return nil }
 
 type rejectSocket struct{ fakeSocket }
+
+type successfulUserSocket struct {
+	fakeSocket
+	event []byte
+}
+
+func (s *successfulUserSocket) Write(_ context.Context, _ websocket.MessageType, payload []byte) error {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return err
+	}
+	s.reads = [][]byte{
+		[]byte(`{"id":"` + req.ID + `","status":200,"result":{"subscriptionId":0}}`),
+		s.event,
+	}
+	return nil
+}
+
+type pingFailSocket struct {
+	fakeSocket
+	pings *atomic.Int64
+}
+
+func (s *pingFailSocket) Ping(context.Context) error {
+	s.pings.Add(1)
+	return errors.New("simulated half-open connection")
+}
 
 func (s *rejectSocket) Write(_ context.Context, _ websocket.MessageType, payload []byte) error {
 	var req struct {

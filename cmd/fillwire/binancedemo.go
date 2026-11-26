@@ -27,10 +27,11 @@ func runBinanceDemoCommand(args []string) error {
 	if *symbols == "" || *directory == "" || fs.NArg() != 0 {
 		return errors.New("usage: fillwire binance-demo --symbols BTCUSDT,ETHUSDT --record-dir <directory> [--no-user-stream]")
 	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("lane", "binance_demo")
 	config := binancedemo.Config{
 		Symbols: strings.Split(*symbols, ","), RecordingRoot: *directory,
 		EnableUserStream: !*noUser,
-		Logger:           slog.New(slog.NewTextHandler(os.Stderr, nil)).With("lane", "binance_demo"),
+		Logger:           logger,
 	}
 	var err error
 	if config, err = binancedemo.FromEnvironment(config); err != nil {
@@ -43,6 +44,10 @@ func runBinanceDemoCommand(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = reader.Run(ctx)
+	health := reader.Health()
+	logger.Info("Binance demo reader stopped", "market_frames", health.MarketFrames, "user_events", health.UserEvents,
+		"malformed_frames", health.MalformedFrames, "subscribe_rejections", health.SubscribeRejects,
+		"reconnects", health.Reconnects, "record_errors", health.RecordErrors)
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}

@@ -30,11 +30,17 @@ const (
 	RecvWindowMS    = 5000
 	maxSymbols      = 20
 	maxFrameBytes   = 1 << 20
+	dialTimeout     = 10 * time.Second
+	pingInterval    = 20 * time.Second
+	pingTimeout     = 10 * time.Second
 )
+
+var errRecording = errors.New("binance demo: recording append failed")
 
 type Socket interface {
 	Read(context.Context) (websocket.MessageType, []byte, error)
 	Write(context.Context, websocket.MessageType, []byte) error
+	Ping(context.Context) error
 	CloseNow() error
 }
 
@@ -87,12 +93,15 @@ type counters struct {
 }
 
 type Reader struct {
-	cfg      Config
-	append   func(Record) error
-	sink     *recording.Sink
-	counters counters
-	running  atomic.Bool
-	started  atomic.Bool
+	cfg          Config
+	append       func(Record) error
+	sink         *recording.Sink
+	counters     counters
+	running      atomic.Bool
+	started      atomic.Bool
+	pingInterval time.Duration
+	pingTimeout  time.Duration
+	dialTimeout  time.Duration
 }
 
 func Name() string { return "binance_demo" }
@@ -173,7 +182,7 @@ func New(cfg Config) (*Reader, error) {
 	if cfg.Dial == nil {
 		cfg.Dial = dial
 	}
-	r := &Reader{cfg: cfg}
+	r := &Reader{cfg: cfg, pingInterval: pingInterval, pingTimeout: pingTimeout, dialTimeout: dialTimeout}
 	r.counters.lastError.Store("")
 	if cfg.Append != nil {
 		r.append = cfg.Append
@@ -205,7 +214,7 @@ func (r *Reader) Health() Health {
 	}
 }
 
-func (r *Reader) Run(ctx context.Context) error {
+func (r *Reader) Run(ctx context.Context) (runErr error) {
 	if !r.started.CompareAndSwap(false, true) {
 		return errors.New("binance demo: reader is already running")
 	}
@@ -215,41 +224,60 @@ func (r *Reader) Run(ctx context.Context) error {
 		if r.sink != nil {
 			if err := r.sink.Close(); err != nil {
 				r.cfg.Logger.Warn("Binance demo recorder close failed")
+				if errors.Is(runErr, context.Canceled) {
+					runErr = nil
+				}
+				runErr = errors.Join(runErr, fmt.Errorf("binance demo: recording close failed: %w", err))
 			}
 		}
 	}()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	finished := make(chan struct{}, 2)
-	go func() { r.supervise(ctx, marketStream); finished <- struct{}{} }()
+	finished := make(chan error, 2)
+	go func() { finished <- r.supervise(ctx, marketStream) }()
 	count := 1
 	if r.cfg.EnableUserStream {
 		count++
-		go func() { r.supervise(ctx, userStream); finished <- struct{}{} }()
+		go func() { finished <- r.supervise(ctx, userStream) }()
 	}
 	select {
 	case <-ctx.Done():
-		for i := 0; i < count; i++ {
-			<-finished
-		}
-		return ctx.Err()
-	case <-finished:
 		cancel()
-		for i := 1; i < count; i++ {
-			<-finished
+		for i := 0; i < count; i++ {
+			if err := <-finished; errors.Is(err, errRecording) {
+				runErr = err
+			}
 		}
-		return errors.New("binance demo: stream supervisor stopped")
+		if runErr == nil {
+			runErr = ctx.Err()
+		}
+		return runErr
+	case err := <-finished:
+		cancel()
+		runErr = err
+		for i := 1; i < count; i++ {
+			if other := <-finished; runErr == nil && other != nil {
+				runErr = other
+			}
+		}
+		if runErr == nil {
+			runErr = errors.New("binance demo: stream supervisor stopped")
+		}
+		return runErr
 	}
 }
 
-func (r *Reader) supervise(ctx context.Context, kind streamKind) {
+func (r *Reader) supervise(ctx context.Context, kind streamKind) error {
 	delay := time.Second
 	for ctx.Err() == nil {
 		started := r.cfg.Now()
 		err := r.session(ctx, kind)
 		r.setConnected(kind, false)
+		if errors.Is(err, errRecording) {
+			return err
+		}
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 		if r.cfg.Now().Sub(started) >= time.Minute {
 			delay = time.Second
@@ -261,10 +289,11 @@ func (r *Reader) supervise(ctx context.Context, kind streamKind) {
 		r.counters.reconnects.Add(1)
 		wait := delay/2 + time.Duration(rand.Int64N(int64(delay/2)+1))
 		if err := r.cfg.Sleep(ctx, wait); err != nil {
-			return
+			return nil
 		}
 		delay = min(delay*2, 30*time.Second)
 	}
+	return nil
 }
 
 func (r *Reader) session(ctx context.Context, kind streamKind) error {
@@ -275,7 +304,9 @@ func (r *Reader) session(ctx context.Context, kind streamKind) error {
 	if err := ValidateURL(endpoint, string(kind)); err != nil {
 		return err
 	}
-	conn, err := r.cfg.Dial(ctx, endpoint, string(kind))
+	dialCtx, cancelDial := context.WithTimeout(ctx, r.dialTimeout)
+	conn, err := r.cfg.Dial(dialCtx, endpoint, string(kind))
+	cancelDial()
 	if err != nil {
 		return err
 	}
@@ -289,24 +320,66 @@ func (r *Reader) session(ctx context.Context, kind streamKind) error {
 			return err
 		}
 	}
-	for ctx.Err() == nil {
-		msgType, raw, err := conn.Read(ctx)
+	sessionCtx, stop := context.WithCancel(ctx)
+	pingFailure := make(chan struct{}, 1)
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		r.pingLoop(sessionCtx, stop, conn, pingFailure)
+	}()
+	defer func() {
+		stop()
+		<-pingDone
+	}()
+	for sessionCtx.Err() == nil {
+		msgType, raw, err := conn.Read(sessionCtx)
 		if err != nil {
+			select {
+			case <-pingFailure:
+				return errors.New("binance demo: stream ping failed")
+			default:
+			}
 			return err
 		}
 		if msgType != websocket.MessageText {
-			r.counters.malformedFrames.Add(1)
+			r.malformed()
 			continue
 		}
 		if kind == marketStream {
-			r.handleMarket(raw)
+			if err := r.handleMarket(raw); err != nil {
+				return err
+			}
 		} else {
-			if !r.handleUser(raw) {
+			continueSession, err := r.handleUser(raw)
+			if err != nil {
+				return err
+			}
+			if !continueSession {
 				return errors.New("binance demo: server requested user stream shutdown")
 			}
 		}
 	}
-	return ctx.Err()
+	return sessionCtx.Err()
+}
+
+func (r *Reader) pingLoop(ctx context.Context, stop context.CancelFunc, conn Socket, failed chan<- struct{}) {
+	for ctx.Err() == nil {
+		if err := r.cfg.Sleep(ctx, r.pingInterval); err != nil {
+			return
+		}
+		pingCtx, cancel := context.WithTimeout(ctx, r.pingTimeout)
+		err := conn.Ping(pingCtx)
+		cancel()
+		if err != nil {
+			r.counters.lastError.Store("ping")
+			select {
+			case failed <- struct{}{}:
+			default:
+			}
+			stop()
+			return
+		}
+	}
 }
 
 func (r *Reader) subscribe(ctx context.Context, conn Socket) error {
@@ -328,18 +401,18 @@ func (r *Reader) subscribe(ctx context.Context, conn Socket) error {
 	defer cancel()
 	msgType, raw, err := conn.Read(ackCtx)
 	if err != nil || msgType != websocket.MessageText {
-		r.counters.malformedFrames.Add(1)
+		r.malformed()
 		return errors.New("binance demo: invalid subscription acknowledgement")
 	}
 	var ack map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &ack); err != nil {
-		r.counters.malformedFrames.Add(1)
+		r.malformed()
 		return errors.New("binance demo: invalid subscription acknowledgement")
 	}
 	var responseID string
 	var status int
 	if json.Unmarshal(ack["id"], &responseID) != nil || responseID != id || json.Unmarshal(ack["status"], &status) != nil {
-		r.counters.malformedFrames.Add(1)
+		r.malformed()
 		return errors.New("binance demo: invalid subscription acknowledgement")
 	}
 	if status == http.StatusOK {
@@ -357,42 +430,47 @@ func (r *Reader) subscribe(ctx context.Context, conn Socket) error {
 	return errors.New("binance demo: user stream subscription rejected")
 }
 
-func (r *Reader) handleMarket(raw []byte) {
+func (r *Reader) handleMarket(raw []byte) error {
 	streamName, symbol, err := validateMarketFrame(raw, r.cfg.Symbols)
 	if err != nil {
-		r.counters.malformedFrames.Add(1)
-		return
+		r.malformed()
+		return nil
 	}
 	if err := r.record(Record{Kind: "market_frame", ReceivedAt: r.cfg.Now().UTC(), Stream: streamName, Symbol: symbol, Payload: append(json.RawMessage(nil), raw...)}); err != nil {
-		r.counters.recordErrors.Add(1)
-		r.counters.lastError.Store("recording")
-		return
+		return err
 	}
 	r.counters.marketFrames.Add(1)
+	return nil
 }
 
-func (r *Reader) handleUser(raw []byte) bool {
+func (r *Reader) handleUser(raw []byte) (bool, error) {
 	eventType, err := validateUserFrame(raw)
 	if err != nil {
-		r.counters.malformedFrames.Add(1)
-		return true
+		r.malformed()
+		return true, nil
 	}
 	if err := r.record(Record{Kind: "user_event", ReceivedAt: r.cfg.Now().UTC(), EventType: eventType, Payload: append(json.RawMessage(nil), raw...)}); err != nil {
-		r.counters.recordErrors.Add(1)
-		r.counters.lastError.Store("recording")
-		return true
+		return true, err
 	}
 	r.counters.userEvents.Add(1)
-	return eventType != "serverShutdown"
+	return eventType != "serverShutdown", nil
 }
 
 func (r *Reader) record(record Record) error {
 	if err := r.append(record); err != nil {
-		r.counters.recordErrors.Add(1)
+		count := r.counters.recordErrors.Add(1)
 		r.counters.lastError.Store("recording")
-		return errors.New("binance demo: recording append failed")
+		r.cfg.Logger.Error("Binance demo recording append failed; stopping stream readers", "kind", record.Kind, "record_errors", count)
+		return errRecording
 	}
 	return nil
+}
+
+func (r *Reader) malformed() {
+	count := r.counters.malformedFrames.Add(1)
+	if count&(count-1) == 0 {
+		r.cfg.Logger.Warn("Binance demo malformed frame dropped", "malformed_frames", count)
+	}
 }
 
 func (r *Reader) setConnected(kind streamKind, connected bool) {
