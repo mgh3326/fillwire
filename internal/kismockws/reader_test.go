@@ -129,10 +129,13 @@ func TestModuleUsesVTSAndMockTRRegistrations(t *testing.T) {
 	transport.mu.Lock()
 	got := slices.Clone(transport.trs)
 	transport.mu.Unlock()
-	for _, tr := range []string{"H0STCNI9", "H0STCNT0", "H0STASP0", TROverseasNotice, TRFuturesNotice} {
+	for _, tr := range []string{"H0STCNI9", "H0STCNT0", "H0STASP0", TROverseasNotice, "H0IFCNI9"} {
 		if !slices.Contains(got, tr) {
 			t.Errorf("subscriptions %v missing %s", got, tr)
 		}
+	}
+	if slices.Contains(got, "H0IFCNI0") {
+		t.Errorf("default subscriptions unexpectedly contain H0IFCNI0: %v", got)
 	}
 }
 
