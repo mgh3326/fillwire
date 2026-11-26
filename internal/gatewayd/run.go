@@ -58,6 +58,15 @@ func ParseEnsureInterval(args []string) (time.Duration, error) {
 // Run serves gatewayd until ctx is cancelled. Startup and periodic failures
 // use fixed text so process output cannot reveal token-related material.
 func Run(ctx context.Context, args []string, lookup func(string) string, stderr io.Writer) int {
+	return run(ctx, args, lookup, stderr, nil)
+}
+
+// RunModule starts the same token service under fillwire's supervisor.
+func RunModule(ctx context.Context, args []string, lookup func(string) string, stderr io.Writer, ready func()) int {
+	return run(ctx, args, lookup, stderr, ready)
+}
+
+func run(ctx context.Context, args []string, lookup func(string) string, stderr io.Writer, ready func()) int {
 	options, err := ParseRunOptions(args)
 	if err != nil {
 		writeStartupError(stderr)
@@ -101,15 +110,28 @@ func Run(ctx context.Context, args []string, lookup func(string) string, stderr 
 	logger := log.New(stderr, "", 0)
 	metrics := NewMetrics()
 	server := &http.Server{
-		Handler:           newHandlerWithFetch(ensurers, logger, metrics, NewFetchService(ensurers, store, config.FetchConsumers)),
+		Handler:           tokenHandler(ensurers, logger, metrics, NewFetchService(ensurers, store, config.FetchConsumers), ready == nil),
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
+	defer server.Close()
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- server.Serve(listener) }()
+	if ready != nil {
+		ready()
+	}
 	if options.EnsureInterval > 0 {
-		go runPeriodicEnsureWithMetrics(ctx, ensurers, options.EnsureInterval, logger, metrics)
+		ensureCtx, cancelEnsure := context.WithCancel(ctx)
+		ensureDone := make(chan struct{})
+		go func() {
+			defer close(ensureDone)
+			runPeriodicEnsureWithMetrics(ensureCtx, ensurers, options.EnsureInterval, logger, metrics)
+		}()
+		defer func() {
+			cancelEnsure()
+			<-ensureDone
+		}()
 	}
 	select {
 	case serveErr := <-serveResult:

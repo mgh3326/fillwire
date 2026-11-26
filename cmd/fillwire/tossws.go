@@ -39,6 +39,9 @@ func resolveTossWSSettings(contents []byte, g gatewaydSettings) (tossWSSettings,
 	if !tossws.ValidAccountSeq(f.AccountSeq) || strings.TrimSpace(f.Directory) == "" {
 		return tossWSSettings{}, errors.New("toss_ws: 활성화하려면 숫자 문자열 account_seq와 directory가 필요합니다")
 	}
+	if g.TokenHeader == "" {
+		g.TokenHeader = "Authorization"
+	}
 	base, err := tokenfetch.NormalizeURL(g.URL)
 	if err != nil || !tokenfetch.CredentialTransportOK(base) ||
 		strings.TrimSpace(g.TokenEnv) == "" || !strings.EqualFold(g.TokenHeader, "Authorization") {
@@ -55,17 +58,35 @@ func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logg
 	if !settings.Enabled {
 		return func() {}
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := runTossWS(ctx, settings, logger, nil); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("Toss WS reader stopped", "reason", err)
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger, ready func()) error {
 	logger = logger.With("lane", "toss_ws")
 	client, err := tokenfetch.NewClient(settings.fetchURL, settings.credential)
 	if err != nil {
-		logger.Error("Toss WS gatewayd client setup failed")
-		return func() {}
+		return errors.New("Toss WS gatewayd client setup failed")
 	}
 	sink, err := recording.NewSink(settings.Directory, tossOrderStream)
 	if err != nil {
-		logger.Error("Toss WS JSONL recorder setup failed", "reason", err)
-		return func() {}
+		return err
 	}
+	defer func() {
+		if err := sink.Close(); err != nil {
+			logger.Error("Toss WS JSONL recorder close failed", "reason", err)
+		}
+	}()
 	reader, err := tossws.New(tossws.Config{
 		AccountSeq: settings.AccountSeq,
 		Tokens:     tokenfetch.NewHolder(client, string(gatewayd.ProviderToss), 2*time.Minute, false, nil),
@@ -75,23 +96,10 @@ func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logg
 		Logger: logger,
 	})
 	if err != nil {
-		_ = sink.Close()
-		logger.Error("Toss WS reader setup failed", "reason", err)
-		return func() {}
+		return err
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := reader.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("Toss WS reader stopped", "reason", err)
-		}
-		if err := sink.Close(); err != nil {
-			logger.Error("Toss WS JSONL recorder close failed", "reason", err)
-		}
-	}()
-	return func() {
-		cancel()
-		<-done
+	if ready != nil {
+		ready()
 	}
+	return reader.Run(ctx)
 }

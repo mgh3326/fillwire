@@ -2,8 +2,9 @@
 
 Fillwire listens to broker execution feeds, persists decoded fills to Redis Streams, and delivers them through independent consumer groups.
 
-It is a runtime, not a broker client: protocol code lives in separate libraries (for example, `go-kis`). `fillwire` never places orders: it listens, persists, and delivers. The separate
-operator command [`execmock`](docs/e3a-mock-runbook.md) can send approved KIS mock
+Protocol code lives in libraries such as `go-kis`. The `fillwire run` and
+`fillwire serve` runtimes listen, persist, and deliver. The operator command
+[`fillwire execmock`](docs/e3a-mock-runbook.md) can send approved KIS mock
 intents, with sending off by default.
 
 ## Scope
@@ -30,6 +31,44 @@ startup: XAUTOCLAIM pending entries before ordinary XREADGROUP
 On shutdown, fillwire stops the socket reader first, then gives already received events a bounded `drain_timeout` window to pass through decode and `XADD`. The drain uses a separate background-rooted context rather than the canceled signal context. If the window expires, the remaining in-memory entries are logged and counted before exit.
 
 Fillwire does not implement restart handoff, a local checkpoint database, an HTTP metrics endpoint, heartbeat reporting, parallel consumers, broker orders, amendments, or cancellations. Those are outside this PR.
+
+## 통합 CLI와 상주 서버
+
+`go build -o fillwire ./cmd/fillwire`로 빌드합니다. `fillwire <명령> --help`에서
+명령별 사용법을 확인할 수 있습니다. 기존 `fillwire -config FILE` 실행은
+`fillwire run -config FILE`과 같습니다. 각 명령의 독립 실행 파일도 빌드할 수 있습니다.
+
+`fillwire serve -config FILE`는 하나의 TOML 파일로 상주 서버와 모듈을 설정합니다.
+아래 표의 각 모듈은 `enabled = true`를 지정하면 실행됩니다.
+
+| 설정 표 | 기능 |
+|---|---|
+| `[gatewayd]` | 토큰 발급 및 조회 HTTP 서버. `providers`는 기존 CLI와 같은 쉼표 구분 목록이며 기본값은 `kis-mock`입니다. `ensure_interval`을 생략하면 요청 시에만 토큰을 발급합니다. `listen`과 `[redis].url`을 생략하면 각각 `GATEWAYD_LISTEN_ADDR`와 `REDIS_URL`을 사용합니다. 공급자 및 조회 인증은 기존 gatewayd 환경 변수를 사용합니다. |
+| `[kis_fills]` | KIS 체결 기록과 ingest. `[kis]`, `[redis]`, `[stream]`, `[ingest]`, `[channel]`, `[retry]`를 사용합니다. |
+| `[kis_quotes]` 또는 `[books]` | KIS 승격 종목 체결·호가 또는 고정 종목 호가. `[recording]`을 활성화하면 고정 종목 KIS 호가도 JSONL로 기록합니다. `fillwire bookrec`는 표준 입력 기록과 파일 재생을 제공합니다. |
+| `[kis_futures]` | KIS 지수선물 웹소켓 분봉. live 세션에서만 동작합니다. |
+| `[upbit]` | Upbit 공개 호가·체결 웹소켓 기록. |
+| `[toss_ws]` | Toss `personal:order` 그림자 기록. |
+| `[quotes]` | 기존 Toss 해외 종목 시세 피드. |
+
+KIS 체결·호가·선물은 `[kis]`에 설정한 웹소켓 세션을 공유합니다. 호가 또는 선물만
+활성화할 때는 체결 구독과 ingest 설정이 필요 없습니다. 선물을 함께 활성화하면
+승격 호가의 등록 상한에서 선물 슬롯을 먼저 확보합니다. 서비스 모듈은 읽기와 기록을
+담당하며 gatewayd는 토큰을 발급합니다. 주문 실행 명령은 CLI에서 별도로 실행합니다.
+
+```toml
+[serve]
+health_listen = "127.0.0.1:8792"
+
+[kis_fills]
+enabled = true
+```
+
+`GET /healthz`에는 모듈별 `state`와 `restarts`가 표시됩니다. 활성 모듈이 모두 실행
+중이면 HTTP 200이고, 시작 또는 재시작 대기 중인 활성 모듈이 있으면 HTTP 503입니다.
+`kis_session`은 KIS 모듈이 사용하는 공유 세션입니다. 실행 상태는 프로세스 내부의
+모듈 상태를 나타냅니다. 시세 신선도와 업스트림 API 가용성은 기존 모듈 로그를 확인합니다.
+모듈이 종료되면 해당 모듈을 1초부터 최대 1분까지 지수 백오프로 다시 시작합니다.
 
 ## Configuration
 

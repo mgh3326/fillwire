@@ -14,6 +14,7 @@ RUN go mod download
 # are included in the image build context or final runtime layer.
 COPY cmd ./cmd
 COPY internal ./internal
+COPY execution_contracts ./execution_contracts
 
 RUN GOMAXPROCS=4 CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -p=4 -trimpath -ldflags='-s -w -buildid=' -o /out/fillwire ./cmd/fillwire

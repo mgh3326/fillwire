@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/bookreccmd"
@@ -62,6 +63,8 @@ func dispatch(args []string) int {
 			return runCLI(options)
 		}
 		code = runCLI(args)
+	case "serve":
+		return runServeCLI(options)
 	case "bookrec":
 		code = bookreccmd.Run(options, os.Stdin, os.Stdout, os.Stderr, time.Now)
 	case "edge-canary":
@@ -81,7 +84,11 @@ func dispatch(args []string) int {
 	case "market-tap":
 		code = markettapcmd.Run(options, os.Stdout, os.Stderr)
 	default:
-		return runCLI(args)
+		if strings.HasPrefix(command, "-") {
+			return runCLI(args)
+		}
+		fmt.Fprint(os.Stderr, usage)
+		return 2
 	}
 	if wantsHelp(options) {
 		return 0

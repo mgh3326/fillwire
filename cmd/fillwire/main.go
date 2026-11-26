@@ -93,7 +93,10 @@ func run(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, alerter al
 	return runWithDependencies(ctx, cfg, logger, runDependencies{alerter: alerter})
 }
 
+type fillSource func(context.Context, chan<- ws.Event, func(), func()) error
+
 type runDependencies struct {
+	sharedFills      fillSource
 	approvalRedis    redis.UniversalClient
 	approvalFallback ws.ApprovalKeyProvider
 	gatewaydEnsurer  reader.GatewaydEnsurer
@@ -142,18 +145,8 @@ func (i kisApprovalIssuer) Issue(ctx context.Context) (string, error) {
 	return result.ApprovalKey, nil
 }
 
-func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies) error {
-	redisOptions, err := redis.ParseURL(cfg.Redis.URL)
-	if err != nil {
-		return fmt.Errorf("%w: invalid Redis URL", reader.ErrApprovalConfig)
-	}
-	redisClient := redis.NewClient(redisOptions)
-	defer redisClient.Close()
-	approvalRedis := dependencies.approvalRedis
-	if approvalRedis == nil {
-		approvalRedis = redisClient
-	}
-
+func newKISApproval(cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies, approvalRedis redis.UniversalClient) (ws.ApprovalKeyProvider, *reader.ApprovalProvider, error) {
+	var err error
 	// Only approval_mode "" issues approval keys, through the KIS REST
 	// client; cache-only reads the shared cache and gatewayd delegates to
 	// the ensure endpoint, so neither constructs an issuing client.
@@ -170,7 +163,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			RequestTimeout: reader.ApprovalIssueTimeout,
 		})
 		if err != nil {
-			return fmt.Errorf("%w: KIS REST client", reader.ErrApprovalConfig)
+			return nil, nil, fmt.Errorf("%w: KIS REST client", reader.ErrApprovalConfig)
 		}
 		issuer = kisApprovalIssuer{client: kisClient}
 	}
@@ -195,13 +188,13 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		if fetcher == nil {
 			client, err := tokenfetch.NewClient(cfg.KIS.Gatewayd.URL, cfg.gatewaydToken)
 			if err != nil {
-				return fmt.Errorf("%w: gatewayd fetch client", reader.ErrApprovalConfig)
+				return nil, nil, fmt.Errorf("%w: gatewayd fetch client", reader.ErrApprovalConfig)
 			}
 			fetcher = client
 		}
 		fetchApproval, err := reader.NewApprovalProviderGatewaydFetch(fetcher, cfg.KIS.AccountMode, margin, logger)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		approvalSource, approvalAlert = fetchApproval, fetchApproval.SetTransientAlert
 	case reader.ApprovalModeGatewayd:
@@ -210,7 +203,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 			var err error
 			ensurer, err = reader.NewGatewaydClient(cfg.KIS.Gatewayd.URL, cfg.KIS.Gatewayd.TokenHeader, cfg.gatewaydToken)
 			if err != nil {
-				return fmt.Errorf("%w: gatewayd client", reader.ErrApprovalConfig)
+				return nil, nil, fmt.Errorf("%w: gatewayd client", reader.ErrApprovalConfig)
 			}
 		}
 		approval, err = reader.NewApprovalProviderGatewayd(approvalRedis, ensurer, cfg.KIS.AccountMode, margin, logger)
@@ -218,7 +211,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		approval, err = reader.NewApprovalProviderConfig(approvalRedis, issuer, cfg.KIS.ApprovalMode, cfg.KIS.AccountMode, margin, logger)
 	}
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if approval != nil {
 		approvalSource, approvalAlert = approval, approval.SetTransientAlert
@@ -227,6 +220,30 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 		approvalAlert(func() {
 			dependencies.alerter.Alert(context.Background(), "transient", "fillwire approval refresh failed; retrying while cached key remains valid")
 		})
+	}
+
+	return approvalSource, approval, nil
+}
+
+func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Logger, dependencies runDependencies) error {
+	redisOptions, err := redis.ParseURL(cfg.Redis.URL)
+	if err != nil {
+		return fmt.Errorf("%w: invalid Redis URL", reader.ErrApprovalConfig)
+	}
+	redisClient := redis.NewClient(redisOptions)
+	defer redisClient.Close()
+	approvalRedis := dependencies.approvalRedis
+	if approvalRedis == nil {
+		approvalRedis = redisClient
+	}
+
+	var approvalSource ws.ApprovalKeyProvider
+	var approval *reader.ApprovalProvider
+	if dependencies.sharedFills == nil {
+		approvalSource, approval, err = newKISApproval(cfg, logger, dependencies, approvalRedis)
+		if err != nil {
+			return err
+		}
 	}
 
 	bookEvent, stopBooks, err := startBooks(ctx, cfg, logger)
@@ -307,7 +324,7 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	readerCtx, stopReader := context.WithCancel(context.Background())
 	defer stopReader()
 	refreshDone := make(chan error, 1)
-	if cfg.KIS.ApprovalMode == "" {
+	if dependencies.sharedFills == nil && cfg.KIS.ApprovalMode == "" {
 		go func() {
 			if err := approval.RefreshLoop(readerCtx); err != nil {
 				refreshDone <- err
@@ -348,6 +365,12 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	}
 	go func() {
 		defer close(events)
+		if dependencies.sharedFills != nil {
+			readerDone <- runAttempt(func() error {
+				return dependencies.sharedFills(readerCtx, events, onSubscribed, onReconnected)
+			})
+			return
+		}
 		readerDone <- reader.New(reader.Config{
 			OnSubscribed:  onSubscribed,
 			OnReconnected: onReconnected,
