@@ -32,8 +32,7 @@ func wantsHelp(args []string) bool {
 func dispatch(args []string) int {
 	if wantsHelp(args) {
 		fmt.Fprint(os.Stdout, usage)
-		fmt.Fprintln(os.Stdout, "기존 방식: fillwire [-config fillwire.toml]")
-		return 0
+		return runCLI(args)
 	}
 	if len(args) == 0 {
 		return runCLI(args)

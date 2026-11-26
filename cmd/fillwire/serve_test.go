@@ -35,8 +35,25 @@ func TestCommandHelp(t *testing.T) {
 	}
 }
 
+func TestRootHelpPreservesDeploySmokeContract(t *testing.T) {
+	for _, option := range []string{"--help", "-help", "-h"} {
+		t.Run(option, func(t *testing.T) {
+			child := exec.Command(os.Args[0], "-test.run=^TestDispatchProcess$", "--", option)
+			output, err := child.CombinedOutput()
+			if err != nil {
+				t.Fatalf("fillwire %s: %v\n%s", option, err, output)
+			}
+			for _, want := range []string{"Usage of", "-config string", "serve"} {
+				if !strings.Contains(string(output), want) {
+					t.Errorf("fillwire %s missing %q:\n%s", option, want, output)
+				}
+			}
+		})
+	}
+}
+
 func TestDispatchProcess(t *testing.T) {
-	if args := os.Args[1:]; len(args) == 4 && args[1] == "--" {
+	if args := os.Args[1:]; len(args) >= 3 && args[1] == "--" {
 		os.Exit(dispatch(args[2:]))
 	}
 }
