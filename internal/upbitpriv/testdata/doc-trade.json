@@ -1,0 +1,15 @@
+{
+  "type": "myOrder",
+  "code": "KRW-BTC",
+  "uuid": "ac2dc2a3-fce9-40a2-a4f6-5987c25c438f",
+  "ask_bid": "BID",
+  "state": "trade",
+  "trade_uuid": "68315169-fba4-4175-ade3-aff14a616657",
+  "price": 0.001453,
+  "avg_price": 0.00145372,
+  "volume": 30925891.29839369,
+  "executed_volume": 30925891.29839369,
+  "identifier": "test-1",
+  "trade_timestamp": 1710751590421,
+  "timestamp": 1710751597500
+}
