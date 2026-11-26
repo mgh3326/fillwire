@@ -33,6 +33,9 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "alpaca" {
+		os.Exit(runAlpacaCLI(os.Args[2:]))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "upbit-fills" {
 		if err := runUpbitFillsCommand(os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
