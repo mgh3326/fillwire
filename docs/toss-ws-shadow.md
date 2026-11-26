@@ -20,3 +20,7 @@ directory = "var/toss-ws"
 3. `session_id`가 바뀌는 지점에서 폴러에만 나타난 상태와 웹소켓에만 나타난 상태를 확인합니다. `resync_needed`는 새 세션의 시작 시각이며 직전 연결이 끊긴 정확한 시각은 종료 로그에서 확인합니다. 연결이 끊긴 동안의 이벤트는 재전송되지 않습니다. 이 리더의 동작 범위는 JSONL 기록까지입니다.
 
 [Toss Open API 개요](https://openapi.tossinvest.com/openapi-docs/overview.md#웹소켓-연동) · [AsyncAPI Connection / Order Event](https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json)
+
+## 인증 실패 시 기록 중단
+
+HTTP 401 또는 `auth-revoked`를 받으면 백오프 후 gatewayd `/fetch`를 한 번 호출합니다. 거부된 토큰의 해시를 보내지 않으며 공유 토큰의 폐기와 갱신은 gatewayd가 관리합니다. 조회가 실패하거나 gatewayd가 같은 토큰을 반환하면 리더를 중단하고 ERROR를 남깁니다. 다른 토큰을 받으면 한 번 재접속합니다. 재접속 시도부터 10분이 지나기 전에 다시 인증이 거부되면 `auth_revoked_stop` 줄을 기록하고 리더를 중단합니다. 기존 ERROR 로그에서 중단을 확인할 수 있습니다.

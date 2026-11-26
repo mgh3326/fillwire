@@ -24,28 +24,29 @@ const (
 	pingInterval = 60 * time.Second
 	ioTimeout    = 10 * time.Second
 	readIdle     = 3 * pingInterval
-	reissueGap   = time.Minute
+	authWindow   = 10 * time.Minute
 )
 
 var (
-	ErrAccountNotFound  = errors.New("Toss WS subscription rejected: account-not-found")
-	ErrRejected         = errors.New("Toss WS subscription rejected")
-	ErrAck              = errors.New("Toss WS invalid subscription acknowledgement")
-	ErrAuthAfterReissue = errors.New("Toss WS replacement token rejected")
-	ErrForbidden        = errors.New("Toss WS handshake forbidden: HTTP 403")
-	ErrRecord           = errors.New("Toss WS JSONL append failed")
-	errToken            = errors.New("Toss WS gatewayd token unavailable")
-	errAckTimeout       = errors.New("Toss WS subscription acknowledgement timed out")
-	errReadIdle         = errors.New("Toss WS inbound traffic timed out")
-	errServer           = errors.New("Toss WS unrecognized server error")
-	errUnauthorized     = errors.New("Toss WS handshake unauthorized: HTTP 401")
-	errAuthRevoked      = errors.New("Toss WS token revoked")
-	errDial             = errors.New("Toss WS handshake failed")
-	errWrite            = errors.New("Toss WS declaration write failed")
-	errClose            = errors.New("Toss WS unexpected close; possible connection eviction")
-	errShutdown         = errors.New("Toss WS server-shutdown")
-	errPing             = errors.New("Toss WS PING write failed")
-	errRate             = errors.New("Toss WS rate-limit-exceeded")
+	ErrAccountNotFound = errors.New("Toss WS subscription rejected: account-not-found")
+	ErrRejected        = errors.New("Toss WS subscription rejected")
+	ErrAck             = errors.New("Toss WS invalid subscription acknowledgement")
+	ErrAuthRevokedStop = errors.New("Toss WS stopped after a second authentication rejection")
+	ErrForbidden       = errors.New("Toss WS handshake forbidden: HTTP 403")
+	ErrRecord          = errors.New("Toss WS JSONL append failed")
+	errFreshToken      = errors.New("Toss WS gatewayd did not provide a different token")
+	errToken           = errors.New("Toss WS gatewayd token unavailable")
+	errAckTimeout      = errors.New("Toss WS subscription acknowledgement timed out")
+	errReadIdle        = errors.New("Toss WS inbound traffic timed out")
+	errServer          = errors.New("Toss WS unrecognized server error")
+	errUnauthorized    = errors.New("Toss WS handshake unauthorized: HTTP 401")
+	errAuthRevoked     = errors.New("Toss WS token revoked")
+	errDial            = errors.New("Toss WS handshake failed")
+	errWrite           = errors.New("Toss WS declaration write failed")
+	errClose           = errors.New("Toss WS unexpected close; possible connection eviction")
+	errShutdown        = errors.New("Toss WS server-shutdown")
+	errPing            = errors.New("Toss WS PING write failed")
+	errRate            = errors.New("Toss WS rate-limit-exceeded")
 )
 
 type Socket interface {
@@ -58,7 +59,7 @@ type Dialer func(ctx context.Context, endpoint string, headers http.Header) (Soc
 
 type TokenSource interface {
 	Current(context.Context) (tokenfetch.Token, bool, error)
-	Reissue(context.Context, string) (tokenfetch.Token, error)
+	Refresh(context.Context) (tokenfetch.Token, error)
 }
 
 type Clock interface {
@@ -125,45 +126,53 @@ func (r *Reader) Run(ctx context.Context) error {
 	}
 	defer r.running.Store(false)
 	var rejected string
-	var nextReissue time.Time
-	var pendingReplacement string
+	var recoveryStarted time.Time
 	delay := time.Second
 	for ctx.Err() == nil {
-		var token tokenfetch.Token
-		err := errToken
-		if rejected == "" || !r.cfg.Clock.Now().Before(nextReissue) {
-			if rejected != "" {
-				// Count the attempt even when gatewayd reports a failure.
-				nextReissue = r.cfg.Clock.Now().Add(reissueGap)
+		recovering := rejected != ""
+		token, err := r.token(ctx, rejected)
+		if recovering && err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			token, err = r.token(ctx, rejected)
+			return err
 		}
 		if err == nil {
-			value := token.Value()
-			if rejected != "" {
-				pendingReplacement = value
-			}
-			rejected = ""
 			start := r.cfg.Clock.Now()
+			if recovering {
+				recoveryStarted = start
+				rejected = ""
+			}
+			id := rand.Text()
+			value := token.Value()
 			conn, dialErr := r.connect(ctx, value)
 			err = dialErr
 			if err == nil {
-				if pendingReplacement == value {
-					pendingReplacement = ""
-				}
-				err = r.session(ctx, conn, value)
+				err = r.session(ctx, conn, value, id)
+			}
+			if ctx.Err() != nil {
+				break
 			}
 			if r.cfg.Clock.Now().Sub(start) >= pingInterval {
 				delay = time.Second
 			}
 			switch err {
-			case errUnauthorized:
-				if pendingReplacement == value {
-					return ErrAuthAfterReissue
+			case errUnauthorized, errAuthRevoked:
+				now := r.cfg.Clock.Now()
+				if !recoveryStarted.IsZero() && now.Sub(recoveryStarted) < authWindow {
+					if err := r.cfg.Append(Record{
+						Kind: "auth_revoked_stop", ReceivedAt: now.UTC(), SessionID: id,
+						Topic: channel + ":" + r.cfg.AccountSeq,
+					}); err != nil {
+						return errors.Join(ErrAuthRevokedStop, ErrRecord)
+					}
+					return ErrAuthRevokedStop
 				}
 				rejected = value
-			case errAuthRevoked:
-				rejected = value
+			default:
+				if recovering && dialErr != nil {
+					return dialErr
+				}
 			}
 		}
 		if ctx.Err() != nil {
@@ -190,10 +199,13 @@ func (r *Reader) token(ctx context.Context, rejected string) (tokenfetch.Token, 
 	if rejected == "" {
 		token, _, err = r.cfg.Tokens.Current(ctx)
 	} else {
-		token, err = r.cfg.Tokens.Reissue(ctx, rejected)
+		token, err = r.cfg.Tokens.Refresh(ctx)
 	}
 	if err != nil || token.Value() == "" {
 		return tokenfetch.Token{}, errToken
+	}
+	if token.Value() == rejected {
+		return tokenfetch.Token{}, errFreshToken
 	}
 	return token, nil
 }
@@ -216,9 +228,8 @@ func (r *Reader) connect(ctx context.Context, token string) (Socket, error) {
 	return conn, nil
 }
 
-func (r *Reader) session(ctx context.Context, conn Socket, token string) error {
+func (r *Reader) session(ctx context.Context, conn Socket, token, id string) error {
 	defer conn.CloseNow()
-	id := rand.Text()
 	topic := channel + ":" + r.cfg.AccountSeq
 	if err := r.cfg.Append(Record{Kind: "resync_needed", ReceivedAt: r.cfg.Clock.Now().UTC(), SessionID: id, Topic: topic}); err != nil {
 		return ErrRecord

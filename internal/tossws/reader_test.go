@@ -30,8 +30,8 @@ func (testTokens) Current(context.Context) (tokenfetch.Token, bool, error) {
 	return tokenfetch.NewToken(fakeToken, time.Now().Add(time.Hour), "test"), false, nil
 }
 
-func (testTokens) Reissue(context.Context, string) (tokenfetch.Token, error) {
-	return tokenfetch.Token{}, errors.New("unexpected token reissue")
+func (testTokens) Refresh(context.Context) (tokenfetch.Token, error) {
+	return tokenfetch.Token{}, errors.New("unexpected token refresh")
 }
 
 func fixture(t *testing.T, name string) []byte {
@@ -293,55 +293,6 @@ func TestPingAndReconnectWithFakeClock(t *testing.T) {
 	})
 }
 
-type retryTokens struct {
-	testTokens
-	attempts []time.Time
-}
-
-func (s *retryTokens) Reissue(_ context.Context, rejected string) (tokenfetch.Token, error) {
-	if rejected != fakeToken {
-		return tokenfetch.Token{}, errors.New("unexpected rejected token")
-	}
-	s.attempts = append(s.attempts, time.Now())
-	if len(s.attempts) == 1 {
-		return tokenfetch.Token{}, errors.New("simulated gatewayd timeout")
-	}
-	return tokenfetch.NewToken("replacement", time.Now().Add(time.Hour), "test"), nil
-}
-
-func TestRepeatedUnauthorizedBoundsReissue(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
-		defer cancel()
-		tokens := &retryTokens{}
-		var dials int
-		reader, err := New(Config{AccountSeq: "3", Tokens: tokens,
-			Append: func(Record) error { return nil },
-			Dial: func(_ context.Context, _ string, h http.Header) (Socket, int, error) {
-				dials++
-				want := "Bearer " + fakeToken
-				if dials == 2 {
-					want = "Bearer replacement"
-				}
-				if h.Get("Authorization") != want {
-					t.Error("unexpected token presented")
-				}
-				return nil, http.StatusUnauthorized, errors.New("simulated unauthorized")
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		runErr := reader.Run(ctx)
-		if runErr == nil || runErr.Error() != "Toss WS replacement token rejected" || dials != 2 || len(tokens.attempts) != 2 {
-			t.Fatalf("run = %v, dials = %d, attempts = %d", runErr, dials, len(tokens.attempts))
-		}
-		if got := tokens.attempts[1].Sub(tokens.attempts[0]); got < time.Minute {
-			t.Fatalf("retried gatewayd after %v", got)
-		}
-	})
-}
-
 func TestTransientReadFailuresReconnect(t *testing.T) {
 	for _, scenario := range []string{"ack-timeout", "read-idle", "unknown-server-error"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -399,67 +350,84 @@ func TestTransientReadFailuresReconnect(t *testing.T) {
 	}
 }
 
-type rotatingTokens struct {
-	value    string
-	reissues []time.Time
+type recoveryTokens struct {
+	testTokens
+	refreshes int
+	value     string
+	err       error
 }
 
-func (s *rotatingTokens) Current(context.Context) (tokenfetch.Token, bool, error) {
-	return tokenfetch.NewToken(s.value, time.Now().Add(time.Hour), "test"), false, nil
+func (s *recoveryTokens) Refresh(context.Context) (tokenfetch.Token, error) {
+	s.refreshes++
+	return tokenfetch.NewToken(s.value, time.Now().Add(time.Hour), "test"), s.err
 }
 
-func (s *rotatingTokens) Reissue(ctx context.Context, rejected string) (tokenfetch.Token, error) {
-	if rejected != s.value {
-		return tokenfetch.Token{}, errors.New("unexpected rejected token")
-	}
-	s.reissues = append(s.reissues, time.Now())
-	s.value = fmt.Sprintf("replacement-%d", len(s.reissues))
-	token, _, err := s.Current(ctx)
-	return token, err
-}
-
-func TestAcceptedReplacementCanRecoverFromAuthFailure(t *testing.T) {
-	for _, scenario := range []string{"auth-revoked", "unauthorized-after-close"} {
+func TestAuthRecoveryFetchesOnceThenStops(t *testing.T) {
+	for _, scenario := range []string{"http-401", "revoked-before-ack", "revoked-after-ack", "same-token", "fetch-failure", "dial-failure", "after-window"} {
 		t.Run(scenario, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+				ctx, cancel := context.WithTimeout(t.Context(), 11*time.Minute)
 				defer cancel()
-				tokens := &rotatingTokens{value: fakeToken}
-				var dials, markers int
+				tokens := &recoveryTokens{value: "replacement-token"}
+				if scenario == "same-token" {
+					tokens.value = fakeToken
+				}
+				if scenario == "fetch-failure" {
+					tokens.err = errors.New(fakeToken)
+				}
+				var dials int
+				var firstDial time.Time
+				var records []Record
+				var logs bytes.Buffer
 				reader, err := New(Config{AccountSeq: "3", Tokens: tokens,
-					Append: func(r Record) error {
-						if r.Kind == "resync_needed" {
-							markers++
-							if markers == 2 {
-								cancel()
-							}
-						}
-						return nil
-					},
+					Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+					Append: func(r Record) error { records = append(records, r); return nil },
 					Dial: func(_ context.Context, _ string, h http.Header) (Socket, int, error) {
 						dials++
-						if h.Get("Authorization") != "Bearer "+tokens.value {
-							t.Error("unexpected token presented")
+						want := fakeToken
+						if dials == 1 {
+							firstDial = time.Now()
+						} else {
+							want = tokens.value
+							if time.Since(firstDial) < time.Second {
+								t.Error("reconnected without backoff")
+							}
 						}
-						if dials == 1 || (dials == 3 && scenario == "unauthorized-after-close") {
-							return nil, http.StatusUnauthorized, errors.New("simulated unauthorized")
+						if h.Get("Authorization") != "Bearer "+want {
+							t.Error("unexpected handshake token")
+						}
+						revocationScenario := scenario == "revoked-before-ack" || scenario == "revoked-after-ack"
+						if (dials == 1 && !revocationScenario) || scenario == "http-401" {
+							return nil, http.StatusUnauthorized, errors.New(fakeToken)
+						}
+						if scenario == "dial-failure" {
+							return nil, 0, errors.New(fakeToken)
 						}
 						var id string
-						acknowledged := false
+						firstRead := true
+						pongs := 0
 						return fakeSocket{
-							write: func(raw []byte) error { id = requestID(raw); return nil },
-							read: func(ctx context.Context) ([]byte, error) {
-								if ctx.Err() != nil {
-									return nil, ctx.Err()
+							write: func(raw []byte) error {
+								if string(raw) != "PING" {
+									id = requestID(raw)
 								}
-								if !acknowledged {
-									acknowledged = true
+								return nil
+							},
+							read: func(ctx context.Context) ([]byte, error) {
+								if firstRead && scenario != "revoked-before-ack" {
+									firstRead = false
 									return fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3"],"rejected":[]}`, id), nil
 								}
-								if scenario == "auth-revoked" {
-									return []byte(`{"type":"error","error":{"code":"auth-revoked","message":"test"}}`), nil
+								if scenario == "after-window" && pongs < 10 {
+									pongs++
+									select {
+									case <-ctx.Done():
+										return nil, ctx.Err()
+									case <-time.After(time.Minute):
+										return []byte(`{"type":"pong"}`), nil
+									}
 								}
-								return nil, errors.New("simulated peer close")
+								return []byte(`{"type":"error","error":{"code":"auth-revoked","message":"` + fakeToken + `"}}`), nil
 							},
 							close: func() {},
 						}, http.StatusSwitchingProtocols, nil
@@ -468,11 +436,38 @@ func TestAcceptedReplacementCanRecoverFromAuthFailure(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := reader.Run(ctx); !errors.Is(err, context.Canceled) || markers != 2 || len(tokens.reissues) != 2 {
-					t.Fatalf("run = %v, dials = %d, markers = %d, reissues = %d", err, dials, markers, len(tokens.reissues))
+				wantErr, wantDials, wantRefreshes := ErrAuthRevokedStop, 2, 1
+				switch scenario {
+				case "same-token":
+					wantErr, wantDials = errFreshToken, 1
+				case "fetch-failure":
+					wantErr, wantDials = errToken, 1
+				case "dial-failure":
+					wantErr = errDial
+				case "after-window":
+					wantErr, wantRefreshes = errFreshToken, 2
 				}
-				if gap := tokens.reissues[1].Sub(tokens.reissues[0]); gap < time.Minute {
-					t.Fatalf("retried gatewayd after %v", gap)
+				runErr := reader.Run(ctx)
+				if !errors.Is(runErr, wantErr) || dials != wantDials || tokens.refreshes != wantRefreshes {
+					t.Fatalf("run = %v, dials = %d, refreshes = %d", runErr, dials, tokens.refreshes)
+				}
+				var stops int
+				for _, record := range records {
+					if record.Kind == "auth_revoked_stop" {
+						stops++
+						if record.Topic != "personal:order:3" || record.SessionID == "" || record.ReceivedAt.IsZero() {
+							t.Fatalf("invalid stop record: %+v", record)
+						}
+					}
+				}
+				if (wantErr == ErrAuthRevokedStop && stops != 1) || (wantErr != ErrAuthRevokedStop && stops != 0) {
+					t.Fatalf("stop rows = %d", stops)
+				}
+				raw, _ := json.Marshal(records)
+				for _, token := range []string{fakeToken, "replacement-token"} {
+					if strings.Contains(string(raw)+logs.String()+runErr.Error(), token) {
+						t.Fatal("credential appears in output")
+					}
 				}
 			})
 		})
