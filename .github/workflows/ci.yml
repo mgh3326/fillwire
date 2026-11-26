@@ -70,6 +70,7 @@ jobs:
         run: |
           bash scripts/publish-image_test.sh
           bash scripts/deploy-serve_test.sh
+          python3 scripts/test-serve-runbook.py /tmp/fillwire
       # The main stage's image build is publish (below), which builds and
       # pushes the same image to GHCR. Pull requests keep the local build.
       - name: container build

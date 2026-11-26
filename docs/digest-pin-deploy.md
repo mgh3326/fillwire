@@ -1,5 +1,7 @@
 # Digest-pinned container deployment (fillwire)
 
+For the serve and quote-collector units, use the [pi cutover runbook](serve-cutover.md).
+
 fillwire runs on the target host as a Docker container under systemd, pinned to
 an immutable GHCR digest — the same pattern as broker-edge
 (`deploy/systemd/broker-edge.service.example`). This repository is public: it
@@ -43,11 +45,10 @@ and B, and any recorded digest can be restored, not just the latest.
 ## Finding the digest for a commit
 
 CI publishes `ghcr.io/mgh3326/fillwire:sha-<commit-sha>` on every push to
-`main`. The workflow's **Surface pushed digest** step prints
-`Pushed image: ghcr.io/mgh3326/fillwire:sha-<commit-sha>@sha256:<digest>` and
+`main`. The workflow's **Build and push immutable image** step prints
+`Pushed image: ghcr.io/mgh3326/fillwire@sha256:<digest>` and
 writes the same pair into the run's `GITHUB_STEP_SUMMARY` ("GHCR image"
-block), so the canonical digest is on the workflow run page — no workflow
-change is needed.
+block), so the canonical digest is on the workflow run page.
 
 To resolve it from the host instead:
 

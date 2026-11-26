@@ -36,8 +36,13 @@ MOCK
 cat > "$tmp/bin/curl" <<'MOCK'
 #!/bin/bash
 echo curl >> "$TEST_LOG"
-printf 200
+if [[ -f ${TEST_UNHEALTHY:-} ]] && cmp -s "$TEST_UNHEALTHY" "$TEST_CURRENT"; then
+  printf 503
+else
+  printf 200
+fi
 MOCK
+printf '#!/bin/bash\nexit 0\n' > "$tmp/bin/sleep"
 chmod +x "$tmp/bin/"*
 deploy() { bash scripts/deploy-serve.sh fillwire-serve "$1"; }
 refuse() {
@@ -76,6 +81,19 @@ assert_pin "$current" "$a"
 assert_pin "$current.previous" "$b"
 [[ $(grep -c '^curl$' "$TEST_LOG") == 1 ]]
 grep -q 'deployment failed; restored' "$tmp/output"
+rm "$TEST_FAILURE"
+export TEST_UNHEALTHY="$tmp/unhealthy"
+printf 'IMAGE=%s\n' "$b" > "$TEST_UNHEALTHY"
+refuse "$b"
+assert_pin "$current" "$a"
+assert_pin "$current.previous" "$b"
+
 printf 'IMAGE=%s\nEXTRA=bad' "$a" > "$current"
 refuse --check
-echo 'deploy-serve pin, first failure and rollback tests: PASS'
+export TEST_CURRENT="$FILLWIRE_DEPLOY_STATE_DIR/quote-collector.service.image"
+: > "$TEST_LOG"
+bash scripts/deploy-serve.sh quote-collector "$a"
+assert_pin "$TEST_CURRENT" "$a"
+! grep -qx curl "$TEST_LOG"
+
+echo 'deploy-serve pin, first failure, collector and rollback tests: PASS'
