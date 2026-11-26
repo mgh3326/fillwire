@@ -10,7 +10,11 @@ export TEST_LOG="$tmp/log"
 export TEST_FAILURE="$tmp/failure"
 export TEST_FLAP="$tmp/flap"
 export TEST_TICK="$tmp/tick"
-touch "$TEST_TICK"
+export TEST_RESTARTS="$tmp/restarts"
+export TEST_STARTS="$tmp/starts"
+export TEST_STOPPED="$tmp/stopped"
+export TEST_INTERRUPT="$tmp/interrupt"
+touch "$TEST_TICK" "$TEST_RESTARTS" "$TEST_STARTS"
 a=ghcr.io/mgh3326/fillwire@sha256:$(printf '%064d' 1)
 b=ghcr.io/mgh3326/fillwire@sha256:$(printf '%064d' 2)
 unknown=ghcr.io/mgh3326/fillwire@sha256:$(printf '%064d' 3)
@@ -30,8 +34,12 @@ case "$1 $2" in
       running=false
     fi
     pin=$(cut -d= -f2 "$TEST_CURRENT")
+    id=container-id
+    if [[ -f ${TEST_REPLACE:-} && -s $TEST_TICK ]] && cmp -s "$TEST_REPLACE" "$TEST_CURRENT"; then
+      id=replacement-id
+    fi
     if [[ $4 == *'.Id'* ]]; then
-      printf '%s %s container-id 2026-11-26T00:00:00Z\n' "$running" "$pin"
+      printf '%s %s %s 2026-11-26T00:00:00Z\n' "$running" "$pin" "$id"
     else
       printf '%s %s\n' "$running" "$pin"
     fi
@@ -43,9 +51,35 @@ cat > "$tmp/bin/systemctl" <<'MOCK'
 #!/bin/bash
 set -eu
 echo "systemctl $*" >> "$TEST_LOG"
-if [[ $1 == restart ]]; then : > "$TEST_TICK"; fi
-if [[ $1 == show ]]; then echo 0; fi
-if [[ $1 == restart && -f $TEST_FAILURE ]] && cmp -s "$TEST_FAILURE" "$TEST_CURRENT"; then
+case "$1" in
+  stop) touch "$TEST_STOPPED" ;;
+  reset-failed)
+    [[ -f $TEST_STOPPED ]] || exit 1
+    : > "$TEST_STARTS"
+    : > "$TEST_RESTARTS"
+    ;;
+  start)
+    rm -f "$TEST_STOPPED"
+    : > "$TEST_TICK"
+    [[ $(wc -l < "$TEST_STARTS") -lt 4 ]] || exit 1
+    echo start >> "$TEST_STARTS"
+    if [[ -f $TEST_INTERRUPT ]]; then
+      signal=$(cat "$TEST_INTERRUPT")
+      rm "$TEST_INTERRUPT"
+      kill -s "$signal" "$PPID"
+      exit 1
+    fi
+    ;;
+  show)
+    if [[ -f ${TEST_AUTO_RESTART:-} && -s $TEST_TICK ]] && cmp -s "$TEST_AUTO_RESTART" "$TEST_CURRENT"; then
+      echo restart > "$TEST_RESTARTS"
+      # Automatic starts consume the start limit, too.
+      printf 'start\nstart\nstart\n' >> "$TEST_STARTS"
+    fi
+    wc -l < "$TEST_RESTARTS" | tr -d ' '
+    ;;
+esac
+if [[ $1 == start && -f $TEST_FAILURE ]] && cmp -s "$TEST_FAILURE" "$TEST_CURRENT"; then
   exit 1
 fi
 MOCK
@@ -59,6 +93,7 @@ else
 fi
 MOCK
 printf '#!/bin/bash\necho tick >> "$TEST_TICK"\n' > "$tmp/bin/sleep"
+printf '#!/bin/bash\n[[ $1 == -f && -d $2 ]]\n' > "$tmp/bin/sync"
 chmod +x "$tmp/bin/"*
 deploy() { bash scripts/deploy-serve.sh fillwire-serve "$1"; }
 refuse() {
@@ -86,7 +121,9 @@ deploy --check
 deploy "$b"
 assert_pin "$current" "$b"
 assert_pin "$current.previous" "$a"
-deploy --rollback
+printf 'start\nstart\nstart\nstart\n' > "$TEST_STARTS"
+printf 'restart\n' > "$TEST_RESTARTS"
+deploy --rollback || { echo 'manual rollback must clear both systemd counters' >&2; exit 1; }
 assert_pin "$current" "$a"
 assert_pin "$current.previous" "$b"
 
@@ -103,6 +140,51 @@ printf 'IMAGE=%s\n' "$b" > "$TEST_UNHEALTHY"
 refuse "$b"
 assert_pin "$current" "$a"
 assert_pin "$current.previous" "$b"
+
+for fault in TEST_REPLACE TEST_AUTO_RESTART; do
+  export "$fault=$tmp/fault"
+  printf 'IMAGE=%s\n' "$b" > "$tmp/fault"
+  refuse "$b"
+  grep -q 'deployment failed; restored' "$tmp/output"
+  assert_pin "$current" "$a"
+  assert_pin "$current.previous" "$b"
+  unset "$fault"
+done
+
+# The mock interrupts the deploy process immediately after the candidate pin changes.
+for signal in INT TERM HUP; do
+  echo "$signal" > "$TEST_INTERRUPT"
+  refuse "$b"
+  assert_pin "$current" "$a"
+  assert_pin "$current.previous" "$b"
+  [[ ! -e $current.pending ]]
+done
+
+echo KILL > "$TEST_INTERRUPT"
+refuse "$b"
+assert_pin "$current" "$b"
+assert_pin "$current.pending" "$a"
+rmdir "$FILLWIRE_DEPLOY_STATE_DIR/fillwire-serve.service.lock"
+refuse "$b"
+grep -q 'interrupted deployment' "$tmp/output"
+printf 'IMAGE=%s\n' "$a" > "$TEST_FAILURE"
+refuse --recover
+assert_pin "$current.pending" "$a"
+rm "$TEST_FAILURE"
+deploy --recover
+assert_pin "$current" "$a"
+assert_pin "$current.previous" "$b"
+[[ ! -e $current.pending ]]
+
+rm "$current" "$current.previous"
+echo TERM > "$TEST_INTERRUPT"
+refuse "$b"
+[[ ! -e $current && ! -e $current.previous && ! -e $current.pending ]]
+echo KILL > "$TEST_INTERRUPT"
+refuse "$b"
+rmdir "$FILLWIRE_DEPLOY_STATE_DIR/fillwire-serve.service.lock"
+deploy --recover
+[[ ! -e $current && ! -e $current.previous && ! -e $current.pending ]]
 
 printf 'IMAGE=%s\nEXTRA=bad' "$a" > "$current"
 refuse --check
@@ -122,4 +204,4 @@ grep -q 'deployment failed; restored' "$tmp/output"
 assert_pin "$TEST_CURRENT" "$a"
 assert_pin "$TEST_CURRENT.previous" "$unknown"
 
-echo 'deploy-serve pin, first failure, collector, run-then-exit and rollback tests: PASS'
+echo 'deploy-serve pin, start limits, stability, signal recovery and rollback tests: PASS'
