@@ -74,7 +74,7 @@ func TestBinaryHasNoOrderCode(t *testing.T) {
 	goTool(t, "build", "-o", binary, ".")
 
 	symbols := string(goTool(t, "tool", "nm", binary))
-	for _, want := range []string{"main.run", "marketminute.(*Client).Fetch"} {
+	for _, want := range []string{"internal/markettapcmd.Run", "marketminute.(*Client).Fetch"} {
 		if !strings.Contains(symbols, want) {
 			t.Fatalf("symbol table lacks %s; the scan would pass vacuously", want)
 		}

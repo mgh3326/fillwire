@@ -26,28 +26,44 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "upbit" {
-		if err := runUpbitCommand(os.Args[2:]); err != nil && !errors.Is(err, context.Canceled) {
+	os.Exit(dispatch(os.Args[1:]))
+}
+
+func runCLI(args []string) int {
+	if len(args) > 0 && args[0] == "upbit" {
+		if err := runUpbitCommand(args[1:]); err != nil && !errors.Is(err, context.Canceled) {
+			if errors.Is(err, flag.ErrHelp) {
+				return 0
+			}
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return 1
 		}
-		return
+		return 0
 	}
-	if len(os.Args) > 1 && os.Args[1] == "coverage" {
-		if err := runCoverageCommand(os.Args[2:]); err != nil {
+	if len(args) > 0 && args[0] == "coverage" {
+		if err := runCoverageCommand(args[1:]); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return 0
+			}
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
+			return 2
 		}
-		return
+		return 0
 	}
-	configPath := flag.String("config", "fillwire.toml", "path to fillwire TOML configuration")
-	flag.Parse()
+	flags := flag.NewFlagSet("fillwire", flag.ContinueOnError)
+	configPath := flags.String("config", "fillwire.toml", "path to fillwire TOML configuration")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	alerter := alert.FromEnv(logger, alert.DefaultRateLimit)
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		logger.Error("startup configuration failed", "reason", err.Error())
-		os.Exit(exitCodeWithAlert(reader.ErrApprovalConfig, alerter))
+		return exitCodeWithAlert(reader.ErrApprovalConfig, alerter)
 	}
 	alerter.SetRateLimit(cfg.alertRateLimit)
 
@@ -55,8 +71,9 @@ func main() {
 	defer stop()
 	if err := run(ctx, cfg, logger, alerter); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("fillwire stopped", "reason", safeRuntimeError(err))
-		os.Exit(exitCodeWithAlert(err, alerter))
+		return exitCodeWithAlert(err, alerter)
 	}
+	return 0
 }
 
 func exitCodeWithAlert(err error, alerter alert.Alerter) int {
