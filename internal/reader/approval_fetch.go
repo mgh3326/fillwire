@@ -23,8 +23,7 @@ const ApprovalModeGatewaydFetch = "gatewayd-fetch"
 // refresh failure while the held key still has life keeps the stream, and a
 // failure with no live key is terminal. No failure falls back to issuing.
 //
-// A non-forced fetch inside the margin may return the same key: gatewayd
-// reissues only under 60 s of life. That answer is adopted as success.
+// A successful fetch can return the same key if a refresh extends its expiry.
 type FetchApprovalProvider struct {
 	holder      *tokenfetch.Holder
 	logger      *slog.Logger

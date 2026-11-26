@@ -149,11 +149,10 @@ first connect (see failure handling below). The call goes to the same
   never issues locally. The approval key exists only in process memory.
 - **Refresh.** The key is read from memory while more than
   `approval_refresh_margin` of its life remains, with no HTTP call at all.
-  Inside the margin, the next connect or reconnect asks gatewayd again. gatewayd
-  reissues only when under 60 s remain, so a request inside the margin may
-  legitimately return the same key; fillwire adopts it without an alert. There
-  is no background refresh loop, as in `"gatewayd"` mode: the key matters only
-  at the websocket handshake.
+  Inside the margin, the next connect or reconnect asks gatewayd again.
+  Gatewayd refreshes keys with at most two hours left, which covers every
+  supported reader margin. As in `"gatewayd"` mode, the key is needed at the
+  WebSocket handshake.
 - **KIS rejection.** Where `""` mode forces a reissue, fillwire sends
   `failed_token_sha256`, the SHA-256 of the key KIS rejected. gatewayd reissues
   if that key is still current, and otherwise answers with the newer key it
