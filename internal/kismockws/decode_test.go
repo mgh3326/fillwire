@@ -64,6 +64,7 @@ func TestMockNoticesDecodeAndRecord(t *testing.T) {
 	}{
 		{TROverseasNotice, overseasRecordingName, 25},
 		{TRFuturesNotice, futuresRecordingName, 22},
+		{TRFuturesNoticeLegacy, futuresRecordingName, 22},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tr, func(t *testing.T) {

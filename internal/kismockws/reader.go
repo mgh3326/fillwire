@@ -34,6 +34,7 @@ type Config struct {
 	Endpoint           string
 	HTSID              string
 	Symbols            []string
+	FuturesNoticeTR    string
 	RecordingDirectory string
 	Approval           ws.ApprovalKeyProvider
 	Dialer             ws.Dialer
@@ -73,6 +74,12 @@ func New(cfg Config) (*Module, error) {
 	}
 	if len(cfg.Symbols) == 0 {
 		return nil, errors.New("kismockws: at least one domestic symbol is required")
+	}
+	if cfg.FuturesNoticeTR == "" {
+		cfg.FuturesNoticeTR = TRFuturesNotice
+	}
+	if cfg.FuturesNoticeTR != TRFuturesNotice && cfg.FuturesNoticeTR != TRFuturesNoticeLegacy {
+		return nil, errors.New("kismockws: unsupported futures notice TR")
 	}
 	seen := make(map[string]bool, len(cfg.Symbols))
 	for _, symbol := range cfg.Symbols {
@@ -144,7 +151,7 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		for _, symbol := range m.cfg.Symbols {
 			registrations = append(registrations, [2]string{"H0STCNT0", symbol}, [2]string{"H0STASP0", symbol})
 		}
-		registrations = append(registrations, [2]string{TROverseasNotice, m.cfg.HTSID}, [2]string{TRFuturesNotice, m.cfg.HTSID})
+		registrations = append(registrations, [2]string{TROverseasNotice, m.cfg.HTSID}, [2]string{m.cfg.FuturesNoticeTR, m.cfg.HTSID})
 		for i, registration := range registrations {
 			if i > 0 {
 				timer := time.NewTimer(m.cfg.SubscribePace)
@@ -203,7 +210,7 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		}).Run(runCtx, output)
 	}()
 	processEvent := func(event ws.Event) {
-		if event.TR == TROverseasNotice || event.TR == TRFuturesNotice {
+		if event.TR == TROverseasNotice || isFuturesNoticeTR(event.TR) {
 			m.recordNotice(sink, event, cancel)
 		}
 	}
@@ -326,7 +333,7 @@ func (m *Module) recordNotice(sink *recording.Sink, event ws.Event, cancel conte
 	}
 	for _, notice := range notices {
 		stream := overseasRecordingName
-		if event.TR == TRFuturesNotice {
+		if isFuturesNoticeTR(event.TR) {
 			stream = futuresRecordingName
 		}
 		if m.append(sink, stream, notice.ReceivedAt, notice, cancel) {

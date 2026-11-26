@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	TROverseasNotice = "H0GSCNI9"
-	TRFuturesNotice  = "H0IFCNI0"
+	TROverseasNotice      = "H0GSCNI9"
+	TRFuturesNotice       = "H0IFCNI9"
+	TRFuturesNoticeLegacy = "H0IFCNI0"
 )
 
 // Notice is one decrypted KIS account-notice row, named in the order of the
@@ -42,6 +43,10 @@ var futuresNoticeFields = []string{
 	"cntg_isnm", "oder_cond", "ord_grp", "ord_grpseq", "order_prc",
 }
 
+func isFuturesNoticeTR(tr string) bool {
+	return tr == TRFuturesNotice || tr == TRFuturesNoticeLegacy
+}
+
 // DecodeNotice maps the decrypted websocket fields to KIS's sample schema.
 // The count check fails closed so a changed wire layout is counted and dropped.
 func DecodeNotices(event ws.Event) ([]Notice, error) {
@@ -49,7 +54,7 @@ func DecodeNotices(event ws.Event) ([]Notice, error) {
 	switch event.TR {
 	case TROverseasNotice:
 		names = overseasNoticeFields
-	case TRFuturesNotice:
+	case TRFuturesNotice, TRFuturesNoticeLegacy:
 		names = futuresNoticeFields
 	default:
 		return nil, errors.New("kismockws: unsupported notice TR")
