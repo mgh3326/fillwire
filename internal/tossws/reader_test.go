@@ -398,3 +398,83 @@ func TestTransientReadFailuresReconnect(t *testing.T) {
 		})
 	}
 }
+
+type rotatingTokens struct {
+	value    string
+	reissues []time.Time
+}
+
+func (s *rotatingTokens) Current(context.Context) (tokenfetch.Token, bool, error) {
+	return tokenfetch.NewToken(s.value, time.Now().Add(time.Hour), "test"), false, nil
+}
+
+func (s *rotatingTokens) Reissue(ctx context.Context, rejected string) (tokenfetch.Token, error) {
+	if rejected != s.value {
+		return tokenfetch.Token{}, errors.New("unexpected rejected token")
+	}
+	s.reissues = append(s.reissues, time.Now())
+	s.value = fmt.Sprintf("replacement-%d", len(s.reissues))
+	token, _, err := s.Current(ctx)
+	return token, err
+}
+
+func TestAcceptedReplacementCanRecoverFromAuthFailure(t *testing.T) {
+	for _, scenario := range []string{"auth-revoked", "unauthorized-after-close"} {
+		t.Run(scenario, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+				defer cancel()
+				tokens := &rotatingTokens{value: fakeToken}
+				var dials, markers int
+				reader, err := New(Config{AccountSeq: "3", Tokens: tokens,
+					Append: func(r Record) error {
+						if r.Kind == "resync_needed" {
+							markers++
+							if markers == 2 {
+								cancel()
+							}
+						}
+						return nil
+					},
+					Dial: func(_ context.Context, _ string, h http.Header) (Socket, int, error) {
+						dials++
+						if h.Get("Authorization") != "Bearer "+tokens.value {
+							t.Error("unexpected token presented")
+						}
+						if dials == 1 || (dials == 3 && scenario == "unauthorized-after-close") {
+							return nil, http.StatusUnauthorized, errors.New("simulated unauthorized")
+						}
+						var id string
+						acknowledged := false
+						return fakeSocket{
+							write: func(raw []byte) error { id = requestID(raw); return nil },
+							read: func(ctx context.Context) ([]byte, error) {
+								if ctx.Err() != nil {
+									return nil, ctx.Err()
+								}
+								if !acknowledged {
+									acknowledged = true
+									return fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3"],"rejected":[]}`, id), nil
+								}
+								if scenario == "auth-revoked" {
+									return []byte(`{"type":"error","error":{"code":"auth-revoked","message":"test"}}`), nil
+								}
+								return nil, errors.New("simulated peer close")
+							},
+							close: func() {},
+						}, http.StatusSwitchingProtocols, nil
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := reader.Run(ctx); !errors.Is(err, context.Canceled) || markers != 2 || len(tokens.reissues) != 2 {
+					t.Fatalf("run = %v, dials = %d, markers = %d, reissues = %d", err, dials, markers, len(tokens.reissues))
+				}
+				if gap := tokens.reissues[1].Sub(tokens.reissues[0]); gap < time.Minute {
+					t.Fatalf("retried gatewayd after %v", gap)
+				}
+			})
+		})
+	}
+}

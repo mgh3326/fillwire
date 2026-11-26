@@ -38,7 +38,8 @@ var (
 	errAckTimeout       = errors.New("Toss WS subscription acknowledgement timed out")
 	errReadIdle         = errors.New("Toss WS inbound traffic timed out")
 	errServer           = errors.New("Toss WS unrecognized server error")
-	errAuth             = errors.New("Toss WS token rejected")
+	errUnauthorized     = errors.New("Toss WS handshake unauthorized: HTTP 401")
+	errAuthRevoked      = errors.New("Toss WS token revoked")
 	errDial             = errors.New("Toss WS handshake failed")
 	errWrite            = errors.New("Toss WS declaration write failed")
 	errClose            = errors.New("Toss WS unexpected close; possible connection eviction")
@@ -125,7 +126,7 @@ func (r *Reader) Run(ctx context.Context) error {
 	defer r.running.Store(false)
 	var rejected string
 	var nextReissue time.Time
-	var replacementUsed bool
+	var pendingReplacement string
 	delay := time.Second
 	for ctx.Err() == nil {
 		var token tokenfetch.Token
@@ -138,19 +139,31 @@ func (r *Reader) Run(ctx context.Context) error {
 			token, err = r.token(ctx, rejected)
 		}
 		if err == nil {
-			replacementUsed = replacementUsed || rejected != ""
+			value := token.Value()
+			if rejected != "" {
+				pendingReplacement = value
+			}
 			rejected = ""
 			start := r.cfg.Clock.Now()
-			err = r.session(ctx, token.Value())
+			conn, dialErr := r.connect(ctx, value)
+			err = dialErr
+			if err == nil {
+				if pendingReplacement == value {
+					pendingReplacement = ""
+				}
+				err = r.session(ctx, conn, value)
+			}
 			if r.cfg.Clock.Now().Sub(start) >= pingInterval {
 				delay = time.Second
-				replacementUsed = false
 			}
-			if err == errAuth {
-				if replacementUsed {
+			switch err {
+			case errUnauthorized:
+				if pendingReplacement == value {
 					return ErrAuthAfterReissue
 				}
-				rejected = token.Value()
+				rejected = value
+			case errAuthRevoked:
+				rejected = value
 			}
 		}
 		if ctx.Err() != nil {
@@ -185,7 +198,7 @@ func (r *Reader) token(ctx context.Context, rejected string) (tokenfetch.Token, 
 	return token, nil
 }
 
-func (r *Reader) session(ctx context.Context, token string) error {
+func (r *Reader) connect(ctx context.Context, token string) (Socket, error) {
 	headers := http.Header{"Authorization": {"Bearer " + token}}
 	dialCtx, cancel := context.WithTimeout(ctx, ioTimeout)
 	conn, status, err := r.cfg.Dial(dialCtx, Endpoint, headers)
@@ -193,13 +206,17 @@ func (r *Reader) session(ctx context.Context, token string) error {
 	if err != nil {
 		switch status {
 		case http.StatusUnauthorized:
-			return errAuth
+			return nil, errUnauthorized
 		case http.StatusForbidden:
-			return ErrForbidden
+			return nil, ErrForbidden
 		default:
-			return errDial
+			return nil, errDial
 		}
 	}
+	return conn, nil
+}
+
+func (r *Reader) session(ctx context.Context, conn Socket, token string) error {
 	defer conn.CloseNow()
 	id := rand.Text()
 	topic := channel + ":" + r.cfg.AccountSeq
@@ -214,7 +231,7 @@ func (r *Reader) session(ctx context.Context, token string) error {
 	}
 	firstPing := r.cfg.Clock.After(pingInterval)
 	ackCtx, cancel := context.WithTimeout(ctx, ioTimeout)
-	err = r.ack(ackCtx, conn, id, topic)
+	err := r.ack(ackCtx, conn, id, topic)
 	cancel()
 	if err != nil {
 		return err
@@ -322,7 +339,7 @@ func serverError(frame object) error {
 	}
 	switch body["code"] {
 	case "auth-revoked":
-		return errAuth
+		return errAuthRevoked
 	case "server-shutdown":
 		return errShutdown
 	case "rate-limit-exceeded", "internal-error":
