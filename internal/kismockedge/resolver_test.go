@@ -23,13 +23,13 @@ func TestResolverEvidenceBranches(t *testing.T) {
 		wantOrderID     string
 	}{
 		{
-			name: "matching read evidence accepts",
+			name: "single KIS history candidate remains unknown",
 			orders: []kismockread.DomesticOrder{{
 				BrokerOrderID: "12345", Side: "buy", StockCode: "005930", Quantity: "001", Price: "070000",
 				OrderedAt: time.Date(2026, 9, 1, 12, 1, 0, 0, time.UTC),
 			}},
-			wantDisposition: executioncontracts.DispositionAccepted,
-			wantOrderID:     "12345",
+			wantDisposition: executioncontracts.DispositionUnknown,
+			wantError:       ErrorBrokerTimeout,
 		},
 		{
 			name:            "complete read without match resolves absent after grace",
@@ -70,6 +70,12 @@ func TestResolverEvidenceBranches(t *testing.T) {
 			if test.readErr != nil {
 				if result.ReadFailures != 1 || len(result.Resolved) != 0 || result.Unresolved != 1 {
 					t.Fatalf("failure result = %+v; an evidence failure must not create NOT_CREATED", result)
+				}
+				return
+			}
+			if test.wantDisposition == executioncontracts.DispositionUnknown {
+				if result.Unresolved != 1 || len(result.Resolved) != 0 {
+					t.Fatalf("heuristic match changed the resolution: %+v", result)
 				}
 				return
 			}

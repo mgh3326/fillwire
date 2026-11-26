@@ -308,9 +308,22 @@ func execute(ctx context.Context, config Config, now func() time.Time, client *h
 		stageCtx, cancelStage := context.WithTimeout(ctx, budget)
 		defer cancelStage()
 		started := time.Now()
+		defer func() { result.StageDurationsMS[stage] = time.Since(started).Milliseconds() }()
 		response, err := client.Do(request.WithContext(stageCtx))
-		result.StageDurationsMS[stage] = time.Since(started).Milliseconds()
-		return response, err
+		if err != nil {
+			return nil, err
+		}
+		const maxResponseBytes = 1 << 20
+		body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+		response.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if len(body) > maxResponseBytes {
+			return nil, errors.New("canary response exceeds size limit")
+		}
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		return response, nil
 	}
 
 	stock := config.KRSymbol

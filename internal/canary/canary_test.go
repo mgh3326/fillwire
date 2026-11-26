@@ -603,16 +603,10 @@ func mustStore(t *testing.T) *kismockedge.Store {
 	return store
 }
 
-// AC3 core case: a place that times out before the ack may still have crossed
-// the send boundary. The canary must ask the edge to evidence its own command,
-// find the resting order, and cancel exactly that command — recorded on the
-// outcome line. Everything below runs the real edge Service and Store; only
-// the KIS transport and the read evidence are faked.
-func TestPlaceTimeoutFindsAndCancelsOwnRestingOrder(t *testing.T) {
+// A place timeout and a single KIS history candidate do not establish ownership.
+func TestPlaceTimeoutWithKISHistoryCandidateCancelsNothing(t *testing.T) {
 	at := fixedKR(2026, time.September, 2, 10, 0)
 	transport := &hangingKISTransport{}
-	// The resting order matches the command's own facts (buy 005930 x1 at the
-	// derived lower-limit price 49700, ordered at the service's send time).
 	resting := stubOrderReader{orders: []kismockread.DomesticOrder{{
 		BrokerOrderID: "9001", Side: "buy", StockCode: "005930",
 		Quantity: "001", Price: "49700", OrderedAt: edgeTestNow,
@@ -625,34 +619,15 @@ func TestPlaceTimeoutFindsAndCancelsOwnRestingOrder(t *testing.T) {
 	budgets.place = 300 * time.Millisecond
 	result := execute(context.Background(), Config{EdgeURL: server.URL, KRSymbol: "005930"}, func() time.Time { return at }, server.Client(), budgets)
 
-	if result.Outcome != OutcomePlaceNotAccepted || result.ErrorCode != ErrorCanaryTimeout {
+	if result.Outcome != OutcomePlaceNotAccepted || result.ErrorCode != ErrorCanaryTimeout || result.Stage != StagePlaceSent {
 		t.Fatalf("result = %+v", result)
 	}
-	if result.Stage != StageCancelAcked {
-		t.Fatalf("stage = %q, want %q after cleanup cancel", result.Stage, StageCancelAcked)
-	}
-	if result.OrderCheck == nil || result.OrderCheck.Disposition != string(executioncontracts.DispositionAccepted) ||
-		result.OrderCheck.Matched != 1 || result.OrderCheck.OrdersSeen != 1 ||
-		result.OrderCheck.CancelState != "CANCELLED" {
+	if result.OrderCheck == nil || result.OrderCheck.Disposition != string(executioncontracts.DispositionUnknown) ||
+		result.OrderCheck.Matched != 1 || result.OrderCheck.OrdersSeen != 1 || result.OrderCheck.CancelState != "" {
 		t.Fatalf("order_check = %+v", result.OrderCheck)
 	}
-	for _, stage := range []string{StageBandGet, StagePlaceSent, "check", StageCancelSent} {
-		if _, ok := result.StageDurationsMS[stage]; !ok {
-			t.Fatalf("missing duration for %s in %+v", stage, result.StageDurationsMS)
-		}
-	}
-	if transport.placeCalls.Load() != 1 || transport.cancelCalls.Load() != 1 {
-		t.Fatalf("place=%d cancel=%d KIS calls; want exactly one each", transport.placeCalls.Load(), transport.cancelCalls.Load())
-	}
-	// The store proves the cleanup: the command resolved ACCEPTED and its one
-	// cancel attempt is durably CANCELLED.
-	resolved, found, err := service.Store.Find(context.Background(), result.CommandID)
-	if err != nil || !found || resolved.Disposition != executioncontracts.DispositionAccepted || resolved.BrokerOrderID != "9001" {
-		t.Fatalf("resolved receipt = %+v found=%t err=%v", resolved, found, err)
-	}
-	cancelled, found, err := service.Store.FindCancelAttempt(context.Background(), result.CommandID)
-	if err != nil || !found || cancelled.State != "CANCELLED" {
-		t.Fatalf("cancel attempt = %+v found=%t err=%v", cancelled, found, err)
+	if transport.placeCalls.Load() != 1 || transport.cancelCalls.Load() != 0 {
+		t.Fatalf("place=%d cancel=%d KIS calls; want one place and no cancel", transport.placeCalls.Load(), transport.cancelCalls.Load())
 	}
 }
 
@@ -763,6 +738,7 @@ func TestSlowBandGetHonorsItsOwnBudget(t *testing.T) {
 	var posts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/v1/price-band" {
+			writer.(http.Flusher).Flush()
 			<-request.Context().Done()
 			return
 		}

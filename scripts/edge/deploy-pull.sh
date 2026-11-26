@@ -31,7 +31,7 @@ case "$tag" in
 esac
 
 state_dir=${BROKER_EDGE_STATE_DIR:-/var/lib/broker-edge}
-repository=${BROKER_EDGE_IMAGE_REPOSITORY:-ghcr.io/mgh3326/broker-edge}
+repository=${BROKER_EDGE_IMAGE_REPOSITORY:?set the explicitly approved legacy image repository}
 health_port=${BROKER_EDGE_HEALTH_PORT:-8080}
 health_url=${BROKER_EDGE_HEALTH_URL:-http://127.0.0.1:${health_port}/metrics}
 health_attempts=${BROKER_EDGE_HEALTH_ATTEMPTS:-10}
@@ -91,7 +91,7 @@ health_gate() {
 }
 
 restart_and_gate() {
-  systemctl restart "$unit"
+  systemctl restart "$unit" || return 1
   health_gate
 }
 
@@ -123,7 +123,10 @@ fi
 
 docker pull "$repository:$tag"
 digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$repository:$tag" \
-  | awk -v prefix="$repository@sha256:" '$0 ~ "^" prefix "[0-9a-f]{64}$" { print; exit }')
+  | awk -v prefix="$repository@sha256:" 'index($0, prefix) == 1 {
+      hash = substr($0, length(prefix) + 1)
+      if (length(hash) == 64 && hash !~ /[^0-9a-f]/) { print; exit }
+    }')
 [ -n "$digest" ] || fail "could not resolve a RepoDigest for $repository:$tag"
 new_image=IMAGE=$digest
 
@@ -145,7 +148,10 @@ if restart_and_gate; then
 fi
 
 if [ ! -f "$backup_dir/current" ]; then
-  fail "health gate failed for $unit and no previous image is available"
+  copy_or_remove "$backup_dir/current" "$image_file"
+  copy_or_remove "$backup_dir/previous" "$previous_file"
+  systemctl stop "$unit" || fail "first deploy failed and unit stop failed for $unit"
+  fail "first deploy health gate failed; stopped $unit"
 fi
 copy_or_remove "$backup_dir/current" "$image_file"
 copy_or_remove "$backup_dir/previous" "$previous_file"

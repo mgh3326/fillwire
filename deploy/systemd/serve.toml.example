@@ -1,0 +1,53 @@
+# 활성화할 모듈과 사본의 경로는 전환 런북을 따릅니다.
+[serve]
+health_listen = "127.0.0.1:8792"
+
+[gatewayd]
+enabled = false
+listen = "127.0.0.1:8791"
+providers = "kis-live,kis-live-approval"
+
+[kis]
+endpoint = "live"
+account_mode = "live"
+approval_mode = "gatewayd-fetch"
+
+[kis.gatewayd]
+url = "http://127.0.0.1:8791"
+token_env = "GATEWAYD_FETCH_TOKEN"
+token_header = "Authorization"
+
+[redis]
+url = "redis://127.0.0.1:6379/0"
+
+[kis_fills]
+enabled = false
+
+[stream]
+key = "shadow:fillwire:fills:kis"
+max_len = 100000
+
+[kis_quotes]
+enabled = false
+max_len = 100000
+access_token_source = "redis"
+
+[kis_futures]
+enabled = false
+ingest = false
+calendar_file = "/etc/fillwire/krx-calendar.json"
+jsonl_path = "/data/futures-shadow.jsonl"
+max_len = 100000
+
+[upbit]
+enabled = false
+markets_file = "/etc/fillwire/upbit-markets.json"
+directory = "/data/upbit-shadow"
+
+[toss_ws]
+enabled = false
+directory = "/data/toss-shadow"
+
+[upbit_fills]
+enabled = false
+directory = "/data/upbit-fills-shadow"

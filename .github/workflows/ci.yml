@@ -66,6 +66,11 @@ jobs:
       # Go packages are already covered by the vet and test steps above.
       - name: edge deploy-pull script test
         run: sh scripts/edge/deploy-pull_test.sh
+      - name: pi deployment script tests
+        run: |
+          bash scripts/publish-image_test.sh
+          bash scripts/deploy-serve_test.sh
+          python3 scripts/test-serve-runbook.py /tmp/fillwire
       # The main stage's image build is publish (below), which builds and
       # pushes the same image to GHCR. Pull requests keep the local build.
       - name: container build
@@ -128,18 +133,12 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+      - name: Set up multi-platform builder
+        run: docker buildx create --driver docker-container --use
       - name: Build and push immutable image
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/fillwire:sha-${{ github.sha }}
-        run: docker buildx build --push --platform linux/amd64 --tag "$IMAGE" --label org.opencontainers.image.revision="${GITHUB_SHA}" .
-      - name: Surface pushed digest
-        env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/fillwire:sha-${{ github.sha }}
-        run: |
-          DIGEST="$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')"
-          test -n "$DIGEST"
-          echo "Pushed image: $IMAGE@$DIGEST"
-          printf '%s\n' '### GHCR image' "- image: \`$IMAGE\`" "- digest: \`$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: bash scripts/publish-image.sh --push "$IMAGE_OWNER" "$GITHUB_SHA"
 
   auto-tag-test:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.suite != 'deploy' }}

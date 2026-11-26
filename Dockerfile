@@ -3,7 +3,7 @@
 FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 
 ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 
 WORKDIR /src
 

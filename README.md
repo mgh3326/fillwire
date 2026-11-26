@@ -40,6 +40,7 @@ Fillwire does not implement restart handoff, a local checkpoint database, an HTT
 
 `fillwire serve -config FILE`는 하나의 TOML 파일로 상주 서버와 모듈을 설정합니다.
 아래 표의 각 모듈은 `enabled = true`를 지정하면 실행됩니다.
+pi 배포 사본과 전환 순서는 [serve 전환 런북](docs/serve-cutover.md)을 참고합니다.
 
 | 설정 표 | 기능 |
 |---|---|

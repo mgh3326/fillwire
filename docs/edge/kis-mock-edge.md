@@ -84,9 +84,10 @@ routing. It does not introduce a live KIS authority or credential path.
 `kis-mock-edge resolve` is the only later conclusion path. It queries the
 already allowlisted, GET-only VTS domestic daily-order history endpoint
 (`VTTC8001R`) and appends a resolution record; it does not alter the original
-receipt. A single order matching side, stock, quantity, price, and the pending
-send timestamp within its fixed five-minute match window yields `ACCEPTED` and
-the broker order number. A successful complete query with no corresponding
+receipt. Side, stock, quantity, price, and the five-minute send window
+identify candidates only. A matching candidate leaves the receipt `UNKNOWN`
+and cannot authorize cancellation. Historical KIS resolution rows also cannot
+authorize cancellation. A successful complete query with no corresponding
 order may yield `NOT_CREATED/resolved_absent` only after a ten-minute grace
 period. Query failure, ambiguous matches, and an unexpired grace period remain
 `UNKNOWN` without a resolution record. Legacy receipt rows that predate stored
@@ -102,7 +103,7 @@ decide to cancel. The answer is a `CommandCheckV1` (`command-check/v1`):
 `evidence_read` reports `completed`, `not_needed` (the stored disposition was
 already conclusive), or `unavailable` (no evidence source can address the
 command), and `orders_seen`/`matched` carry counts only. Matching is by the
-command's own stored facts — a same-symbol foreign order never satisfies it —
+command's own stored facts — a foreign order with identical facts can appear in the count —
 and the only possible write is the same additive `command_resolutions` row the
 scheduled resolver appends. An unknown command answers `404`, an invalid ID
 `400`, a store failure `500`, and an evidence-read failure `502` with the

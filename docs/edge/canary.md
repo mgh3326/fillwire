@@ -94,9 +94,9 @@ crossed the send boundary, so the canary never assumes the order does not
 exist. Before finishing it issues exactly one bounded check —
 `POST /v1/commands/{command_id}/resolve` — which makes the edge answer from
 its own durable record plus the GET-only daily-order-history read. Match
-evidence is selected by the command's own stored facts (side, stock,
-quantity, price, send-time window); a foreign order can never satisfy it, and
-an ambiguous answer stays `UNKNOWN`.
+evidence uses side, stock, quantity, price, and the send-time window. KIS
+history can contain an identical foreign order, so even a single candidate
+leaves the command `UNKNOWN`.
 
 The check is reported in `order_check` with `disposition`, `evidence_read`,
 `orders_seen`, `matched`, and an `error_code` when the check itself could not
