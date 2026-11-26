@@ -14,8 +14,8 @@ import (
 
 const (
 	TROverseasNotice      = "H0GSCNI9"
-	TRFuturesNotice       = "H0IFCNI9"
-	TRFuturesNoticeLegacy = "H0IFCNI0"
+	TRFuturesNotice       = "H0IFCNI0"
+	TRFuturesNoticeLegacy = "H0IFCNI9"
 )
 
 // Notice is one decrypted KIS account-notice row, named in the order of the
