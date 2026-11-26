@@ -64,6 +64,7 @@ func TestMockNoticesDecodeAndRecord(t *testing.T) {
 	}{
 		{TROverseasNotice, overseasRecordingName, 25},
 		{TRFuturesNotice, futuresRecordingName, 22},
+		{TRFuturesNoticeLegacy, futuresRecordingName, 22},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tr, func(t *testing.T) {
@@ -117,14 +118,18 @@ func TestDecodeNoticeDropsMalformedFrames(t *testing.T) {
 }
 
 func TestDecodeNoticesSplitsFlattenedRows(t *testing.T) {
-	fields := make([]string, 44)
-	fields[12], fields[34] = "2", "2"
-	notices, err := DecodeNotices(ws.Event{TR: TRFuturesNotice, Fields: fields, Raw: []byte("0|" + TRFuturesNotice + "|002|ciphertext")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(notices) != 2 || notices[0].Kind != "fill" || notices[1].Kind != "fill" {
-		t.Fatalf("decoded notices = %+v, want two fills", notices)
+	for _, tr := range []string{TRFuturesNotice, TRFuturesNoticeLegacy} {
+		t.Run(tr, func(t *testing.T) {
+			fields := make([]string, 44)
+			fields[12], fields[34] = "2", "2"
+			notices, err := DecodeNotices(ws.Event{TR: tr, Fields: fields, Raw: []byte("0|" + tr + "|002|ciphertext")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(notices) != 2 || notices[0].Kind != "fill" || notices[1].Kind != "fill" {
+				t.Fatalf("decoded notices = %+v, want two fills", notices)
+			}
+		})
 	}
 }
 

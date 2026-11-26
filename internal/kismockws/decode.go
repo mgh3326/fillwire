@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	TROverseasNotice = "H0GSCNI9"
-	TRFuturesNotice  = "H0IFCNI0"
+	TROverseasNotice      = "H0GSCNI9"
+	TRFuturesNotice       = "H0IFCNI0"
+	TRFuturesNoticeLegacy = "H0IFCNI9"
 )
 
 // Notice is one decrypted KIS account-notice row, named in the order of the
@@ -49,7 +50,7 @@ func DecodeNotices(event ws.Event) ([]Notice, error) {
 	switch event.TR {
 	case TROverseasNotice:
 		names = overseasNoticeFields
-	case TRFuturesNotice:
+	case TRFuturesNotice, TRFuturesNoticeLegacy:
 		names = futuresNoticeFields
 	default:
 		return nil, errors.New("kismockws: unsupported notice TR")

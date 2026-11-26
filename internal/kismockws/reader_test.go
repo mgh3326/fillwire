@@ -193,6 +193,55 @@ func TestModuleEnforcesSessionRegistrationLimit(t *testing.T) {
 	}
 }
 
+func TestModuleCanSelectLegacyFuturesTR(t *testing.T) {
+	transport := newAckTransport()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	module, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		FuturesNoticeTR: TRFuturesNoticeLegacy, RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- module.Run(ctx) }()
+	deadline := time.After(2 * time.Second)
+	for {
+		transport.mu.Lock()
+		count := len(transport.trs)
+		got := slices.Clone(transport.trs)
+		transport.mu.Unlock()
+		if count == 5 {
+			if !slices.Contains(got, TRFuturesNoticeLegacy) {
+				t.Fatalf("subscriptions %v lack configurable futures TR %s", got, TRFuturesNoticeLegacy)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("mock subscriptions did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestModuleRejectsUnknownFuturesNoticeTR(t *testing.T) {
+	_, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		FuturesNoticeTR: "H0IFCNI7", RecordingDirectory: t.TempDir(), Approval: unusedApproval{},
+	})
+	if err == nil {
+		t.Fatal("unknown futures notice TR accepted")
+	}
+}
+
 func TestMalformedEventsAreCountedAndDropped(t *testing.T) {
 	root := t.TempDir()
 	sink, err := recording.NewSink(root, Name)
