@@ -49,6 +49,8 @@ Fillwire does not implement restart handoff, a local checkpoint database, an HTT
 | `[kis_futures]` | KIS 지수선물 웹소켓 분봉. live 세션에서만 동작합니다. |
 | `[upbit]` | Upbit 공개 호가·체결 웹소켓 기록. |
 | `[toss_ws]` | Toss `personal:order` 그림자 기록. |
+| `[upbit_fills]` | Upbit 개인 체결 그림자 기록. |
+| `[alpaca]` | Alpaca paper 체결 및 IEX 시세 기록. |
 | `[quotes]` | 기존 Toss 해외 종목 시세 피드. |
 
 KIS 체결·호가·선물은 `[kis]`에 설정한 웹소켓 세션을 공유합니다. 호가 또는 선물만
@@ -1055,6 +1057,14 @@ Upbit 기록기를 단독으로 실행해 확인하려면 다음 명령을 사�
 ```sh
 fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fillwire/recordings
 ```
+
+## Alpaca paper 스트림 기록기 (기본 비활성화)
+
+`[alpaca] enabled = true`와 `symbols` 종목 목록 및 `directory`를 설정하면 `fillwire alpaca --config fillwire.toml`이 Alpaca paper 계정의 `trade_updates`와 IEX의 주식 trade/quote/minute bar 프레임을 UTC 날짜별 JSONL 파일에 기록합니다. 명령은 paper 거래 스트림 `wss://paper-api.alpaca.markets/stream`에만 연결하며 라이브 거래 스트림 호스트는 다이얼 전에 거부합니다. 구독 전에 API 인증을 수행합니다. 주문 제출이나 ledger ingest를 호출하지 않습니다.
+
+키 값은 설정 파일에 넣지 않습니다. 프로세스는 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `ALPACA_DATA_API_KEY_ID`, `ALPACA_DATA_API_SECRET_KEY` 환경 변수에서 읽습니다. 기본 IEX feed는 무료 market-data plan에서 제공되는 feed입니다. 연결이 끊기면 재시도하며, 형식이 잘못된 프레임은 버립니다. 기록은 `<directory>/alpaca-trade-updates/<UTC 날짜>/trade_updates.jsonl` 및 `<directory>/alpaca-iex/<UTC 날짜>/market_data.jsonl`에 추가됩니다.
+
+Trading stream의 인증, `trade_updates` 구독 및 fill 이벤트 형식은 [Alpaca WebSocket Streaming 문서](https://docs.alpaca.markets/us/docs/websocket-streaming)를 따릅니다. IEX endpoint와 trades/quotes/bars 구독 형식은 [Alpaca Market Data WebSocket 문서](https://docs.alpaca.markets/us/docs/streaming-market-data) 및 [market data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq)를 따릅니다.
 
 ## 재연결 reconcile 트리거 (기본 비활성화)
 

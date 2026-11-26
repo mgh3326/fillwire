@@ -156,6 +156,21 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 		"kis_futures": func(ctx context.Context, ready func()) error {
 			return runKISFutures(ctx, contents, hub, logger, books, ready)
 		},
+		"alpaca": func(ctx context.Context, ready func()) error {
+			settings, err := resolveAlpacaSettings(contents)
+			if err != nil {
+				return err
+			}
+			_, err = runAlpaca(ctx, settings, logger, ready)
+			return err
+		},
+		"upbit_fills": func(ctx context.Context, ready func()) error {
+			settings, err := resolveUpbitFillsSettings(contents)
+			if err != nil {
+				return err
+			}
+			return runUpbitFills(ctx, settings.Directory, ready)
+		},
 		"upbit": func(ctx context.Context, ready func()) error {
 			settings, err := resolveUpbitSettings(contents)
 			if err != nil {

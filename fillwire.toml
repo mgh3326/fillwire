@@ -131,6 +131,12 @@ directory = "/var/lib/fillwire/recordings"
 retry_min = "1s"
 retry_max = "30s"
 
+# Alpaca paper 체결 알림 및 IEX 시세 기록기. 기본 비활성화.
+[alpaca]
+enabled = false
+symbols = ["AAPL", "MSFT"]
+directory = "/var/lib/fillwire/recordings"
+
 # KIS 국내 지수선물(F200·MF200 근월·차월) 주간·야간 체결 -> 1분봉. 기존 KIS 웹소켓
 # 세션과 구독 예산을 공유하며(등록 8건) 두 번째 세션을 열지 않습니다. live 전용.
 # 닫힌 봉만 Redis Stream minute:kis:futures:<symbol> 또는 jsonl_path 파일에 씁니다.
@@ -155,3 +161,9 @@ max_len = 100000
 buffer = 1024
 access_token_env = "KIS_MOCK_ACCESS_TOKEN"
 access_token_source = "" # "" with access_token_env, or "redis"
+
+# fillwire upbit-fills: private myOrder recording for comparison with at-upbit-ws.
+# Credentials come from UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY.
+[upbit_fills]
+enabled = false
+directory = "recordings"
