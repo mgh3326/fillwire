@@ -17,12 +17,14 @@ import (
 	"github.com/mgh3326/fillwire/internal/gatewayd"
 	"github.com/mgh3326/fillwire/internal/kismockedge"
 	"github.com/mgh3326/fillwire/internal/kismockread"
+	"github.com/mgh3326/fillwire/internal/kiwoomws"
 	"github.com/mgh3326/fillwire/internal/markettapcmd"
 )
 
 const usage = `사용법: fillwire <명령> [옵션]
 명령: run (별칭 fillwire), serve, upbit, upbit-fills, alpaca, nhplug-ws, coverage, bookrec, edge-canary,
-      execmock, execsim, execupbit, gatewayd, kis-mock-edge, kis-mock-read, market-tap
+      execmock, execsim, execupbit, gatewayd, kis-mock-edge, kis-mock-read, market-tap,
+      kiwoom-kr, kiwoom-us
 `
 
 func wantsHelp(args []string) bool {
@@ -74,6 +76,18 @@ func dispatch(args []string) int {
 		return 0
 	case "upbit-fills":
 		if err := runUpbitFillsCommand(options); err != nil && !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	case "kiwoom-kr":
+		if err := runKiwoomCommand(kiwoomws.AccountKR, options); err != nil && !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	case "kiwoom-us":
+		if err := runKiwoomCommand(kiwoomws.AccountUS, options); err != nil && !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
