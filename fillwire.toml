@@ -118,6 +118,17 @@ symbol = "005930"
 access_token_env = "KIS_MOCK_ACCESS_TOKEN"
 access_token_source = "" # "" with access_token_env, or "redis"
 
+# Binance Spot Demo market and user streams. Disabled unless enabled = true.
+# Frames are appended to date-partitioned JSONL recordings; fills are never
+# sent to the execution ledger. User stream credentials are read only when
+# enabled and user_stream is true (default), from the documented environment
+# names; values are never logged.
+[binance_demo]
+enabled = false
+symbols = ["BTCUSDT"]
+directory = "/var/lib/fillwire/recordings"
+user_stream = true
+
 # Toss/KIS 시세 레인의 장기 JSONL 기록. 기본 비활성화.
 [recording]
 enabled = false
