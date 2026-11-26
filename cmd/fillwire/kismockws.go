@@ -62,6 +62,9 @@ func runKISMockWSCommand(args []string) error {
 	flags := flag.NewFlagSet("kis-mock-ws", flag.ContinueOnError)
 	configPath := flags.String("config", "fillwire.toml", "path to fillwire TOML configuration")
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
 		return fmt.Errorf("%w: %v", errKISMockWSUsage, err)
 	}
 	contents, err := os.ReadFile(*configPath)

@@ -129,13 +129,13 @@ func TestModuleUsesVTSAndMockTRRegistrations(t *testing.T) {
 	transport.mu.Lock()
 	got := slices.Clone(transport.trs)
 	transport.mu.Unlock()
-	for _, tr := range []string{"H0STCNI9", "H0STCNT0", "H0STASP0", TROverseasNotice, "H0IFCNI9"} {
+	for _, tr := range []string{"H0STCNI9", "H0STCNT0", "H0STASP0", TROverseasNotice, "H0IFCNI0"} {
 		if !slices.Contains(got, tr) {
 			t.Errorf("subscriptions %v missing %s", got, tr)
 		}
 	}
-	if slices.Contains(got, "H0IFCNI0") {
-		t.Errorf("default subscriptions unexpectedly contain H0IFCNI0: %v", got)
+	if slices.Contains(got, "H0IFCNI9") {
+		t.Errorf("default subscriptions unexpectedly contain H0IFCNI9: %v", got)
 	}
 }
 
@@ -144,7 +144,7 @@ func TestModuleUsesConfiguredFuturesNoticeTR(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	module, err := New(Config{
 		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
-		FuturesNoticeTR: TRFuturesNoticeAlt, RecordingDirectory: t.TempDir(),
+		FuturesNoticeTR: TRFuturesNotice, RecordingDirectory: t.TempDir(),
 		Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
 		Dialer: ws.DialerFunc(func(_ context.Context, _ string) (ws.Transport, error) { return transport, nil }),
 	})
@@ -175,8 +175,8 @@ func TestModuleUsesConfiguredFuturesNoticeTR(t *testing.T) {
 	transport.mu.Lock()
 	got := slices.Clone(transport.trs)
 	transport.mu.Unlock()
-	if !slices.Contains(got, TRFuturesNoticeAlt) || slices.Contains(got, TRFuturesNotice) {
-		t.Fatalf("subscriptions = %v, want configured TR %s only", got, TRFuturesNoticeAlt)
+	if !slices.Contains(got, TRFuturesNotice) || slices.Contains(got, TRFuturesNoticeAlt) {
+		t.Fatalf("subscriptions = %v, want configured TR %s only", got, TRFuturesNotice)
 	}
 }
 
@@ -243,7 +243,7 @@ func TestModuleCanSelectLegacyFuturesTR(t *testing.T) {
 	defer cancel()
 	module, err := New(Config{
 		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
-		FuturesNoticeTR: TRFuturesNoticeAlt, RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		FuturesNoticeTR: TRFuturesNotice, RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
 		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
 	})
 	if err != nil {
@@ -258,8 +258,8 @@ func TestModuleCanSelectLegacyFuturesTR(t *testing.T) {
 		got := slices.Clone(transport.trs)
 		transport.mu.Unlock()
 		if count == 5 {
-			if !slices.Contains(got, TRFuturesNoticeAlt) {
-				t.Fatalf("subscriptions %v lack configurable futures TR %s", got, TRFuturesNoticeAlt)
+			if !slices.Contains(got, TRFuturesNotice) {
+				t.Fatalf("subscriptions %v lack configurable futures TR %s", got, TRFuturesNotice)
 			}
 			break
 		}
@@ -365,5 +365,85 @@ func TestSubscribeRegistrationTreatsShutdownAsClean(t *testing.T) {
 	got := <-result
 	if got.err != nil || !got.canceled {
 		t.Fatalf("shutdown subscription result = (%v, %v), want (nil, true)", got.err, got.canceled)
+	}
+}
+
+func TestSlowQuoteWriterDropsOverflowAndDrains(t *testing.T) {
+	transport := newAckTransport()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	module, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoteStarted, releaseQuote, noticeWritten := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	quotesWritten := 0
+	module.appendRecord = func(stream string, _ time.Time, _ any) error {
+		if stream != quoteRecordingName {
+			close(noticeWritten)
+			return nil
+		}
+		quotesWritten++
+		if quotesWritten == 1 {
+			close(quoteStarted)
+			<-releaseQuote
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- module.Run(ctx) }()
+	defer func() {
+		cancel()
+		close(releaseQuote)
+		if err := <-done; err != nil {
+			t.Errorf("Run: %v", err)
+		}
+		if !t.Failed() && quotesWritten != 33 {
+			t.Errorf("recorded %d quotes, want one in flight plus 32 queued", quotesWritten)
+		}
+	}()
+	for {
+		transport.mu.Lock()
+		count := len(transport.trs)
+		transport.mu.Unlock()
+		if count == 5 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("subscriptions did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	fields := make([]string, 46)
+	fields[0], fields[1] = "005930", "100203"
+	fields[2], fields[12], fields[13], fields[21] = "100", "1", "1", "1"
+	frame := []byte("0|H0STCNT0|001|" + strings.Join(fields, "^"))
+	transport.reads <- frame
+	select {
+	case <-quoteStarted:
+	case <-ctx.Done():
+		t.Fatal("quote writer did not start")
+	}
+	for i := 0; i < 34; i++ {
+		select {
+		case transport.reads <- frame:
+		case <-ctx.Done():
+			t.Fatal("blocked quote writer stalled the reader")
+		}
+	}
+	select {
+	case transport.reads <- []byte("0|H0IFCNI0|001|malformed"):
+	case <-ctx.Done():
+		t.Fatal("could not deliver notice after quote burst")
+	}
+	select {
+	case <-noticeWritten:
+	case <-ctx.Done():
+		t.Fatal("blocked quote writer stalled notice processing")
 	}
 }
