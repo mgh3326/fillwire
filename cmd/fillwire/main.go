@@ -15,6 +15,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/decode"
 	"github.com/mgh3326/fillwire/internal/kisfutures"
+	"github.com/mgh3326/fillwire/internal/kiwoomws"
 	"github.com/mgh3326/fillwire/internal/quote"
 	"github.com/mgh3326/fillwire/internal/reader"
 	"github.com/mgh3326/fillwire/internal/sink"
@@ -35,6 +36,20 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "upbit" {
 		if err := runUpbitCommand(os.Args[2:]); err != nil && !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "kiwoom-kr" {
+		if err := runKiwoomCommand(kiwoomws.AccountKR, os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "kiwoom-us" {
+		if err := runKiwoomCommand(kiwoomws.AccountUS, os.Args[2:]); err != nil && !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

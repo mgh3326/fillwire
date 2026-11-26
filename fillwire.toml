@@ -123,6 +123,22 @@ access_token_source = "" # "" with access_token_env, or "redis"
 enabled = false
 directory = "/var/lib/fillwire/recordings"
 
+# 키움 모의 웹소켓 기록기. 계정별로 따로 실행합니다:
+# fillwire kiwoom-kr 또는 fillwire kiwoom-us
+[kiwoom_mock_kr]
+enabled = false
+symbols = []
+directory = "/var/lib/fillwire/recordings"
+app_key_env = "KIWOOM_MOCK_APP_KEY"
+app_secret_env = "KIWOOM_MOCK_APP_SECRET"
+
+[kiwoom_mock_us]
+enabled = false
+symbols = []
+directory = "/var/lib/fillwire/recordings"
+app_key_env = "KIWOOM_MOCK_US_APP_KEY"
+app_secret_env = "KIWOOM_MOCK_US_APP_SECRET"
+
 # Upbit 공개 호가 및 체결 기록기. API 키와 비공개 웹소켓을 사용하지 않습니다.
 [upbit]
 enabled = false
