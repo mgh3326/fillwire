@@ -243,3 +243,34 @@ func TestSubscribeWithRetryRetriesTransientAndStopsOnRejection(t *testing.T) {
 		t.Fatalf("permanent rejection = %v after %d calls", err, permanent.calls)
 	}
 }
+
+type cancelWaitSession struct{ started chan struct{} }
+
+func (s cancelWaitSession) Subscribe(ctx context.Context, _, _ string) error {
+	close(s.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (cancelWaitSession) Unsubscribe(context.Context, string, string) error { return nil }
+
+func TestSubscribeRegistrationTreatsShutdownAsClean(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	session := cancelWaitSession{started: make(chan struct{})}
+	result := make(chan struct {
+		err      error
+		canceled bool
+	}, 1)
+	go func() {
+		err, canceled := subscribeRegistration(ctx, session, "H0STCNT0", "005930")
+		result <- struct {
+			err      error
+			canceled bool
+		}{err, canceled}
+	}()
+	<-session.started
+	cancel()
+	got := <-result
+	if got.err != nil || !got.canceled {
+		t.Fatalf("shutdown subscription result = (%v, %v), want (nil, true)", got.err, got.canceled)
+	}
+}
