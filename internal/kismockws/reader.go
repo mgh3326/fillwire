@@ -16,7 +16,7 @@ import (
 
 const (
 	Name                  = "kis-mock-ws"
-	RegistrationLimit     = 41 // conservative per-session cap used by the KIS samples
+	RegistrationLimit     = 41 // existing fillwire conservative cap; exact KIS limit remains unverified
 	SubscriptionPace      = 500 * time.Millisecond
 	quoteRecordingName    = "quotes"
 	overseasRecordingName = "overseas-fills"

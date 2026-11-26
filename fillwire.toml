@@ -158,6 +158,7 @@ access_token_source = "" # "" with access_token_env, or "redis"
 
 # KIS 모의(VTS) 국내 시세와 해외/선물옵션 체결통보를 기록만 합니다.
 # `fillwire kis-mock-ws`로 실행하며 [kis] endpoint/account_mode는 모두 mock이어야 합니다.
+# 보수적인 세션 등록 상한은 41건입니다(공식 한도는 미확인).
 # app_key_env와 app_secret_env는 auto_trader의 KIS_MOCK_APP_KEY,
 # KIS_MOCK_APP_SECRET을 사용합니다. 주문 또는 ledger ingest는 호출하지 않습니다.
 [kis_mock_ws]
