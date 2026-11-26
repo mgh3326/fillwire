@@ -45,7 +45,7 @@ func postResolve(t *testing.T, server *httptest.Server, commandID string) (int, 
 	return response.StatusCode, check
 }
 
-func TestResolveEndpointFindsRestingOrder(t *testing.T) {
+func TestResolveEndpointReportsCandidateWithoutCancelTarget(t *testing.T) {
 	store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
 	service := resolveTestService(t, store, fakeOrderHistoryReader{orders: []kismockread.DomesticOrder{{
 		BrokerOrderID: "9001", Side: "buy", StockCode: "005930",
@@ -62,13 +62,13 @@ func TestResolveEndpointFindsRestingOrder(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("resolve status = %d, check = %+v", status, check)
 	}
-	if check.Disposition != executioncontracts.DispositionAccepted || check.BrokerOrderID != "9001" ||
+	if check.Disposition != executioncontracts.DispositionUnknown || check.BrokerOrderID != "" ||
 		check.EvidenceRead != "completed" || check.OrdersSeen != 1 || check.Matched != 1 {
 		t.Fatalf("check = %+v", check)
 	}
-	// The now-ACCEPTED command is a valid cancel target for the same command id.
+	// A matching candidate cannot authorize cancellation.
 	target, found, err := store.FindCancelTarget(context.Background(), "resolve-resting")
-	if err != nil || !found || target.BrokerOrderID != "9001" {
+	if err != nil || found {
 		t.Fatalf("cancel target = %+v found=%t err=%v", target, found, err)
 	}
 }

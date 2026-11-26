@@ -25,7 +25,10 @@ cat > "$bin/systemctl" <<'EOF'
 #!/bin/sh
 set -eu
 printf '%s %s ' "$1" "$2" >> "$TEST_LOG/systemctl"
-cat "$BROKER_EDGE_STATE_DIR/$2.image" >> "$TEST_LOG/systemctl"
+if [ "$1" = restart ]; then
+  cat "$BROKER_EDGE_STATE_DIR/$2.image" >> "$TEST_LOG/systemctl"
+  [ "$(cat "$BROKER_EDGE_STATE_DIR/$2.image")" != "${FAIL_RESTART_PIN:-}" ]
+fi
 EOF
 cat > "$bin/curl" <<'EOF'
 #!/bin/sh
@@ -39,6 +42,8 @@ printf '%s\n' "$count" > "$count_file"
 printf '200'
 EOF
 chmod +x "$bin/docker" "$bin/systemctl" "$bin/curl"
+
+export BROKER_EDGE_IMAGE_REPOSITORY=ghcr.io/mgh3326/broker-edge
 
 digest_a=ghcr.io/mgh3326/broker-edge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 digest_b=ghcr.io/mgh3326/broker-edge@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -56,7 +61,7 @@ new_case() {
   BROKER_EDGE_HEALTH_ATTEMPTS=1
   BROKER_EDGE_HEALTH_INTERVAL=0
   export BROKER_EDGE_HEALTH_ATTEMPTS BROKER_EDGE_HEALTH_INTERVAL
-  unset CURL_FAIL_COUNT
+  unset CURL_FAIL_COUNT FAIL_RESTART_PIN
 }
 
 new_case success
@@ -96,5 +101,17 @@ printf 'IMAGE=%s\n' "$digest_b" > "$BROKER_EDGE_STATE_DIR/broker-edge.service.im
 [ "$(cat "$BROKER_EDGE_STATE_DIR/broker-edge.service.image")" = "IMAGE=$digest_b" ]
 [ "$(cat "$BROKER_EDGE_STATE_DIR/broker-edge.service.image.previous")" = "IMAGE=$digest_a" ]
 grep -F "restart broker-edge.service IMAGE=$digest_b" "$TEST_LOG/systemctl" >/dev/null
+
+new_case fail-closed
+if (unset BROKER_EDGE_IMAGE_REPOSITORY; "$script" broker-edge.service); then exit 1; fi
+[ ! -e "$TEST_LOG/docker" ]
+
+new_case failed-first
+printf 'IMAGE=%s\n' "$digest_c" > "$BROKER_EDGE_STATE_DIR/broker-edge.service.image.previous"
+if FAIL_RESTART_PIN="IMAGE=$digest_a" "$script" broker-edge.service; then exit 1; fi
+[ ! -e "$TEST_LOG/curl-count" ]
+[ ! -e "$BROKER_EDGE_STATE_DIR/broker-edge.service.image" ]
+[ "$(cat "$BROKER_EDGE_STATE_DIR/broker-edge.service.image.previous")" = "IMAGE=$digest_c" ]
+grep -F 'stop broker-edge.service' "$TEST_LOG/systemctl" >/dev/null
 
 echo "deploy-pull tests: PASS"

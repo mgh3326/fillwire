@@ -199,14 +199,8 @@ func (resolver Resolver) resolveEvidence(
 	unresolved := 0
 	for _, item := range items {
 		matches := matchingIDs(item)
-		if len(matches) == 1 {
-			receipt, err := resolver.Store.ResolveUnknown(ctx, item.Receipt.CommandID, executioncontracts.DispositionAccepted, matches[0], "", now())
-			if err != nil {
-				return resolved, unresolved, err
-			}
-			resolved = append(resolved, receipt)
-			continue
-		}
+		// KIS history matches are heuristic. Even one candidate does not
+		// bind the broker order to this command or authorize its cancellation.
 		// A legacy receipt has no immutable command facts. An empty, successful
 		// day is nevertheless evidence that it was not created; any nonempty
 		// day remains UNKNOWN rather than guessing a correspondence.
@@ -398,10 +392,7 @@ func (resolver Resolver) ResolveOne(ctx context.Context, commandID string) (exec
 	}
 }
 
-// applyMatch folds a completed KIS day read into the shared resolveEvidence
-// conclusion for a single pending record: a unique match resolves ACCEPTED,
-// an empty proven day resolves absent only after grace, and anything else —
-// zero or ambiguous matches — remains UNKNOWN and is never resolved.
+// applyMatch reports heuristic candidates while resolving only proven absence.
 func (resolver Resolver) applyMatch(
 	ctx context.Context,
 	check executioncontracts.CommandCheckV1,

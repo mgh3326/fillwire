@@ -239,9 +239,9 @@ go run ./cmd/kis-mock-edge resolve
 go run ./cmd/kis-mock-edge resolve --grace=10m
 ```
 
-For a stored `UNKNOWN/kis_mock` receipt, one matching order (side, stock,
-quantity, price, and send-time window) appends an `ACCEPTED` resolution with
-the broker order number. A successful complete read with no match appends
+For a stored `UNKNOWN/kis_mock` receipt, matching side, stock, quantity,
+price, and send-time window identifies candidates only. A candidate leaves
+the receipt `UNKNOWN` and cannot authorize cancellation. A successful complete read with no match appends
 `NOT_CREATED/resolved_absent` only after the ten-minute default grace period.
 Read errors, multiple matches, and young receipts remain `UNKNOWN`. The
 original receipt row is preserved; resolution is an additive SQLite record and

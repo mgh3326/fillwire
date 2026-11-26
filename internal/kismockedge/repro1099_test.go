@@ -71,7 +71,7 @@ func TestResolveEndpointFindsSpecialCommandIDEveryEncoding(t *testing.T) {
 			// already-conclusive receipt, still proving the row was found.
 			continue
 		}
-		if check.Disposition != executioncontracts.DispositionAccepted || check.BrokerOrderID != "9001" ||
+		if check.Disposition != executioncontracts.DispositionUnknown || check.BrokerOrderID != "" ||
 			check.Matched != 1 || check.EvidenceRead != "completed" {
 			t.Fatalf("form[%d]=%q check = %+v", index, form, check)
 		}

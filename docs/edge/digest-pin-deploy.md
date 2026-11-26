@@ -9,8 +9,8 @@ this repository contains no host environment files or credentials.
 
 Copy and adapt the appropriate example in
 `deploy/edge/systemd/broker-edge.service.example` or
-`deploy/edge/systemd/gatewayd.service.example`. The `STATE_DIR` and `--env-file`
-values are deliberately placeholders: choose the existing host locations and
+`deploy/edge/systemd/gatewayd.service.example`. The absolute `EnvironmentFile` and `--env-file`
+paths are placeholders: choose the existing host locations and
 keep populated environment files off this public repository. The unit's
 `EnvironmentFile` must be the state file managed by the script, and its
 `ExecStart` must use `${IMAGE}`.
@@ -29,11 +29,13 @@ ownership required by the host's service setup.
 
 ## Deploy
 
-Run with the service unit name. The tag defaults to `main`.
+Set `BROKER_EDGE_IMAGE_REPOSITORY` to the approved legacy repository.
+The tag defaults to `main`. See the [serve cutover runbook](../serve-cutover.md)
+for new Fillwire images.
 
 ```sh
-sudo scripts/edge/deploy-pull.sh broker-edge.service
-sudo BROKER_EDGE_HEALTH_PORT=8791 scripts/edge/deploy-pull.sh gatewayd.service main
+sudo BROKER_EDGE_IMAGE_REPOSITORY=ghcr.io/mgh3326/broker-edge scripts/edge/deploy-pull.sh broker-edge.service
+sudo BROKER_EDGE_IMAGE_REPOSITORY=ghcr.io/mgh3326/broker-edge BROKER_EDGE_HEALTH_PORT=8791 scripts/edge/deploy-pull.sh gatewayd.service main
 ```
 
 The port above is gatewayd's default listen port (8791); use the port of your configured `GATEWAYD_LISTEN_ADDR`.
@@ -53,7 +55,7 @@ recovery gate is reported explicitly for operator intervention.
 To return immediately to the recorded prior digest:
 
 ```sh
-sudo scripts/edge/deploy-pull.sh --rollback broker-edge.service
+sudo BROKER_EDGE_IMAGE_REPOSITORY=ghcr.io/mgh3326/broker-edge scripts/edge/deploy-pull.sh --rollback broker-edge.service
 ```
 
 Rollback swaps current and previous pins, restarts, and health-checks the

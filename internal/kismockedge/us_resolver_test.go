@@ -35,13 +35,13 @@ func TestKISMockUSResolverEvidenceBranches(t *testing.T) {
 		wantOrderID     string
 	}{
 		{
-			name: "matching mock daily-history evidence accepts",
+			name: "single mock daily-history candidate remains unknown",
 			orders: []kismockread.OverseasOrder{{
 				BrokerOrderID: "us-12345", Side: "buy", StockCode: "AAPL", Quantity: "001", Price: "1.00",
 				OrderedAt: time.Date(2026, 9, 1, 12, 1, 0, 0, time.UTC),
 			}},
-			wantDisposition: executioncontracts.DispositionAccepted,
-			wantOrderID:     "us-12345",
+			wantDisposition: executioncontracts.DispositionUnknown,
+			wantError:       ErrorBrokerTimeout,
 		},
 		{
 			name:            "complete mock daily-history absence resolves after grace",
@@ -82,6 +82,12 @@ func TestKISMockUSResolverEvidenceBranches(t *testing.T) {
 			if test.readErr != nil {
 				if result.ReadFailures != 1 || len(result.Resolved) != 0 || result.Unresolved != 1 {
 					t.Fatalf("failure result=%+v; a read failure must not create a conclusion", result)
+				}
+				return
+			}
+			if test.wantDisposition == executioncontracts.DispositionUnknown {
+				if result.Unresolved != 1 || len(result.Resolved) != 0 {
+					t.Fatalf("heuristic match changed the resolution: %+v", result)
 				}
 				return
 			}
