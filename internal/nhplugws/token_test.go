@@ -36,7 +36,7 @@ func TestOAuthTokenSourceUsesSDKApprovalFormAndCaches(t *testing.T) {
 				t.Fatalf("OAuth form %q omitted %q", form, field)
 			}
 		}
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"access_token":"fixture-token","expires_in":3600}`)), Header: make(http.Header)}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"access_token":"fixture-token","expires_in":"3600"}`)), Header: make(http.Header)}, nil
 	})}
 	token, err := source.Token(context.Background())
 	if err != nil || token != "fixture-token" {

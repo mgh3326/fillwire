@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,7 +80,17 @@ func (s *OAuthTokenSource) Token(ctx context.Context) (string, error) {
 	var seconds float64
 	if len(payload.ExpiresIn) == 0 {
 		seconds = 86400
-	} else if err := json.Unmarshal(payload.ExpiresIn, &seconds); err != nil || seconds <= 0 {
+	} else if err := json.Unmarshal(payload.ExpiresIn, &seconds); err != nil {
+		var text string
+		if json.Unmarshal(payload.ExpiresIn, &text) != nil {
+			return "", errors.New("NHPLUG OAuth response expiry is invalid")
+		}
+		seconds, err = strconv.ParseFloat(text, 64)
+		if err != nil {
+			return "", errors.New("NHPLUG OAuth response expiry is invalid")
+		}
+	}
+	if seconds <= 0 {
 		return "", errors.New("NHPLUG OAuth response expiry is invalid")
 	}
 	s.token = strings.TrimSpace(payload.AccessToken)
