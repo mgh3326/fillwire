@@ -956,3 +956,64 @@ func TestFetchTossReadsTokenRotatedByEnsure(t *testing.T) {
 		t.Fatalf("issuer calls = %d, want initial issue and one rotation", h.issuer.callCount())
 	}
 }
+
+type blockingPanicSource struct {
+	fetchSource
+	started, release chan struct{}
+}
+
+func (source blockingPanicSource) EnsureReplacing(context.Context, string) (EnsureState, error) {
+	close(source.started)
+	<-source.release
+	panic("synthetic issuer panic")
+}
+
+type observedDoneContext struct {
+	context.Context
+	waiting chan struct{}
+}
+
+func (ctx observedDoneContext) Done() <-chan struct{} {
+	close(ctx.waiting)
+	return ctx.Context.Done()
+}
+
+func TestFetchPanicFailsLeaderAndFollower(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISMock)
+	h.seed("synthetic-rejected")
+	state := h.fetch.providers[h.provider]
+	source := blockingPanicSource{state.source, make(chan struct{}), make(chan struct{})}
+	state.source = source
+	body := `{"failed_token_sha256":"` + shaHex("synthetic-rejected") + `"}`
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	replies := make(chan int, 2)
+	post := func(ctx context.Context) {
+		request := httptest.NewRequest(http.MethodPost, "/v1/tokens/kis-mock/fetch", strings.NewReader(body)).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer "+testFetchCredential)
+		response := httptest.NewRecorder()
+		h.handler.ServeHTTP(response, request)
+		replies <- response.Code
+	}
+	go post(ctx)
+	select {
+	case <-source.started:
+	case <-ctx.Done():
+		close(source.release)
+		t.Fatal("leader did not reach issuer")
+	}
+	waiting := make(chan struct{})
+	go post(observedDoneContext{ctx, waiting})
+	select {
+	case <-waiting:
+	case <-ctx.Done():
+		close(source.release)
+		t.Fatal("follower did not join")
+	}
+	close(source.release)
+	for range 2 {
+		if status := <-replies; status != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", status)
+		}
+	}
+}

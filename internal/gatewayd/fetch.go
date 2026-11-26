@@ -121,7 +121,7 @@ func (provider *fetchProvider) join(sha string) (*fetchAttempt, bool) {
 	if attempt, running := provider.attempts[sha]; running {
 		return attempt, false
 	}
-	attempt := &fetchAttempt{done: make(chan struct{})}
+	attempt := &fetchAttempt{done: make(chan struct{}), err: errFetchUnavailable}
 	provider.attempts[sha] = attempt
 	return attempt, true
 }
