@@ -36,6 +36,10 @@ func (testTokens) Refresh(context.Context) (tokenfetch.Token, error) {
 	return tokenfetch.Token{}, errors.New("unexpected token refresh")
 }
 
+func (testTokens) Reissue(context.Context, string) (tokenfetch.Token, error) {
+	return tokenfetch.Token{}, errors.New("unexpected token replacement")
+}
+
 func fixture(t *testing.T, name string) []byte {
 	t.Helper()
 	data, err := os.ReadFile("testdata/doc-" + name)
@@ -622,9 +626,11 @@ func TestTransientReadFailuresReconnect(t *testing.T) {
 
 type recoveryTokens struct {
 	testTokens
-	refreshes int
-	value     string
-	err       error
+	refreshes   int
+	reissues    []string
+	replacement string
+	value       string
+	err         error
 }
 
 func (s *recoveryTokens) Refresh(context.Context) (tokenfetch.Token, error) {
@@ -632,15 +638,30 @@ func (s *recoveryTokens) Refresh(context.Context) (tokenfetch.Token, error) {
 	return tokenfetch.NewToken(s.value, time.Now().Add(time.Hour), "test"), s.err
 }
 
-func TestAuthRecoveryFetchesOnceThenStops(t *testing.T) {
-	for _, scenario := range []string{"http-401", "revoked-before-ack", "revoked-after-ack", "same-token", "fetch-failure", "dial-failure", "after-window"} {
+func (s *recoveryTokens) Reissue(_ context.Context, rejected string) (tokenfetch.Token, error) {
+	s.reissues = append(s.reissues, tokenfetch.Hash(rejected))
+	if s.replacement == "" {
+		return tokenfetch.Token{}, errors.New("unexpected token replacement")
+	}
+	return tokenfetch.NewToken(s.replacement, time.Now().Add(time.Hour), "test"), nil
+}
+
+func TestAuthRecoveryComparesGatewaydTokenAndBoundsReplacement(t *testing.T) {
+	for _, scenario := range []string{"http-401", "revoked-before-ack", "revoked-after-ack", "replace-current", "same-token", "fetch-failure", "dial-failure", "after-window"} {
 		t.Run(scenario, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), 11*time.Minute)
 				defer cancel()
 				tokens := &recoveryTokens{value: "replacement-token"}
-				if scenario == "same-token" {
+				if scenario == "same-token" || scenario == "replace-current" {
 					tokens.value = fakeToken
+					tokens.replacement = fakeToken
+					if scenario == "replace-current" {
+						tokens.replacement = "replacement-token"
+					}
+				}
+				if scenario == "after-window" {
+					tokens.replacement = "replacement-token"
 				}
 				if scenario == "fetch-failure" {
 					tokens.err = errors.New(fakeToken)
@@ -659,6 +680,9 @@ func TestAuthRecoveryFetchesOnceThenStops(t *testing.T) {
 							firstDial = time.Now()
 						} else {
 							want = tokens.value
+							if scenario == "replace-current" {
+								want = tokens.replacement
+							}
 							if time.Since(firstDial) < time.Second {
 								t.Error("reconnected without backoff")
 							}
@@ -667,7 +691,7 @@ func TestAuthRecoveryFetchesOnceThenStops(t *testing.T) {
 							t.Error("unexpected handshake token")
 						}
 						revocationScenario := scenario == "revoked-before-ack" || scenario == "revoked-after-ack"
-						if (dials == 1 && !revocationScenario) || scenario == "http-401" {
+						if (dials == 1 && !revocationScenario) || scenario == "http-401" || scenario == "replace-current" {
 							return nil, http.StatusUnauthorized, errors.New(fakeToken)
 						}
 						if scenario == "dial-failure" {
@@ -718,6 +742,20 @@ func TestAuthRecoveryFetchesOnceThenStops(t *testing.T) {
 					wantErr, wantRefreshes = errFreshToken, 2
 				}
 				runErr := reader.Run(ctx)
+				wantReplacementHash := ""
+				switch scenario {
+				case "same-token", "replace-current":
+					wantReplacementHash = tokenfetch.Hash(fakeToken)
+				case "after-window":
+					wantReplacementHash = tokenfetch.Hash("replacement-token")
+				}
+				if wantReplacementHash == "" {
+					if len(tokens.reissues) != 0 {
+						t.Fatalf("replacement calls = %d, want 0", len(tokens.reissues))
+					}
+				} else if len(tokens.reissues) != 1 || tokens.reissues[0] != wantReplacementHash {
+					t.Fatalf("expected one replacement call with the rejected hash, got %d calls", len(tokens.reissues))
+				}
 				if !errors.Is(runErr, wantErr) || dials != wantDials || tokens.refreshes != wantRefreshes {
 					t.Fatalf("run = %v, dials = %d, refreshes = %d", runErr, dials, tokens.refreshes)
 				}

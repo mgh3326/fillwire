@@ -34,7 +34,7 @@ var (
 	ErrAccountNotFound = errors.New("Toss WS subscription rejected: account-not-found")
 	ErrRejected        = errors.New("Toss WS subscription rejected")
 	ErrAck             = errors.New("Toss WS invalid subscription acknowledgement")
-	ErrAuthRevokedStop = errors.New("Toss WS stopped after a second authentication rejection")
+	ErrAuthRevokedStop = errors.New("Toss WS stopped after authentication rejected the new token within 10 minutes")
 	ErrForbidden       = errors.New("Toss WS handshake forbidden: HTTP 403")
 	ErrRecord          = errors.New("Toss WS JSONL append failed")
 	errFreshToken      = errors.New("Toss WS gatewayd did not provide a different token")
@@ -63,6 +63,7 @@ type Dialer func(ctx context.Context, endpoint string, headers http.Header) (Soc
 type TokenSource interface {
 	Current(context.Context) (tokenfetch.Token, bool, error)
 	Refresh(context.Context) (tokenfetch.Token, error)
+	Reissue(context.Context, string) (tokenfetch.Token, error)
 }
 
 type Clock interface {
@@ -276,17 +277,28 @@ func (r *Reader) Run(ctx context.Context) error {
 }
 
 func (r *Reader) token(ctx context.Context, rejected string) (tokenfetch.Token, error) {
-	var token tokenfetch.Token
-	var err error
 	if rejected == "" {
-		token, _, err = r.cfg.Tokens.Current(ctx)
-	} else {
-		token, err = r.cfg.Tokens.Refresh(ctx)
+		token, _, err := r.cfg.Tokens.Current(ctx)
+		if err != nil || token.Value() == "" {
+			return tokenfetch.Token{}, errToken
+		}
+		return token, nil
 	}
+
+	token, err := r.cfg.Tokens.Refresh(ctx)
 	if err != nil || token.Value() == "" {
 		return tokenfetch.Token{}, errToken
 	}
-	if token.Value() == rejected {
+	rejectedSHA := tokenfetch.Hash(rejected)
+	if tokenfetch.Hash(token.Value()) != rejectedSHA {
+		return token, nil
+	}
+	// Gatewayd checks the same digest again under its issuance lock.
+	token, err = r.cfg.Tokens.Reissue(ctx, rejected)
+	if err != nil || token.Value() == "" {
+		return tokenfetch.Token{}, errToken
+	}
+	if tokenfetch.Hash(token.Value()) == rejectedSHA {
 		return tokenfetch.Token{}, errFreshToken
 	}
 	return token, nil
