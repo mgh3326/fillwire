@@ -2,8 +2,9 @@
 
 Fillwire listens to broker execution feeds, persists decoded fills to Redis Streams, and delivers them through independent consumer groups.
 
-It is a runtime, not a broker client: protocol code lives in separate libraries (for example, `go-kis`). `fillwire` never places orders: it listens, persists, and delivers. The separate
-operator command [`execmock`](docs/e3a-mock-runbook.md) can send approved KIS mock
+Protocol code lives in libraries such as `go-kis`. The `fillwire run` and
+`fillwire serve` runtimes listen, persist, and deliver. The operator command
+[`fillwire execmock`](docs/e3a-mock-runbook.md) can send approved KIS mock
 intents, with sending off by default.
 
 ## Scope
@@ -30,6 +31,49 @@ startup: XAUTOCLAIM pending entries before ordinary XREADGROUP
 On shutdown, fillwire stops the socket reader first, then gives already received events a bounded `drain_timeout` window to pass through decode and `XADD`. The drain uses a separate background-rooted context rather than the canceled signal context. If the window expires, the remaining in-memory entries are logged and counted before exit.
 
 Fillwire does not implement restart handoff, a local checkpoint database, an HTTP metrics endpoint, heartbeat reporting, parallel consumers, broker orders, amendments, or cancellations. Those are outside this PR.
+
+## 통합 CLI와 상주 서버
+
+`go build -o fillwire ./cmd/fillwire`로 빌드합니다. `fillwire <명령> --help`에서
+명령별 사용법을 확인할 수 있습니다. 기존 `fillwire -config FILE` 실행은
+`fillwire run -config FILE`과 같습니다. 각 명령의 독립 실행 파일도 빌드할 수 있습니다.
+
+`fillwire serve -config FILE`는 하나의 TOML 파일로 상주 서버와 모듈을 설정합니다.
+아래 표의 각 모듈은 `enabled = true`를 지정하면 실행됩니다.
+
+| 설정 표 | 기능 |
+|---|---|
+| `[gatewayd]` | 토큰 발급 및 조회 HTTP 서버. `providers`는 기존 CLI와 같은 쉼표 구분 목록이며 기본값은 `kis-mock`입니다. `ensure_interval`을 생략하면 요청 시에만 토큰을 발급합니다. `listen`과 `[redis].url`을 생략하면 각각 `GATEWAYD_LISTEN_ADDR`와 `REDIS_URL`을 사용합니다. 공급자 및 조회 인증은 기존 gatewayd 환경 변수를 사용합니다. |
+| `[kis_fills]` | KIS 체결 기록과 ingest. `[kis]`, `[redis]`, `[stream]`, `[ingest]`, `[channel]`, `[retry]`를 사용합니다. |
+| `[kis_quotes]` 또는 `[books]` | KIS 승격 종목 체결·호가 또는 고정 종목 호가. `[recording]`을 활성화하면 고정 종목 KIS 호가도 JSONL로 기록합니다. `fillwire bookrec`는 표준 입력 기록과 파일 재생을 제공합니다. |
+| `[kis_futures]` | KIS 지수선물 웹소켓 분봉. live 세션에서만 동작합니다. |
+| `[upbit]` | Upbit 공개 호가·체결 웹소켓 기록. |
+| `[toss_ws]` | Toss `personal:order` 그림자 기록. |
+| `[upbit_fills]` | Upbit 개인 체결 그림자 기록. |
+| `[alpaca]` | Alpaca paper 체결 및 IEX 시세 기록. |
+| `[quotes]` | 기존 Toss 해외 종목 시세 피드. |
+
+KIS 체결·호가·선물은 `[kis]`에 설정한 웹소켓 세션을 공유합니다. 호가 또는 선물만
+활성화할 때는 체결 구독과 ingest 설정이 필요 없습니다. 선물을 함께 활성화하면
+승격 호가의 등록 상한에서 선물 슬롯을 먼저 확보합니다. 서비스 모듈은 읽기와 기록을
+담당하며 gatewayd는 토큰을 발급합니다. 주문 실행 명령은 CLI에서 별도로 실행합니다.
+
+```toml
+[serve]
+health_listen = "127.0.0.1:8792"
+
+[kis_fills]
+enabled = true
+```
+
+`GET /healthz`에는 모듈별 `state`와 `restarts`가 표시됩니다. 활성 모듈이 모두 실행
+중이면 HTTP 200입니다. 활성 모듈이 시작 중이거나 재시작 대기 중이거나
+`failed` 상태이면 HTTP 503입니다. KIS 세션 점유와 cache-only 승인키의 영구 실패,
+Toss 개인 스트림의 인증 중단은 재시도하지 않습니다. gatewayd는 별도 리스너에서
+기존 `GET /healthz`를 제공합니다.
+`kis_session`은 KIS 모듈이 사용하는 공유 세션입니다. 실행 상태는 프로세스 내부의
+모듈 상태를 나타냅니다. 시세 신선도와 업스트림 API 가용성은 기존 모듈 로그를 확인합니다.
+모듈이 종료되면 해당 모듈을 1초부터 최대 1분까지 지수 백오프로 다시 시작합니다.
 
 ## Configuration
 
@@ -571,6 +615,32 @@ Set `enabled = false`, or delete the `[quotes]` table, and restart fillwire.
 The mount can stay or go. Existing `quotes:toss` entries remain until trimmed
 by `MAXLEN` or deleted by the desk (`DEL quotes:toss`).
 
+## NHPLUG 모의 WebSocket 기록 (기본 비활성화)
+
+`fillwire nhplug-ws -config fillwire.toml`은 NHPLUG 모의 WebSocket 한 세션에서
+시세와 d0–d3 통보 프레임을 JSONL로 기록합니다. 이 명령은 주문이나 원장 경로를
+호출하지 않습니다. 사용자 ID와 시세 채널은 설정에 두고, 앱 키와 시크릿은
+`NHPLUG_APP_KEY`, `NHPLUG_APP_SECRET` 환경 변수에서 읽습니다. WebSocket 주소는
+`wss://moapi.nhplug.com:17070/websocket`으로 고정되며 운영 WebSocket 포트는 거부합니다.
+인증 토큰은 NH SDK 방식으로 발급하고 메모리에만 유지합니다.
+
+```toml
+[nhplug_ws]
+enabled = false
+user_id = "NHPLUG_USER_ID"
+directory = "./recordings"
+app_key_env = "NHPLUG_APP_KEY"
+app_secret_env = "NHPLUG_APP_SECRET"
+
+[[nhplug_ws.quotes]]
+tr_cd = "mc"
+tr_key = "005930"
+```
+
+serve 모듈 레지스트리가 아직 통합되지 않은 상태에서는 명령을 직접 실행합니다.
+레지스트리 연결은 `[nhplug_ws]`를 읽고 `runNHPlugWS(ctx, cfg, tokens.Token)`을
+실행하는 모듈 팩토리 한 줄로 연결할 수 있습니다.
+
 ## KIS promoted quote lane (off by default)
 
 The promoted quote lane registers the KIS realtime trade (`H0STCNT0`) and
@@ -1016,6 +1086,14 @@ Upbit 기록기를 단독으로 실행해 확인하려면 다음 명령을 사�
 ```sh
 fillwire upbit --markets-file /etc/fillwire/upbit-markets.txt --dir /var/lib/fillwire/recordings
 ```
+
+## Alpaca paper 스트림 기록기 (기본 비활성화)
+
+`[alpaca] enabled = true`와 `symbols` 종목 목록 및 `directory`를 설정하면 `fillwire alpaca --config fillwire.toml`이 Alpaca paper 계정의 `trade_updates`와 IEX의 주식 trade/quote/minute bar 프레임을 UTC 날짜별 JSONL 파일에 기록합니다. 명령은 paper 거래 스트림 `wss://paper-api.alpaca.markets/stream`에만 연결하며 라이브 거래 스트림 호스트는 다이얼 전에 거부합니다. 구독 전에 API 인증을 수행합니다. 주문 제출이나 ledger ingest를 호출하지 않습니다.
+
+키 값은 설정 파일에 넣지 않습니다. 프로세스는 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `ALPACA_DATA_API_KEY_ID`, `ALPACA_DATA_API_SECRET_KEY` 환경 변수에서 읽습니다. 기본 IEX feed는 무료 market-data plan에서 제공되는 feed입니다. 연결이 끊기면 재시도하며, 형식이 잘못된 프레임은 버립니다. 기록은 `<directory>/alpaca-trade-updates/<UTC 날짜>/trade_updates.jsonl` 및 `<directory>/alpaca-iex/<UTC 날짜>/market_data.jsonl`에 추가됩니다.
+
+Trading stream의 인증, `trade_updates` 구독 및 fill 이벤트 형식은 [Alpaca WebSocket Streaming 문서](https://docs.alpaca.markets/us/docs/websocket-streaming)를 따릅니다. IEX endpoint와 trades/quotes/bars 구독 형식은 [Alpaca Market Data WebSocket 문서](https://docs.alpaca.markets/us/docs/streaming-market-data) 및 [market data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq)를 따릅니다.
 
 ## 재연결 reconcile 트리거 (기본 비활성화)
 

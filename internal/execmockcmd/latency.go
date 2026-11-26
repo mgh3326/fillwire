@@ -1,4 +1,4 @@
-package main
+package execmockcmd
 
 import (
 	"context"

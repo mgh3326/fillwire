@@ -1,0 +1,1 @@
+{"stream":"trade_updates","data":{"event":"fill","execution_id":"2f63ea93-423d-4169-b3f6-3fdafc10c418","order":{"id":"a5be8f5e-fdfa-41f5-a644-7a74fe947a8f","symbol":"AAPL","status":"filled","filled_qty":"1"},"timestamp":"2024-01-01T00:00:00Z","price":"100.00","qty":"1"}}

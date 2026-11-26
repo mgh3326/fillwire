@@ -1,4 +1,4 @@
-package main
+package markettapcmd
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 
 func TestDisabledByDefault(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run(nil, &stdout, &stderr); code != 0 {
+	if code := Run(nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
 	}
 	if !strings.Contains(stdout.String(), "disabled") {
@@ -23,7 +23,7 @@ func TestDisabledByDefault(t *testing.T) {
 
 func TestEnabledWithoutTargetsIsAUsageError(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"-enabled"}, &stdout, &stderr); code != 2 {
+	if code := Run([]string{"-enabled"}, &stdout, &stderr); code != 2 {
 		t.Fatalf("exit = %d, want 2", code)
 	}
 }
@@ -42,7 +42,7 @@ func TestEnabledRefusesMissingConfiguration(t *testing.T) {
 	t.Setenv("FILLWIRE_TEST_APP_KEY", "")
 	t.Setenv("FILLWIRE_TEST_APP_SECRET", "")
 	var stdout, stderr bytes.Buffer
-	code := run([]string{
+	code := Run([]string{
 		"-enabled", "-targets", targets, "-calendar", calendar, "-out", output,
 		"-once", "-token-redis", "redis://127.0.0.1:1",
 		"-app-key-env", "FILLWIRE_TEST_APP_KEY", "-app-secret-env", "FILLWIRE_TEST_APP_SECRET",
@@ -69,7 +69,7 @@ func TestRefusesRemotePlaintextRedis(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := run([]string{
+	code := Run([]string{
 		"-enabled", "-targets", targets, "-calendar", calendar, "-out", filepath.Join(dir, "rows.jsonl"),
 		"-redis", "redis://redis.example.invalid:6379", "-once",
 	}, &stdout, &stderr)
@@ -92,7 +92,7 @@ func TestRefusesACredentialHostThatIsNotTLSOrLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := run([]string{
+	code := Run([]string{
 		"-enabled", "-targets", targets, "-calendar", calendar, "-out", filepath.Join(dir, "rows.jsonl"),
 		"-host", "http://kis.example.invalid:9443", "-once",
 	}, &stdout, &stderr)

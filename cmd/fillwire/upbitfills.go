@@ -32,23 +32,31 @@ func runUpbitFillsCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	var cfg upbitFillsConfig
-	if _, err := strictTable(contents, "upbit_fills", &cfg); err != nil {
+	cfg, err := resolveUpbitFillsSettings(contents)
+	if err != nil {
 		return err
 	}
 	if !cfg.Enabled {
 		slog.Info("Upbit fills recording disabled")
 		return nil
 	}
-	if strings.TrimSpace(cfg.Directory) == "" {
-		return errors.New("upbit_fills: 활성화하려면 directory가 필요합니다")
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return runUpbitFills(ctx, cfg.Directory)
+	return runUpbitFills(ctx, cfg.Directory, func(func() bool) {})
 }
 
-func runUpbitFills(ctx context.Context, directory string) (runErr error) {
+func resolveUpbitFillsSettings(contents []byte) (upbitFillsConfig, error) {
+	var cfg upbitFillsConfig
+	if _, err := strictTable(contents, "upbit_fills", &cfg); err != nil {
+		return upbitFillsConfig{}, err
+	}
+	if cfg.Enabled && strings.TrimSpace(cfg.Directory) == "" {
+		return upbitFillsConfig{}, errors.New("upbit_fills: 활성화하려면 directory가 필요합니다")
+	}
+	return cfg, nil
+}
+
+func runUpbitFills(ctx context.Context, directory string, observe func(func() bool)) (runErr error) {
 	var sink *recording.Sink
 	reader, err := upbitpriv.New(upbitpriv.Config{
 		AccessKey: os.Getenv("UPBIT_ACCESS_KEY"),
@@ -65,6 +73,7 @@ func runUpbitFills(ctx context.Context, directory string) (runErr error) {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
+	observe(func() bool { return reader.Health().Connected })
 	err = reader.Run(ctx)
 	if errors.Is(err, context.Canceled) {
 		return nil
