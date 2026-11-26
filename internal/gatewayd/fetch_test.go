@@ -1126,15 +1126,31 @@ func (body fetchTimeoutBody) Read([]byte) (int, error) {
 	return 0, errors.New("read without deadline")
 }
 
-func TestFetchBodyReadSetsAndClearsRouteDeadline(t *testing.T) {
+func TestFetchBodyReadErrorKeepsRouteDeadline(t *testing.T) {
 	h := newFetchHarness(t, ProviderKISMock)
 	writer := &fetchDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
 	body := fetchTimeoutBody{writer}
 	request := httptest.NewRequest(http.MethodPost, "/v1/tokens/kis-mock/fetch", io.NopCloser(body))
 	request.Header.Set("Authorization", "Bearer "+testFetchCredential)
 	h.handler.ServeHTTP(writer, request)
-	if writer.Code != http.StatusBadRequest || len(writer.deadlines) != 2 ||
-		writer.deadlines[0].IsZero() || !writer.deadlines[1].IsZero() || h.store.total() != 0 {
-		t.Fatal("body timeout did not return 400 and clear the read deadline before issuer access")
+	if writer.Code != http.StatusBadRequest || h.store.total() != 0 {
+		t.Fatal("body timeout did not return 400 without issuer access")
+	}
+	if len(writer.deadlines) != 1 || writer.deadlines[0].IsZero() {
+		t.Fatalf("body timeout changed the read deadline %d times, want one nonzero deadline", len(writer.deadlines))
+	}
+	if writer.Result().Header.Get("Connection") != "close" {
+		t.Fatal("body timeout did not request connection closure")
+	}
+}
+
+func TestFetchBodyReadSuccessClearsRouteDeadline(t *testing.T) {
+	writer := &fetchDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+	request := httptest.NewRequest(http.MethodPost, "/v1/tokens/kis-mock/fetch", strings.NewReader("{}"))
+	if _, ok := decodeFetchBody(writer, request); !ok {
+		t.Fatal("valid body was rejected")
+	}
+	if len(writer.deadlines) != 2 || writer.deadlines[0].IsZero() || !writer.deadlines[1].IsZero() {
+		t.Fatal("successful body read did not set and clear the read deadline")
 	}
 }

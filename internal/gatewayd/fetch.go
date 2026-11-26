@@ -470,14 +470,20 @@ func (service *FetchService) registerFetch(mux *http.ServeMux, logger EventLogge
 // optional failed_token_sha256 of 64 lowercase hex characters.
 func decodeFetchBody(writer http.ResponseWriter, request *http.Request) (string, bool) {
 	controller := http.NewResponseController(writer)
-	if err := controller.SetReadDeadline(time.Now().Add(fetchBodyTimeout)); err == nil {
-		defer controller.SetReadDeadline(time.Time{})
-	} else if !errors.Is(err, http.ErrNotSupported) {
+	deadlineErr := controller.SetReadDeadline(time.Now().Add(fetchBodyTimeout))
+	if deadlineErr != nil && !errors.Is(deadlineErr, http.ErrNotSupported) {
 		return "", false
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, fetchBodyLimit))
 	if err != nil {
+		// Keep any cleanup reads bounded and prevent reuse of an HTTP/1.x connection with an unread body.
+		if request.ProtoMajor == 1 {
+			writer.Header().Set("Connection", "close")
+		}
 		return "", false
+	}
+	if deadlineErr == nil {
+		_ = controller.SetReadDeadline(time.Time{})
 	}
 	fields, valid := strictJSONFields(string(raw))
 	if !valid {
