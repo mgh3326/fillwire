@@ -22,7 +22,7 @@ import (
 
 func TestCommandHelp(t *testing.T) {
 	for _, command := range []string{
-		"fillwire", "run", "serve", "upbit", "upbit-fills", "alpaca", "coverage", "bookrec", "edge-canary",
+		"fillwire", "run", "serve", "upbit", "upbit-fills", "alpaca", "nhplug-ws", "coverage", "bookrec", "edge-canary",
 		"execmock", "execsim", "execupbit", "gatewayd", "kis-mock-edge", "kis-mock-read", "market-tap",
 	} {
 		t.Run(command, func(t *testing.T) {

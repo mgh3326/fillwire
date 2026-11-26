@@ -21,7 +21,7 @@ import (
 )
 
 const usage = `사용법: fillwire <명령> [옵션]
-명령: run (별칭 fillwire), serve, upbit, upbit-fills, alpaca, coverage, bookrec, edge-canary,
+명령: run (별칭 fillwire), serve, upbit, upbit-fills, alpaca, nhplug-ws, coverage, bookrec, edge-canary,
       execmock, execsim, execupbit, gatewayd, kis-mock-edge, kis-mock-read, market-tap
 `
 
@@ -67,6 +67,12 @@ func dispatch(args []string) int {
 		code = runCLI(args)
 	case "alpaca":
 		return runAlpacaCLI(options)
+	case "nhplug-ws":
+		if err := runNHPlugWSCommand(options); err != nil && !errors.Is(err, flag.ErrHelp) && !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
 	case "upbit-fills":
 		if err := runUpbitFillsCommand(options); err != nil && !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
