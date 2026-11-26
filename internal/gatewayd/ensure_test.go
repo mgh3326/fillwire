@@ -309,3 +309,108 @@ func tossPythonCompatiblePayload(value string) bool {
 	return json.Unmarshal(accessToken, &token) == nil && token != "" &&
 		json.Unmarshal(expiresAt, &expiry) == nil
 }
+
+type cancelingTossIssuer struct{ cancel context.CancelFunc }
+
+func (issuer cancelingTossIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, error) {
+	issuer.cancel()
+	if err := ctx.Err(); err != nil {
+		return OAuthToken{}, err
+	}
+	return OAuthToken{AccessToken: "synthetic-replacement", ExpiresIn: 3600}, nil
+}
+
+func TestTossEnsureReplacingPublishesAfterCallerCancellation(t *testing.T) {
+	now := testGatewayNow()
+	rawStore := newFakeRedisStore(func() time.Time { return now })
+	store := rawStore
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	service := newTestEnsureServiceForProvider(t, store, cancelingTossIssuer{cancel}, now, ProviderToss)
+	rawStore.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+
+	state, err := service.EnsureReplacing(ctx, tokenSHA256("fresh-cache-token"))
+	if err != nil || state != EnsureStateIssued {
+		t.Fatalf("replacement publication after cancellation: state=%q, error=%v", state, err)
+	}
+	token, fresh, loadErr := loadTossCachedToken(t.Context(), store, service.CacheKey, now)
+	if loadErr != nil || !fresh || token != "synthetic-replacement" {
+		t.Fatal("cache did not contain the newly issued replacement")
+	}
+	locked := rawStore.savedWhileLocked()
+	if len(locked) != 1 || !locked[0] {
+		t.Fatal("replacement was not published while the lock was held")
+	}
+}
+
+type testOAuthIssue func(context.Context) (OAuthToken, error)
+
+func (issue testOAuthIssue) Issue(ctx context.Context, _, _ string) (OAuthToken, error) {
+	return issue(ctx)
+}
+
+func TestTossEnsureReplacingDoesNotOverwritePeerAfterLeaseLoss(t *testing.T) {
+	now := testGatewayNow()
+	store := newFakeRedisStore(func() time.Time { return now })
+	var service *EnsureService
+	issuer := testOAuthIssue(func(context.Context) (OAuthToken, error) {
+		now = now.Add(lockTTL)
+		if locked, err := store.SetNX(t.Context(), service.LockKey, "peer-lock", lockTTL); err != nil || !locked {
+			t.Fatal("peer did not acquire the expired lock")
+		}
+		peer, err := tossTokenPayload("synthetic-peer", 3600, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.save(service.CacheKey, peer, time.Hour)
+		return OAuthToken{AccessToken: "synthetic-delayed", ExpiresIn: 3600}, nil
+	})
+	service = newTestEnsureServiceForProvider(t, store, issuer, now, ProviderToss)
+	store.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+
+	if _, err := service.EnsureReplacing(t.Context(), tokenSHA256("fresh-cache-token")); err != errEnsureUnavailable {
+		t.Fatalf("replacement after lock loss: got %v, want unavailable", err)
+	}
+	token, fresh, err := loadTossCachedToken(t.Context(), store, service.CacheKey, now)
+	if err != nil || !fresh || token != "synthetic-peer" {
+		t.Fatal("stale issuer changed the peer's cached replacement")
+	}
+}
+
+func TestTossEnsureReplacingPreservesRedisPhaseBudgets(t *testing.T) {
+	now := testGatewayNow()
+	store := newFakeRedisStore(func() time.Time { return now })
+	issuer := testOAuthIssue(func(context.Context) (OAuthToken, error) {
+		return OAuthToken{AccessToken: "synthetic-replacement", ExpiresIn: 3600}, nil
+	})
+	publishingStore := &deadlineObservingRedisStore{fakeRedisStore: store}
+	service := newTestEnsureServiceForProvider(t, publishingStore, issuer, now, ProviderToss)
+	store.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+	if _, err := service.EnsureReplacing(t.Context(), tokenSHA256("fresh-cache-token")); err != nil {
+		t.Fatal(err)
+	}
+	if publishingStore.remaining <= 2*redisDialTimeout || publishingStore.remaining > lockTTL {
+		t.Fatalf("publication budget = %v, want room for both Redis phases within the lease", publishingStore.remaining)
+	}
+}
+
+type deadlineObservingRedisStore struct {
+	*fakeRedisStore
+	remaining time.Duration
+}
+
+func (store *deadlineObservingRedisStore) observeDeadline(ctx context.Context) {
+	if deadline, ok := ctx.Deadline(); ok {
+		store.remaining = time.Until(deadline)
+	}
+}
+
+func (store *deadlineObservingRedisStore) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	store.observeDeadline(ctx)
+	return store.fakeRedisStore.Set(ctx, key, value, ttl)
+}
+
+func (store *deadlineObservingRedisStore) SetIfLockOwned(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+	store.observeDeadline(ctx)
+	return store.fakeRedisStore.SetIfLockOwned(ctx, lockKey, lockValue, key, value, ttl)
+}

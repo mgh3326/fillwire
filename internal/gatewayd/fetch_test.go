@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -455,7 +457,7 @@ func TestFetchFailedTokenStillCurrentAfterEnsureIs503WithoutRetry(t *testing.T) 
 		// The broker hands the same token back.
 		reply := h.fetchBody(`{"failed_token_sha256":"` + shaHex("same-token") + `"}`)
 		if reply.code != http.StatusServiceUnavailable || reply.raw != `{"error":"issue_unavailable"}` {
-			t.Fatalf("reply = %d %q", reply.code, reply.raw)
+			t.Fatalf("unexpected response status or error body (status %d)", reply.code)
 		}
 		if h.issuer.callCount() != 2 {
 			t.Fatalf("issuer calls = %d, want initial issue plus exactly one forced issue", h.issuer.callCount())
@@ -474,7 +476,7 @@ func TestFetchForcedContendedLockIs503(t *testing.T) {
 	h.store.locks[lockKey] = storedValue{value: "other-issuer", expiresAt: h.clock.Now().Add(time.Hour)}
 	reply := h.fetchBody(`{"failed_token_sha256":"` + shaHex("held-token") + `"}`)
 	if reply.code != http.StatusServiceUnavailable || reply.raw != `{"error":"issue_unavailable"}` {
-		t.Fatalf("reply = %d %q", reply.code, reply.raw)
+		t.Fatalf("unexpected response status or error body (status %d)", reply.code)
 	}
 	if h.issuer.callCount() != 0 {
 		t.Fatal("issued without owning the lock")
@@ -486,7 +488,7 @@ func TestFetchIssueFailureIs503(t *testing.T) {
 	h.issuer.err = context.DeadlineExceeded
 	reply := h.fetchBody(`{}`)
 	if reply.code != http.StatusServiceUnavailable || reply.raw != `{"error":"issue_unavailable"}` {
-		t.Fatalf("reply = %d %q", reply.code, reply.raw)
+		t.Fatalf("unexpected response status or error body (status %d)", reply.code)
 	}
 }
 
@@ -593,6 +595,8 @@ func TestFetchRejectsBadBodies(t *testing.T) {
 		"only unknown":      `{"force":true}`,
 		"uppercase hash":    `{"failed_token_sha256":"` + strings.ToUpper(good) + `"}`,
 		"short hash":        `{"failed_token_sha256":"abc"}`,
+		"null hash":         `{"failed_token_sha256":null}`,
+		"duplicate hash":    `{"failed_token_sha256":"` + good + `","failed_token_sha256":"` + good + `"}`,
 		"non-string hash":   `{"failed_token_sha256":5}`,
 		"trailing json":     `{} {}`,
 		"trailing garbage":  `{}x`,
@@ -604,7 +608,7 @@ func TestFetchRejectsBadBodies(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			reply := h.fetchBody(body)
 			if reply.code != http.StatusBadRequest || reply.raw != `{"error":"bad_request"}` {
-				t.Fatalf("reply = %d %q", reply.code, reply.raw)
+				t.Fatalf("unexpected response status or error body (status %d)", reply.code)
 			}
 		})
 	}
@@ -718,12 +722,18 @@ func TestParseFetchConsumers(t *testing.T) {
 	valid := `[{"name":"at","credential":"` + testFetchCredential + `","providers":["kis-mock","toss"]}]`
 	consumers, err := parseFetchConsumers(valid)
 	if err != nil || len(consumers) != 1 || consumers[0].Name != "at" || len(consumers[0].Providers) != 2 {
-		t.Fatalf("valid = %+v, %v", consumers, err)
+		t.Fatal("valid consumer config rejected")
 	}
 	if consumers, err := parseFetchConsumers("  "); err != nil || consumers != nil {
-		t.Fatalf("blank = %+v, %v", consumers, err)
+		t.Fatal("blank consumer config rejected")
+	}
+	if consumers, err := parseFetchConsumers("[]"); err != nil || len(consumers) != 0 {
+		t.Fatal("empty array rejected")
 	}
 	for name, raw := range map[string]string{
+		"null":               `null`,
+		"trailing bracket":   valid + `]`,
+		"combined provider":  strings.Replace(valid, `"kis-mock","toss"`, `"kis-mock,toss"`, 1),
 		"not json":           `nope`,
 		"object":             `{"name":"at"}`,
 		"unknown field":      `[{"name":"at","credential":"` + testFetchCredential + `","providers":["kis-mock"],"x":1}]`,
@@ -759,7 +769,7 @@ func TestParseFetchConsumers(t *testing.T) {
 	}
 	config, err := ConfigFromEnv(lookup)
 	if err != nil || len(config.FetchConsumers) != 1 {
-		t.Fatalf("ConfigFromEnv = %+v, %v", config.FetchConsumers, err)
+		t.Fatal("ConfigFromEnv rejected valid consumers")
 	}
 	if _, err := ConfigFromEnv(func(name string) string {
 		if name == "GATEWAYD_FETCH_CONSUMERS" {
@@ -784,6 +794,9 @@ func TestRedisClientReadWithTTLIsOneScriptedRead(t *testing.T) {
 		{name: "missing key", reply: "$-1\r\n"},
 		{name: "resp3 null", reply: "_\r\n"},
 		{name: "no expiry", reply: "*2\r\n$5\r\nvalue\r\n:-1\r\n", value: "value", ttl: -time.Millisecond, present: true},
+		{name: "missing sentinel", reply: "*2\r\n$5\r\nvalue\r\n:-2\r\n"},
+		{name: "invalid negative", reply: "*2\r\n$5\r\nvalue\r\n:-3\r\n", wantErr: true},
+		{name: "overflowing ttl", reply: "*2\r\n$5\r\nvalue\r\n:9223372036855\r\n", wantErr: true},
 		{name: "wrong length", reply: "*1\r\n$5\r\nvalue\r\n", wantErr: true},
 		{name: "ttl not an integer", reply: "*2\r\n$5\r\nvalue\r\n$2\r\n61\r\n", wantErr: true},
 		{name: "nested array", reply: "*2\r\n*1\r\n$1\r\nx\r\n:1\r\n", wantErr: true},
@@ -884,7 +897,7 @@ func TestFetchOverlappingReportsShareTheAttemptAndItsFailure(t *testing.T) {
 	close(release)
 	for range 2 {
 		if reply := <-replies; reply.code != http.StatusServiceUnavailable || reply.raw != `{"error":"issue_unavailable"}` {
-			t.Fatalf("reply = %d %q", reply.code, reply.raw)
+			t.Fatalf("unexpected response status or error body (status %d)", reply.code)
 		}
 	}
 	if h.issuer.callCount() != 2 {
@@ -954,5 +967,197 @@ func TestFetchTossReadsTokenRotatedByEnsure(t *testing.T) {
 	wantToken(t, h.fetchBody(`{}`), "after-rotation", "redis")
 	if h.issuer.callCount() != 2 {
 		t.Fatalf("issuer calls = %d, want initial issue and one rotation", h.issuer.callCount())
+	}
+}
+
+type blockingPanicSource struct {
+	fetchSource
+	started, release chan struct{}
+}
+
+func (source blockingPanicSource) EnsureReplacing(context.Context, string) (EnsureState, error) {
+	close(source.started)
+	<-source.release
+	panic("synthetic issuer panic")
+}
+
+type observedDoneContext struct {
+	context.Context
+	waiting chan struct{}
+}
+
+func (ctx observedDoneContext) Done() <-chan struct{} {
+	close(ctx.waiting)
+	return ctx.Context.Done()
+}
+
+func TestFetchPanicFailsLeaderAndFollower(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISMock)
+	h.seed("synthetic-rejected")
+	state := h.fetch.providers[h.provider]
+	source := blockingPanicSource{state.source, make(chan struct{}), make(chan struct{})}
+	state.source = source
+	body := `{"failed_token_sha256":"` + shaHex("synthetic-rejected") + `"}`
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	replies := make(chan int, 2)
+	post := func(ctx context.Context) {
+		request := httptest.NewRequest(http.MethodPost, "/v1/tokens/kis-mock/fetch", strings.NewReader(body)).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer "+testFetchCredential)
+		response := httptest.NewRecorder()
+		h.handler.ServeHTTP(response, request)
+		replies <- response.Code
+	}
+	go post(ctx)
+	select {
+	case <-source.started:
+	case <-ctx.Done():
+		close(source.release)
+		t.Fatal("leader did not reach issuer")
+	}
+	waiting := make(chan struct{})
+	followerCtx, cancelFollower := context.WithCancel(t.Context())
+	defer cancelFollower()
+	go post(observedDoneContext{followerCtx, waiting})
+	select {
+	case <-waiting:
+	case <-ctx.Done():
+		close(source.release)
+		t.Fatal("follower did not join")
+	}
+	close(source.release)
+	for range 2 {
+		select {
+		case status := <-replies:
+			if status != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want 503", status)
+			}
+		case <-ctx.Done():
+			t.Fatal("leader or follower did not return")
+		}
+	}
+}
+
+func TestFetchRecordsRejectedTokenFoundAfterEnsure(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISMock)
+	h.issue("synthetic-rejected")
+	body := `{"failed_token_sha256":"` + shaHex("synthetic-rejected") + `"}`
+	if status := h.fetchBody(body).code; status != http.StatusServiceUnavailable {
+		t.Fatalf("failure report status = %d, want 503", status)
+	}
+	if status := h.fetchBody(`{}`).code; status != http.StatusServiceUnavailable {
+		t.Fatalf("ordinary fetch status = %d, want 503", status)
+	}
+}
+
+func TestFetchOrdinaryLeaderChecksRedisForSharedDigest(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISMock)
+	state := h.fetch.providers[h.provider]
+	rejected := shaHex("synthetic-rejected")
+	state.reject(rejected)
+	state.issue <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	results := make(chan string, 2)
+	start := func(digest string) {
+		waiting := make(chan struct{})
+		go func() {
+			result, err := h.fetch.fetch(observedDoneContext{ctx, waiting}, h.provider, digest)
+			if err != nil {
+				results <- ""
+				return
+			}
+			results <- result.SHA256
+		}()
+		select {
+		case <-waiting:
+		case <-ctx.Done():
+			t.Fatal("request did not reach wait point")
+		}
+	}
+	start("")
+	start(rejected)
+	h.seed("synthetic-redis")
+	// A previous refresh completed while the ordinary leader was waiting.
+	state.remember(&fetchEntry{sha256: shaHex("synthetic-memory"), expiresAt: h.clock.Now().Add(time.Hour)})
+	<-state.issue
+	for range 2 {
+		if <-results != shaHex("synthetic-redis") {
+			t.Error("shared attempt did not return the Redis token")
+		}
+	}
+}
+
+type delayedTTLStore struct{ clock *testClock }
+
+func (store delayedTTLStore) ReadWithTTL(context.Context, string) (string, time.Duration, bool, error) {
+	store.clock.advance(2 * time.Second)
+	return "synthetic-approval", time.Second, true, nil
+}
+
+func TestFetchSnapshotAccountsForReadDelay(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISMockApproval)
+	h.fetch.store = delayedTTLStore{h.clock}
+	entry, err := h.fetch.snapshot(t.Context(), h.provider, h.ensurer.tokenKey())
+	if err != nil || entry != nil {
+		t.Fatal("snapshot accepted a key whose TTL elapsed during the read")
+	}
+}
+
+func TestRESPRejectsNestedArrayBeforeReadingItsLength(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("*2\r\n*1\r\n$1\r\nx\r\n:1\r\n"))
+	if _, err := readRESPReply(reader); err == nil {
+		t.Fatal("accepted nested array")
+	}
+	if next, err := reader.ReadByte(); err != nil || next != '1' {
+		t.Fatal("read beyond nested array marker")
+	}
+}
+
+type fetchDeadlineWriter struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (writer *fetchDeadlineWriter) SetReadDeadline(deadline time.Time) error {
+	writer.deadlines = append(writer.deadlines, deadline)
+	return nil
+}
+
+type fetchTimeoutBody struct{ writer *fetchDeadlineWriter }
+
+func (body fetchTimeoutBody) Read([]byte) (int, error) {
+	if len(body.writer.deadlines) == 1 && body.writer.deadlines[0].After(time.Now()) {
+		return 0, context.DeadlineExceeded
+	}
+	return 0, errors.New("read without deadline")
+}
+
+func TestFetchBodyReadErrorKeepsRouteDeadline(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISMock)
+	writer := &fetchDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+	body := fetchTimeoutBody{writer}
+	request := httptest.NewRequest(http.MethodPost, "/v1/tokens/kis-mock/fetch", io.NopCloser(body))
+	request.Header.Set("Authorization", "Bearer "+testFetchCredential)
+	h.handler.ServeHTTP(writer, request)
+	if writer.Code != http.StatusBadRequest || h.store.total() != 0 {
+		t.Fatal("body timeout did not return 400 without issuer access")
+	}
+	if len(writer.deadlines) != 1 || writer.deadlines[0].IsZero() {
+		t.Fatalf("body timeout changed the read deadline %d times, want one nonzero deadline", len(writer.deadlines))
+	}
+	if writer.Result().Header.Get("Connection") != "close" {
+		t.Fatal("body timeout did not request connection closure")
+	}
+}
+
+func TestFetchBodyReadSuccessClearsRouteDeadline(t *testing.T) {
+	writer := &fetchDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+	request := httptest.NewRequest(http.MethodPost, "/v1/tokens/kis-mock/fetch", strings.NewReader("{}"))
+	if _, ok := decodeFetchBody(writer, request); !ok {
+		t.Fatal("valid body was rejected")
+	}
+	if len(writer.deadlines) != 2 || writer.deadlines[0].IsZero() || !writer.deadlines[1].IsZero() {
+		t.Fatal("successful body read did not set and clear the read deadline")
 	}
 }

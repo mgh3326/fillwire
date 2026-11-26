@@ -28,6 +28,7 @@ type RedisStore interface {
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
 	SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	CompareAndDelete(ctx context.Context, key, value string) error
+	SetIfLockOwned(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error
 }
 
 // RedisClient is a small RESP client for the issuer's GET, SET, SET NX EX,
@@ -155,6 +156,20 @@ func (client *RedisClient) CompareAndDelete(ctx context.Context, key, value stri
 	return nil
 }
 
+// SetIfLockOwned publishes the value only while the same Redis lock is held.
+func (client *RedisClient) SetIfLockOwned(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+	const script = "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]); return 1"
+	seconds, valid := redisTTLSeconds(ttl)
+	if !valid {
+		return errRedisUnavailable
+	}
+	reply, err := client.execute(ctx, "EVAL", script, "2", lockKey, key, lockValue, value, seconds)
+	if err != nil || reply.kind != ':' || reply.text != "1" {
+		return errRedisUnavailable
+	}
+	return nil
+}
+
 // Held reports whether key exists; the approval lock-wait loop uses it to
 // detect that the lock holder finished, regardless of the value it stored.
 func (client *RedisClient) Held(ctx context.Context, key string) (bool, error) {
@@ -271,6 +286,10 @@ type redisReply struct {
 }
 
 func readRESPReply(reader *bufio.Reader) (redisReply, error) {
+	return readRESPValue(reader, true)
+}
+
+func readRESPValue(reader *bufio.Reader, allowArray bool) (redisReply, error) {
 	marker, err := reader.ReadByte()
 	if err != nil {
 		return redisReply{}, err
@@ -315,6 +334,9 @@ func readRESPReply(reader *bufio.Reader) (redisReply, error) {
 		}
 		return redisReply{kind: marker, text: string(payload[:length])}, nil
 	case '*':
+		if !allowArray {
+			return redisReply{}, errors.New("invalid redis array element")
+		}
 		// Only the flat two-element reply of ReadWithTTL is accepted; nested or
 		// larger arrays are never expected from this client's commands.
 		lengthLine, err := readRESPLine(reader)
@@ -333,8 +355,8 @@ func readRESPReply(reader *bufio.Reader) (redisReply, error) {
 		}
 		elements := make([]redisReply, 0, length)
 		for range length {
-			element, err := readRESPReply(reader)
-			if err != nil || element.kind == '*' {
+			element, err := readRESPValue(reader, false)
+			if err != nil {
 				return redisReply{}, errors.New("invalid redis array element")
 			}
 			elements = append(elements, element)
@@ -391,8 +413,11 @@ func (client *RedisClient) ReadWithTTL(ctx context.Context, key string) (string,
 		return "", 0, false, errRedisUnavailable
 	}
 	ms, err := strconv.ParseInt(reply.elements[1].text, 10, 64)
-	if err != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) || ms < -(1<<62) {
+	if err != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) || ms < -2 {
 		return "", 0, false, errRedisUnavailable
+	}
+	if ms == -2 {
+		return "", 0, false, nil
 	}
 	return reply.elements[0].text, time.Duration(ms) * time.Millisecond, true, nil
 }

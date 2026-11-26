@@ -177,6 +177,7 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 	if err != nil {
 		return "", errEnsureUnavailable
 	}
+	lockStarted := time.Now()
 	locked, err := service.Store.SetNX(ctx, service.LockKey, lockValue, lockTTL)
 	if err != nil {
 		return "", errEnsureUnavailable
@@ -205,6 +206,20 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 			return EnsureStateFresh, nil
 		}
 	}
+	tossReplacement := service.Provider == ProviderToss && rejectedSHA != ""
+	if tossReplacement {
+		// A caller can leave after Toss rotates its token but before we read
+		// the response. Finish the rotation within the remaining lock lease.
+		if ctx.Err() != nil {
+			return "", errEnsureUnavailable
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(context.WithoutCancel(ctx), lockStarted.Add(lockTTL))
+		defer cancel()
+		if ctx.Err() != nil {
+			return "", errEnsureUnavailable
+		}
+	}
 	issued, err := service.OAuth.Issue(ctx, service.AppKey, service.AppSecret)
 	if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
 		return "", errEnsureUnavailable
@@ -216,7 +231,13 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 	// Toss permits one valid token per client. A successful reissue invalidates
 	// the previous token, so publish the replacement while still owning this
 	// shared lock before any Python consumer can observe an unlocked stale key.
-	if err := service.Store.Set(ctx, service.CacheKey, payload, providerCacheTTL(service.Provider, issued.ExpiresIn)); err != nil {
+	ttl := providerCacheTTL(service.Provider, issued.ExpiresIn)
+	if tossReplacement {
+		err = service.Store.SetIfLockOwned(ctx, service.LockKey, lockValue, service.CacheKey, payload, ttl)
+	} else {
+		err = service.Store.Set(ctx, service.CacheKey, payload, ttl)
+	}
+	if err != nil {
 		return "", errEnsureUnavailable
 	}
 	return EnsureStateIssued, nil
