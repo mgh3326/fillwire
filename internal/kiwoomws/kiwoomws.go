@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -350,10 +351,11 @@ func containsToken(raw []byte, token string) bool {
 		return true
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
 	for {
 		item, err := decoder.Token()
 		if err != nil {
-			return false
+			return !errors.Is(err, io.EOF)
 		}
 		if value, ok := item.(string); ok && strings.Contains(value, token) {
 			return true

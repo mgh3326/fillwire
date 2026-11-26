@@ -224,12 +224,13 @@ func TestEscapedReflectedTokenIsDropped(t *testing.T) {
 	for _, frame := range []string{
 		`{"trnm":"REAL","nested":{"value":"se\u0063ret-token"}}`,
 		`{"trnm":"REAL","nested":{"se\u0063ret-token":"reflected"}}`,
+		`{"trnm":"REAL","n":1e400,"value":"se\u0063ret-token"}`,
 	} {
 		if err := r.handleFrame(conn, context.Background(), []byte(frame), "secret-token"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if records != 0 || r.Health().MalformedFrames != 2 {
+	if records != 0 || r.Health().MalformedFrames != 3 {
 		t.Fatalf("records=%d malformed=%d", records, r.Health().MalformedFrames)
 	}
 	if !strings.Contains(logs.String(), "malformed_frames=1") || !strings.Contains(logs.String(), "malformed_frames=2") {
