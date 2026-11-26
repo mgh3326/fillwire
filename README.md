@@ -571,6 +571,32 @@ Set `enabled = false`, or delete the `[quotes]` table, and restart fillwire.
 The mount can stay or go. Existing `quotes:toss` entries remain until trimmed
 by `MAXLEN` or deleted by the desk (`DEL quotes:toss`).
 
+## NHPLUG 모의 WebSocket 기록 (기본 비활성화)
+
+`fillwire nhplug-ws -config fillwire.toml`은 NHPLUG 모의 WebSocket 한 세션에서
+시세와 d0–d3 통보 프레임을 JSONL로 기록합니다. 이 명령은 주문이나 원장 경로를
+호출하지 않습니다. 사용자 ID와 시세 채널은 설정에 두고, 앱 키와 시크릿은
+`NHPLUG_APP_KEY`, `NHPLUG_APP_SECRET` 환경 변수에서 읽습니다. WebSocket 주소는
+`wss://moapi.nhplug.com:17070/websocket`으로 고정되며 운영 WebSocket 포트는 거부합니다.
+인증 토큰은 NH SDK 방식으로 발급하고 메모리에만 유지합니다.
+
+```toml
+[nhplug_ws]
+enabled = false
+user_id = "NHPLUG_USER_ID"
+directory = "./recordings"
+app_key_env = "NHPLUG_APP_KEY"
+app_secret_env = "NHPLUG_APP_SECRET"
+
+[[nhplug_ws.quotes]]
+tr_cd = "mc"
+tr_key = "005930"
+```
+
+serve 모듈 레지스트리가 아직 통합되지 않은 상태에서는 명령을 직접 실행합니다.
+레지스트리 연결은 `[nhplug_ws]`를 읽고 `runNHPlugWS(ctx, cfg, tokens.Token)`을
+실행하는 모듈 팩토리 한 줄로 연결할 수 있습니다.
+
 ## KIS promoted quote lane (off by default)
 
 The promoted quote lane registers the KIS realtime trade (`H0STCNT0`) and
@@ -1029,6 +1055,13 @@ fillwire kiwoom-us --config /etc/fillwire/fillwire.toml
 국내 심볼은 `0B`, `0D`, `0H`, `1h`를 구독하고, 미국 심볼은 `FE`, `FT`를 구독합니다. 같은 세션에서 국내 계좌는 `00`, `04`, 미국 계좌는 `F4`, `F5` 계좌 스트림을 받습니다. 받은 프레임은 `<directory>/kiwoom-kr/` 또는 `kiwoom-us/` 아래 UTC 날짜별 JSONL 기록에 `received_at`과 함께 추가합니다. 기록기에는 원장 ingest나 주문 경로가 없습니다.
 
 프로토콜 근거: 키움 공식 [OAuth 접근토큰 발급(au10001)](https://openapi.kiwoom.com/guide/apiGuideContents/a1/au10001), [국내 주식체결(0B)](https://openapi.kiwoom.com/guide/apiGuideContents/14/0B), [미국 실시간 TR 목록(F4/F5/FE/FT 포함)](https://openapi.kiwoom.com/m/guide/apiguide), [웹소켓 연결 및 LOGIN 안내](https://openapi.kiwoom.com/m/guide/index), [주문체결(00)의 공통 등록 형식 및 200종목 한도](https://openapi.kiwoom.com/m/guide/apiguide/14/00).
+## Alpaca paper 스트림 기록기 (기본 비활성화)
+
+`[alpaca] enabled = true`와 `symbols` 종목 목록 및 `directory`를 설정하면 `fillwire alpaca --config fillwire.toml`이 Alpaca paper 계정의 `trade_updates`와 IEX의 주식 trade/quote/minute bar 프레임을 UTC 날짜별 JSONL 파일에 기록합니다. 명령은 paper 거래 스트림 `wss://paper-api.alpaca.markets/stream`에만 연결하며 라이브 거래 스트림 호스트는 다이얼 전에 거부합니다. 구독 전에 API 인증을 수행합니다. 주문 제출이나 ledger ingest를 호출하지 않습니다.
+
+키 값은 설정 파일에 넣지 않습니다. 프로세스는 `ALPACA_PAPER_API_KEY`, `ALPACA_PAPER_API_SECRET`, `ALPACA_DATA_API_KEY_ID`, `ALPACA_DATA_API_SECRET_KEY` 환경 변수에서 읽습니다. 기본 IEX feed는 무료 market-data plan에서 제공되는 feed입니다. 연결이 끊기면 재시도하며, 형식이 잘못된 프레임은 버립니다. 기록은 `<directory>/alpaca-trade-updates/<UTC 날짜>/trade_updates.jsonl` 및 `<directory>/alpaca-iex/<UTC 날짜>/market_data.jsonl`에 추가됩니다.
+
+Trading stream의 인증, `trade_updates` 구독 및 fill 이벤트 형식은 [Alpaca WebSocket Streaming 문서](https://docs.alpaca.markets/us/docs/websocket-streaming)를 따릅니다. IEX endpoint와 trades/quotes/bars 구독 형식은 [Alpaca Market Data WebSocket 문서](https://docs.alpaca.markets/us/docs/streaming-market-data) 및 [market data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq)를 따릅니다.
 
 ## 재연결 reconcile 트리거 (기본 비활성화)
 
