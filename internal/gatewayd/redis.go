@@ -271,6 +271,10 @@ type redisReply struct {
 }
 
 func readRESPReply(reader *bufio.Reader) (redisReply, error) {
+	return readRESPValue(reader, true)
+}
+
+func readRESPValue(reader *bufio.Reader, allowArray bool) (redisReply, error) {
 	marker, err := reader.ReadByte()
 	if err != nil {
 		return redisReply{}, err
@@ -315,6 +319,9 @@ func readRESPReply(reader *bufio.Reader) (redisReply, error) {
 		}
 		return redisReply{kind: marker, text: string(payload[:length])}, nil
 	case '*':
+		if !allowArray {
+			return redisReply{}, errors.New("invalid redis array element")
+		}
 		// Only the flat two-element reply of ReadWithTTL is accepted; nested or
 		// larger arrays are never expected from this client's commands.
 		lengthLine, err := readRESPLine(reader)
@@ -333,8 +340,8 @@ func readRESPReply(reader *bufio.Reader) (redisReply, error) {
 		}
 		elements := make([]redisReply, 0, length)
 		for range length {
-			element, err := readRESPReply(reader)
-			if err != nil || element.kind == '*' {
+			element, err := readRESPValue(reader, false)
+			if err != nil {
 				return redisReply{}, errors.New("invalid redis array element")
 			}
 			elements = append(elements, element)
@@ -391,8 +398,11 @@ func (client *RedisClient) ReadWithTTL(ctx context.Context, key string) (string,
 		return "", 0, false, errRedisUnavailable
 	}
 	ms, err := strconv.ParseInt(reply.elements[1].text, 10, 64)
-	if err != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) || ms < -(1<<62) {
+	if err != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) || ms < -2 {
 		return "", 0, false, errRedisUnavailable
+	}
+	if ms == -2 {
+		return "", 0, false, nil
 	}
 	return reply.elements[0].text, time.Duration(ms) * time.Millisecond, true, nil
 }

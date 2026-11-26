@@ -5,6 +5,7 @@ package gatewayd
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -186,7 +187,11 @@ func parseFetchConsumers(raw string) ([]FetchConsumer, error) {
 		Credential string   `json:"credential"`
 		Providers  []string `json:"providers"`
 	}
-	if err := decoder.Decode(&entries); err != nil || decoder.More() {
+	if err := decoder.Decode(&entries); err != nil || entries == nil {
+		return nil, errConfiguration
+	}
+	var trailing json.RawMessage
+	if decoder.Decode(&trailing) != io.EOF {
 		return nil, errConfiguration
 	}
 	consumers := make([]FetchConsumer, 0, len(entries))
@@ -206,9 +211,18 @@ func parseFetchConsumers(raw string) ([]FetchConsumer, error) {
 		}
 		names[entry.Name] = struct{}{}
 		credentials[entry.Credential] = struct{}{}
-		providers, err := ParseProviders(strings.Join(entry.Providers, ","))
-		if err != nil {
-			return nil, errConfiguration
+		providers := make([]TokenProvider, 0, len(entry.Providers))
+		seen := make(map[TokenProvider]struct{}, len(entry.Providers))
+		for _, rawProvider := range entry.Providers {
+			provider := TokenProvider(strings.TrimSpace(rawProvider))
+			if !knownProvider(provider) {
+				return nil, errConfiguration
+			}
+			if _, duplicate := seen[provider]; duplicate {
+				return nil, errConfiguration
+			}
+			seen[provider] = struct{}{}
+			providers = append(providers, provider)
 		}
 		consumers = append(consumers, FetchConsumer{Name: entry.Name, Credential: entry.Credential, Providers: providers})
 	}

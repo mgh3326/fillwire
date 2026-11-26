@@ -23,7 +23,8 @@ const (
 	fetchSourceRedis  = "redis"
 	fetchSourceIssued = "issued"
 
-	fetchBodyLimit = 1024
+	fetchBodyLimit   = 1024
+	fetchBodyTimeout = 5 * time.Second
 )
 
 var (
@@ -208,6 +209,7 @@ func (service *FetchService) snapshot(ctx context.Context, provider TokenProvide
 	if service.store == nil || key == "" {
 		return nil, errFetchUnavailable
 	}
+	started := service.now()
 	raw, ttl, present, err := service.store.ReadWithTTL(ctx, key)
 	if err != nil {
 		return nil, errFetchUnavailable
@@ -215,16 +217,15 @@ func (service *FetchService) snapshot(ctx context.Context, provider TokenProvide
 	if !present || ttl <= 0 {
 		return nil, nil
 	}
-	now := service.now()
 	token, payloadExpiry, ok := parseCachedToken(provider, raw)
 	if !ok {
 		return nil, nil
 	}
-	expiresAt := now.Add(ttl)
+	expiresAt := started.Add(ttl)
 	if !payloadExpiry.IsZero() && payloadExpiry.Before(expiresAt) {
 		expiresAt = payloadExpiry
 	}
-	if !expiresAt.After(now) {
+	if !expiresAt.After(service.now()) {
 		return nil, nil
 	}
 	return &fetchEntry{token: token, sha256: tokenSHA256(token), expiresAt: expiresAt}, nil
@@ -312,7 +313,7 @@ func (service *FetchService) fetch(ctx context.Context, provider TokenProvider, 
 		}
 	}
 	defer state.finish(replacing, attempt)
-	attempt.result, attempt.err = service.refresh(ctx, provider, state, failedSHA)
+	attempt.result, attempt.err = service.refresh(ctx, provider, state, replacing)
 	return attempt.result, attempt.err
 }
 
@@ -389,7 +390,8 @@ func (service *FetchService) refresh(ctx context.Context, provider TokenProvider
 	// A token the consumer rejected is still current: reissue did not replace it
 	// (contended lock, or the broker returned the same token). Report that
 	// instead of looping, and never hand it out.
-	if (failedSHA != "" && current.sha256 == failedSHA) || current.sha256 == state.rejectedSHA() {
+	if current.sha256 == failedSHA || current.sha256 == state.rejectedSHA() {
+		state.reject(current.sha256)
 		return FetchResult{}, errFetchUnavailable
 	}
 	state.remember(current)
@@ -467,28 +469,29 @@ func (service *FetchService) registerFetch(mux *http.ServeMux, logger EventLogge
 // decodeFetchBody accepts exactly one JSON object whose only field is an
 // optional failed_token_sha256 of 64 lowercase hex characters.
 func decodeFetchBody(writer http.ResponseWriter, request *http.Request) (string, bool) {
+	controller := http.NewResponseController(writer)
+	if err := controller.SetReadDeadline(time.Now().Add(fetchBodyTimeout)); err == nil {
+		defer controller.SetReadDeadline(time.Time{})
+	} else if !errors.Is(err, http.ErrNotSupported) {
+		return "", false
+	}
 	raw, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, fetchBodyLimit))
-	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
+	if err != nil {
 		return "", false
 	}
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
-	decoder.DisallowUnknownFields()
-	var body struct {
-		Failed *string `json:"failed_token_sha256"`
-	}
-	if decoder.Decode(&body) != nil {
+	fields, valid := strictJSONFields(string(raw))
+	if !valid {
 		return "", false
 	}
-	if _, tokenErr := decoder.Token(); tokenErr != io.EOF {
-		return "", false
-	}
-	if body.Failed == nil {
+	if len(fields) == 0 {
 		return "", true
 	}
-	if !failedHashPattern.MatchString(*body.Failed) {
+	var digest string
+	if len(fields) != 1 || json.Unmarshal(fields["failed_token_sha256"], &digest) != nil ||
+		!failedHashPattern.MatchString(digest) {
 		return "", false
 	}
-	return *body.Failed, true
+	return digest, true
 }
 
 func writeFetchError(writer http.ResponseWriter, status int, code string) {
