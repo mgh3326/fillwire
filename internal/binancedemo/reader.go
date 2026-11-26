@@ -231,7 +231,8 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 			}
 		}
 	}()
-	ctx, cancel := context.WithCancel(ctx)
+	parentCtx := ctx
+	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 	finished := make(chan error, 2)
 	go func() { finished <- r.supervise(ctx, marketStream) }()
@@ -249,7 +250,7 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		if runErr == nil {
-			runErr = ctx.Err()
+			runErr = parentCtx.Err()
 		}
 		return runErr
 	case err := <-finished:
@@ -261,7 +262,11 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		if runErr == nil {
-			runErr = errors.New("binance demo: stream supervisor stopped")
+			if err := parentCtx.Err(); err != nil {
+				runErr = err
+			} else {
+				runErr = errors.New("binance demo: stream supervisor stopped")
+			}
 		}
 		return runErr
 	}

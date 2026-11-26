@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -292,6 +294,32 @@ func TestFailedPingCancelsBlockedReadAndReconnects(t *testing.T) {
 	}
 	if pings.Load() == 0 || r.Health().Reconnects == 0 {
 		t.Fatalf("failed ping did not reconnect: pings=%d health=%+v", pings.Load(), r.Health())
+	}
+}
+
+func TestRunReturnsParentCancellationWhenSupervisorStops(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(oldProcs) })
+	for attempt := 0; attempt < 12; attempt++ {
+		parent, cancel := context.WithCancel(context.Background())
+		r, err := New(Config{
+			Symbols: []string{"BTCUSDT"}, EnableUserStream: false, Logger: slog.New(slog.DiscardHandler),
+			Append: func(Record) error { return nil },
+			Dial:   func(context.Context, string, string) (Socket, error) { return nil, errors.New("simulated disconnect") },
+			Sleep: func(context.Context, time.Duration) error {
+				cancel()
+				return errors.New("supervisor stopped")
+			},
+		})
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		if err := r.Run(parent); !errors.Is(err, context.Canceled) {
+			cancel()
+			t.Fatalf("attempt %d: Run returned %v after parent cancellation", attempt, err)
+		}
+		cancel()
 	}
 }
 
