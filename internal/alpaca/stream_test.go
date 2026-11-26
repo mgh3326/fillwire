@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/mgh3326/fillwire/internal/recording"
 )
 
 type readResult struct {
@@ -43,7 +42,7 @@ func TestLiveTradingEndpointRefusedBeforeDial(t *testing.T) {
 	module := newTestModule(t, nil)
 	var dials int
 	module.cfg.Dial = func(context.Context, string, http.Header) (Socket, error) { dials++; return nil, nil }
-	err := module.session(context.Background(), "trade_updates", "wss://api.alpaca.markets/stream", "key", "secret", module.trade)
+	err := module.session(context.Background(), "trade_updates", "wss://api.alpaca.markets/stream", "key", "secret")
 	if !errors.Is(err, ErrLiveTradingEndpoint) {
 		t.Fatalf("session error = %v, want ErrLiveTradingEndpoint", err)
 	}
@@ -84,12 +83,11 @@ func TestTradeFillAndMarketFramesAreRecordedWithReceivedAt(t *testing.T) {
 	for _, tc := range []struct {
 		stream, endpoint string
 		socket           *fakeSocket
-		writer           *recording.DailyWriter
 	}{
-		{"trade_updates", PaperTradingEndpoint, trade, module.trade},
-		{"market_data", IEXEndpoint, market, module.market},
+		{"trade_updates", PaperTradingEndpoint, trade},
+		{"market_data", IEXEndpoint, market},
 	} {
-		if err := module.session(context.Background(), tc.stream, tc.endpoint, "key", "secret", tc.writer); err == nil {
+		if err := module.session(context.Background(), tc.stream, tc.endpoint, "key", "secret"); err == nil {
 			t.Fatalf("%s session error = nil, want disconnect", tc.stream)
 		}
 		if tc.stream == "trade_updates" && len(tc.socket.writes) != 2 {

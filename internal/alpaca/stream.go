@@ -67,8 +67,7 @@ type Module struct {
 	tradeSec    string
 	dataKey     string
 	dataSec     string
-	trade       *recording.DailyWriter
-	market      *recording.DailyWriter
+	recorder    *recording.Sink
 	tradeReady  atomic.Bool
 	marketReady atomic.Bool
 	running     atomic.Bool
@@ -118,16 +117,11 @@ func New(cfg Config) (*Module, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
-	trade, err := recording.NewDailyWriter(cfg.Root, TradeStream, "trade_updates")
+	recorder, err := recording.NewSink(cfg.Root, TradeStream, MarketStream)
 	if err != nil {
 		return nil, err
 	}
-	market, err := recording.NewDailyWriter(cfg.Root, MarketStream, "market_data")
-	if err != nil {
-		_ = trade.Close()
-		return nil, err
-	}
-	return &Module{cfg: cfg, tradeKey: tradeKey, tradeSec: tradeSec, dataKey: dataKey, dataSec: dataSec, trade: trade, market: market}, nil
+	return &Module{cfg: cfg, tradeKey: tradeKey, tradeSec: tradeSec, dataKey: dataKey, dataSec: dataSec, recorder: recorder}, nil
 }
 
 func validSymbol(symbol string) bool {
@@ -156,10 +150,8 @@ func (m *Module) Run(ctx context.Context) error {
 	var workers atomic.Int32
 	workers.Store(2)
 	errs := make(chan error, 2)
-	go func() {
-		errs <- m.reconnect(ctx, "trade_updates", m.cfg.TradeEndpoint, m.tradeKey, m.tradeSec, m.trade)
-	}()
-	go func() { errs <- m.reconnect(ctx, "market_data", m.cfg.MarketEndpoint, m.dataKey, m.dataSec, m.market) }()
+	go func() { errs <- m.reconnect(ctx, "trade_updates", m.cfg.TradeEndpoint, m.tradeKey, m.tradeSec) }()
+	go func() { errs <- m.reconnect(ctx, "market_data", m.cfg.MarketEndpoint, m.dataKey, m.dataSec) }()
 	for i := int32(0); i < workers.Load(); i++ {
 		if err := <-errs; ctx.Err() == nil && err != nil {
 			m.cfg.Logger.Error("alpaca stream stopped", "reason", err)
@@ -168,10 +160,10 @@ func (m *Module) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (m *Module) reconnect(ctx context.Context, stream, endpoint, key, secret string, writer *recording.DailyWriter) error {
+func (m *Module) reconnect(ctx context.Context, stream, endpoint, key, secret string) error {
 	delay := m.cfg.RetryMin
 	for ctx.Err() == nil {
-		if err := m.session(ctx, stream, endpoint, key, secret, writer); ctx.Err() != nil {
+		if err := m.session(ctx, stream, endpoint, key, secret); ctx.Err() != nil {
 			return ctx.Err()
 		} else if err != nil {
 			m.cfg.Logger.Warn("alpaca stream reconnecting", "stream", stream, "reason", err.Error(), "malformed_frames", m.malformed.Load())
@@ -188,7 +180,7 @@ func (m *Module) reconnect(ctx context.Context, stream, endpoint, key, secret st
 	return ctx.Err()
 }
 
-func (m *Module) session(ctx context.Context, stream, endpoint, key, secret string, writer *recording.DailyWriter) error {
+func (m *Module) session(ctx context.Context, stream, endpoint, key, secret string) error {
 	if stream == "trade_updates" && !paperEndpoint(endpoint) {
 		return ErrLiveTradingEndpoint
 	}
@@ -235,10 +227,21 @@ func (m *Module) session(ctx context.Context, stream, endpoint, key, secret stri
 			m.malformed.Add(1)
 			continue
 		}
-		if err := writer.Append(at, Record{Kind: eventKind(stream, raw), ReceivedAt: at, Stream: stream, Data: append(json.RawMessage(nil), raw...), Raw: append(json.RawMessage(nil), raw...)}); err != nil {
+		name := "market_data"
+		if stream == "trade_updates" {
+			name = "trade_updates"
+		}
+		if err := m.recorder.Append(streamName(stream), name, at, Record{Kind: eventKind(stream, raw), ReceivedAt: at, Stream: stream, Data: append(json.RawMessage(nil), raw...), Raw: append(json.RawMessage(nil), raw...)}); err != nil {
 			return errors.New("alpaca: recording append failed")
 		}
 	}
+}
+
+func streamName(stream string) string {
+	if stream == "trade_updates" {
+		return TradeStream
+	}
+	return MarketStream
 }
 
 func paperEndpoint(raw string) bool { return raw == PaperTradingEndpoint }
@@ -390,11 +393,8 @@ func dial(ctx context.Context, endpoint string, headers http.Header) (Socket, er
 
 func (m *Module) closeWriters() {
 	m.closeOnce.Do(func() {
-		if err := m.trade.Close(); err != nil {
-			m.cfg.Logger.Error("alpaca trade recorder close failed", "reason", err.Error())
-		}
-		if err := m.market.Close(); err != nil {
-			m.cfg.Logger.Error("alpaca market recorder close failed", "reason", err.Error())
+		if err := m.recorder.Close(); err != nil {
+			m.cfg.Logger.Error("alpaca recorder close failed", "reason", err.Error())
 		}
 	})
 }
