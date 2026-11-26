@@ -17,7 +17,7 @@ func TestIssueMockTokenClassifiesPermanentAndTransientFailures(t *testing.T) {
 	}{
 		{name: "unauthorized", status: http.StatusUnauthorized, body: `{}`, permanent: true},
 		{name: "forbidden", status: http.StatusForbidden, body: `{}`, permanent: true},
-		{name: "oauth return code", status: http.StatusOK, body: `{"return_code":1001}`, permanent: true},
+		{name: "nonzero oauth return code", status: http.StatusOK, body: `{"return_code":1001}`, permanent: false},
 		{name: "rate limited", status: http.StatusTooManyRequests, body: `{}`, permanent: false},
 		{name: "server error", status: http.StatusServiceUnavailable, body: `{}`, permanent: false},
 		{name: "invalid response", status: http.StatusOK, body: `<html>maintenance</html>`, permanent: false},

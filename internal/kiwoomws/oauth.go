@@ -56,10 +56,7 @@ func issueMockToken(ctx context.Context, appKey, appSecret, endpoint string, cli
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result); err != nil {
 		return "", errors.New("Kiwoom 모의 OAuth 응답이 올바르지 않습니다")
 	}
-	if result.ReturnCode != nil && *result.ReturnCode != 0 {
-		return "", ErrPermanentAuth
-	}
-	if strings.TrimSpace(result.Token) == "" {
+	if strings.TrimSpace(result.Token) == "" || (result.ReturnCode != nil && *result.ReturnCode != 0) {
 		return "", errors.New("Kiwoom 모의 OAuth 응답이 올바르지 않습니다")
 	}
 	return result.Token, nil
