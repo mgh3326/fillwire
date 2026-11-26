@@ -2,6 +2,7 @@
 package kiwoomws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,12 +25,16 @@ const (
 	NameUS                = "kiwoom-us"
 	MaxSymbols            = 200
 	ioTimeout             = 10 * time.Second
+	// Three minutes allows several periodic server keepalive intervals before reconnecting.
+	readIdle = 3 * time.Minute
 )
 
 var (
-	ErrLiveEndpoint = errors.New("키움 모의 웹소켓 호스트만 허용됩니다")
-	ErrAppend       = errors.New("키움 웹소켓 프레임 기록에 실패했습니다")
-	symbolPattern   = regexp.MustCompile(`^[A-Za-z0-9._-]{1,16}$`)
+	ErrLiveEndpoint  = errors.New("키움 모의 웹소켓 호스트만 허용됩니다")
+	ErrAppend        = errors.New("키움 웹소켓 프레임 기록에 실패했습니다")
+	ErrPermanentAuth = errors.New("키움 모의 웹소켓 인증 또는 구독이 거부되었습니다")
+	symbolPattern    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,16}$`)
+	errReadIdle      = errors.New("키움 모의 웹소켓 유휴 수신 제한에 도달했습니다")
 )
 
 type Account string
@@ -193,6 +198,10 @@ func (r *Reader) Run(ctx context.Context) error {
 		if errors.Is(err, ErrAppend) {
 			return err
 		}
+		if errors.Is(err, ErrPermanentAuth) {
+			r.cfg.Logger.Error("키움 모의 웹소켓 실행 중단", "account", r.cfg.Account, "reason", safeReason(err), "malformed_frames", r.malformed.Load())
+			return ErrPermanentAuth
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -216,13 +225,13 @@ func safeReason(err error) string {
 	if err == nil {
 		return "연결 종료"
 	}
-	return "연결 또는 프로토콜 오류"
+	return err.Error()
 }
 
 func (r *Reader) session(ctx context.Context) error {
 	token, err := r.cfg.Token(ctx)
 	if err != nil || strings.TrimSpace(token) == "" {
-		return errors.New("키움 모의 OAuth 토큰을 사용할 수 없습니다")
+		return ErrPermanentAuth
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, ioTimeout)
 	conn, err := r.cfg.Dial(dialCtx, r.cfg.Endpoint)
@@ -248,8 +257,11 @@ func (r *Reader) session(ctx context.Context) error {
 	r.connected.Store(true)
 	defer r.connected.Store(false)
 	for {
-		_, raw, err := conn.Read(ctx)
+		_, raw, err := readWithIdleLimit(ctx, conn, readIdle)
 		if err != nil {
+			if errors.Is(err, errReadIdle) {
+				return errReadIdle
+			}
 			return errors.New("키움 모의 웹소켓 수신이 중단되었습니다")
 		}
 		if err := r.handleFrame(conn, ctx, raw, token); err != nil {
@@ -277,7 +289,7 @@ func (r *Reader) readUntilLogin(ctx context.Context, conn Socket, token string) 
 			continue
 		}
 		if head.ReturnCode == nil || *head.ReturnCode != 0 {
-			return errors.New("키움 모의 웹소켓 로그인이 거부되었습니다")
+			return ErrPermanentAuth
 		}
 		return nil
 	}
@@ -288,8 +300,8 @@ func (r *Reader) handleFrame(conn Socket, ctx context.Context, raw []byte, token
 	var head struct {
 		TRNM string `json:"trnm"`
 	}
-	if json.Unmarshal(raw, &frame) != nil || frame == nil || json.Unmarshal(raw, &head) != nil || strings.TrimSpace(head.TRNM) == "" || (token != "" && strings.Contains(string(raw), token)) {
-		r.malformed.Add(1)
+	if json.Unmarshal(raw, &frame) != nil || frame == nil || json.Unmarshal(raw, &head) != nil || strings.TrimSpace(head.TRNM) == "" || containsToken(raw, token) {
+		r.dropMalformed()
 		return nil
 	}
 	if err := r.cfg.Append(Frame{Account: r.cfg.Account, ReceivedAt: time.Now().UTC(), Raw: append(json.RawMessage(nil), raw...)}); err != nil {
@@ -305,10 +317,46 @@ func (r *Reader) handleFrame(conn Socket, ctx context.Context, raw []byte, token
 			ReturnCode *int `json:"return_code"`
 		}
 		if json.Unmarshal(raw, &ack) != nil || ack.ReturnCode == nil || *ack.ReturnCode != 0 {
-			return errors.New("키움 모의 웹소켓 구독이 거부되었습니다")
+			return ErrPermanentAuth
 		}
 	}
 	return nil
+}
+
+func readWithIdleLimit(ctx context.Context, conn Socket, idle time.Duration) (websocket.MessageType, []byte, error) {
+	readCtx, cancel := context.WithTimeout(ctx, idle)
+	defer cancel()
+	kind, raw, err := conn.Read(readCtx)
+	if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
+		return 0, nil, errReadIdle
+	}
+	return kind, raw, err
+}
+
+func containsToken(raw []byte, token string) bool {
+	if token == "" {
+		return false
+	}
+	if bytes.Contains(raw, []byte(token)) {
+		return true
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	for {
+		item, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if value, ok := item.(string); ok && strings.Contains(value, token) {
+			return true
+		}
+	}
+}
+
+func (r *Reader) dropMalformed() {
+	count := r.malformed.Add(1)
+	if count == 1 || count&(count-1) == 0 {
+		r.cfg.Logger.Warn("키움 모의 웹소켓 잘못된 프레임 폐기", "account", r.cfg.Account, "malformed_frames", count)
+	}
 }
 
 func write(ctx context.Context, conn Socket, payload []byte) error {

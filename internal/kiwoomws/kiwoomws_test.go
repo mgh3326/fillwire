@@ -1,9 +1,11 @@
 package kiwoomws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"reflect"
 	"strings"
@@ -31,6 +33,15 @@ func (s *testSocket) Write(_ context.Context, _ websocket.MessageType, b []byte)
 	return nil
 }
 func (*testSocket) CloseNow() error { return nil }
+
+type idleTestSocket struct{}
+
+func (idleTestSocket) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	<-ctx.Done()
+	return 0, nil, ctx.Err()
+}
+func (idleTestSocket) Write(context.Context, websocket.MessageType, []byte) error { return nil }
+func (idleTestSocket) CloseNow() error                                            { return nil }
 
 func TestMockEndpointPolicy(t *testing.T) {
 	if err := ValidateEndpoint(MockWebSocketEndpoint); err != nil {
@@ -198,5 +209,73 @@ func TestMalformedAndReflectedTokenAreDropped(t *testing.T) {
 	}
 	if records != 0 || r.Health().MalformedFrames != 3 {
 		t.Fatalf("records=%d malformed=%d", records, r.Health().MalformedFrames)
+	}
+}
+
+func TestEscapedReflectedTokenIsDropped(t *testing.T) {
+	var records int
+	var logs bytes.Buffer
+	r, err := New(Config{Account: AccountUS, Token: func(context.Context) (string, error) { return "secret-token", nil }, Append: func(Frame) error { records++; return nil }, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &testSocket{}
+	for _, frame := range []string{
+		`{"trnm":"REAL","nested":{"value":"se\u0063ret-token"}}`,
+		`{"trnm":"REAL","nested":{"se\u0063ret-token":"reflected"}}`,
+	} {
+		if err := r.handleFrame(conn, context.Background(), []byte(frame), "secret-token"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if records != 0 || r.Health().MalformedFrames != 2 {
+		t.Fatalf("records=%d malformed=%d", records, r.Health().MalformedFrames)
+	}
+	if !strings.Contains(logs.String(), "malformed_frames=1") || !strings.Contains(logs.String(), "malformed_frames=2") {
+		t.Fatalf("malformed counts were not logged during the session: %s", logs.String())
+	}
+}
+
+func TestPermanentAuthFailuresStopTokenRefreshLoop(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reads [][]byte
+		token func(context.Context) (string, error)
+	}{
+		{name: "token", token: func(context.Context) (string, error) { return "", errors.New("denied") }},
+		{name: "login", reads: [][]byte{[]byte(`{"trnm":"LOGIN","return_code":1}`)}, token: func(context.Context) (string, error) { return "mock-token", nil }},
+		{name: "registration", reads: [][]byte{[]byte(`{"trnm":"LOGIN","return_code":0}`), []byte(`{"trnm":"REG","return_code":1}`)}, token: func(context.Context) (string, error) { return "mock-token", nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tokenRequests := 0
+			cfg := Config{
+				Account: AccountKR,
+				Token: func(ctx context.Context) (string, error) {
+					tokenRequests++
+					return tc.token(ctx)
+				},
+				Append: func(Frame) error { return nil },
+				Dial: func(context.Context, string) (Socket, error) {
+					return &testSocket{reads: append([][]byte(nil), tc.reads...)}, nil
+				},
+			}
+			r, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Run(context.Background()); !errors.Is(err, ErrPermanentAuth) {
+				t.Fatalf("Run error = %v, want permanent auth rejection", err)
+			}
+			if tokenRequests != 1 {
+				t.Fatalf("token requests = %d, want 1", tokenRequests)
+			}
+		})
+	}
+}
+
+func TestReadWithIdleLimit(t *testing.T) {
+	_, _, err := readWithIdleLimit(context.Background(), idleTestSocket{}, 10*time.Millisecond)
+	if !errors.Is(err, errReadIdle) {
+		t.Fatalf("idle read error = %v, want %v", err, errReadIdle)
 	}
 }
