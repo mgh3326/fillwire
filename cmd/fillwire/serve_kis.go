@@ -294,7 +294,7 @@ func (s *kisSession) wait(ctx context.Context) error {
 		if s.terminal != nil {
 			return s.terminal
 		}
-		return reader.ErrEventsClosed
+		return errors.Join(errSharedKISStopped, reader.ErrEventsClosed)
 	}
 }
 
@@ -349,19 +349,19 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 		Books bookSettings  `toml:"books"`
 	}
 	if err := toml.Unmarshal(contents, &input); err != nil {
-		return errors.New("config: invalid KIS quote settings")
+		return fmt.Errorf("%w: invalid KIS quote settings", reader.ErrApprovalConfig)
 	}
 	cfg := runtimeConfig{fileConfig: fileConfig{KIS: input.KIS, Redis: input.Redis, Books: input.Books}, kisQuotes: resolveKisQuoteSettings(contents)}
 	quoteErr := cfg.kisQuotes.err
 	if quoteErr != nil && !cfg.Books.Enabled {
-		return quoteErr
+		return errors.Join(reader.ErrApprovalConfig, quoteErr)
 	}
 	if err := cfg.loadKISCredentials(); err != nil {
-		return err
+		return errors.Join(reader.ErrApprovalConfig, err)
 	}
 	var err error
 	if cfg.recording, err = resolveRecordingSettings(contents); err != nil {
-		return err
+		return errors.Join(reader.ErrApprovalConfig, err)
 	}
 	if reserveFutures && cfg.KIS.Endpoint == "live" && cfg.kisQuotes.enabled {
 		// Keep futures capacity aside from the start, even if that worker
@@ -379,7 +379,7 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 	}
 	bookEvent, stopBooks, err := startBooks(ctx, cfg, logger)
 	if err != nil {
-		return err
+		return errors.Join(reader.ErrApprovalConfig, err)
 	}
 	defer stopBooks()
 	var symbols []string
@@ -393,7 +393,7 @@ func runKISQuotes(ctx context.Context, contents []byte, h *kisHub, logger *slog.
 	}
 	if quoteErr != nil {
 		if !cfg.Books.Enabled {
-			return quoteErr
+			return errors.Join(reader.ErrApprovalConfig, quoteErr)
 		}
 		logger.Error("KIS 승격 호가 초기화 실패, 고정 종목 호가는 계속 실행합니다", "reason", safeRuntimeError(quoteErr))
 	}
@@ -434,16 +434,19 @@ func runKISFutures(ctx context.Context, contents []byte, h *kisHub, logger *slog
 		Redis redisSettings `toml:"redis"`
 	}
 	if err := toml.Unmarshal(contents, &input); err != nil {
-		return errors.New("config: invalid KIS futures settings")
+		return fmt.Errorf("%w: invalid KIS futures settings", reader.ErrApprovalConfig)
 	}
 	settings, err := resolveKisFuturesSettings(contents)
 	if err != nil {
-		return err
+		return errors.Join(reader.ErrApprovalConfig, err)
 	}
 	if settings.err != nil {
-		return settings.err
+		return errors.Join(reader.ErrApprovalConfig, settings.err)
 	}
 	cfg := runtimeConfig{fileConfig: fileConfig{KIS: input.KIS, Redis: input.Redis}, kisFutures: settings, kisQuotes: resolveKisQuoteSettings(contents)}
+	if cfg.KIS.Endpoint != "live" {
+		return fmt.Errorf("%w: KIS futures requires the live endpoint", reader.ErrApprovalConfig)
+	}
 	cfg.Books.Enabled = books
 	session, err := h.wait(ctx)
 	if err != nil {

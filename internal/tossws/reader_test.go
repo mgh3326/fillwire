@@ -743,3 +743,53 @@ func TestAuthRecoveryFetchesOnceThenStops(t *testing.T) {
 		})
 	}
 }
+
+func TestQuoteRecorderFailureClosesConnection(t *testing.T) {
+	trade := fixture(t, "trade-us-asyncapi-example.json")
+	var reader *Reader
+	healthyAtAppend := make(chan bool, 1)
+	closed := make(chan struct{}, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	reader, err := New(Config{
+		AccountSeq: "3", Tokens: testTokens{}, Symbols: []quote.Symbol{{Market: quote.MarketUS, Code: "AAPL"}},
+		Append: func(Record) error { return nil },
+		AppendQuote: func(Record) error {
+			healthyAtAppend <- reader.Health()
+			return errors.New("disk full")
+		},
+		Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+			frames := make(chan []byte, 2)
+			return fakeSocket{
+				write: func(raw []byte) error {
+					frames <- fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3","trade:us:AAPL","orderbook:us:AAPL"],"rejected":[]}`, requestID(raw))
+					frames <- trade
+					return nil
+				},
+				read: func(ctx context.Context) ([]byte, error) {
+					select {
+					case frame := <-frames:
+						return frame, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+				close: func() { closed <- struct{}{} },
+			}, 0, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Run(ctx); !errors.Is(err, ErrRecord) {
+		t.Fatalf("Run() = %v, want recording error", err)
+	}
+	if !<-healthyAtAppend || reader.Health() {
+		t.Fatal("health should transition from connected to disconnected on recorder failure")
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("failed recorder left socket open")
+	}
+}

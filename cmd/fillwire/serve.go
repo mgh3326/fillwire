@@ -153,7 +153,7 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 		},
 		"kis_quotes": func(ctx context.Context, ready func()) error {
 			if booksErr != nil {
-				return booksErr
+				return errors.Join(reader.ErrApprovalConfig, booksErr)
 			}
 			return runKISQuotes(ctx, contents, hub, logger, futures, ready)
 		},
@@ -231,7 +231,7 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 	}
 	sort.Strings(names)
 	slots := make([]*moduleSlot, 0, len(names)+1)
-	needsKIS := false
+	needsKIS, hasKISAuxiliary := false, false
 	for _, name := range names {
 		on, err := enabled(name)
 		if name == "kis_quotes" {
@@ -240,27 +240,34 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 		slot := &moduleSlot{name: name}
 		switch {
 		case err != nil:
+			if name == "kis_quotes" || name == "kis_futures" {
+				err = errors.Join(reader.ErrApprovalConfig, err)
+			}
 			slot.Module = &serviceModule{name: name, start: func(context.Context, func()) error { return err }}
 		case on:
 			slot.Module = modules[name]
 			needsKIS = needsKIS || name == "kis_fills" || name == "kis_quotes" || name == "kis_futures"
 		}
 		slots = append(slots, slot)
+		hasKISAuxiliary = hasKISAuxiliary || (slot.Module != nil && (name == "kis_quotes" || name == "kis_futures"))
 	}
-	if needsKIS {
+	if needsKIS || hasKISAuxiliary {
 		interval, configErr := serveAlertInterval(contents)
 		alerter := alert.FromEnv(logger, interval)
 		for _, slot := range slots {
 			switch slot.name {
 			case "kis_fills", "kis_quotes", "kis_futures":
 				if module, ok := slot.Module.(*serviceModule); ok {
-					module.start = alertKISFailures(module.start, alerter)
+					module.start = alertKISFailures(slot.name, module.start, alerter)
 				}
 			}
 		}
+		if !needsKIS {
+			return slots, settings.HealthAddress, nil
+		}
 		slots = append(slots, &moduleSlot{name: "kis_session", Module: &serviceModule{
 			name: "kis_session",
-			start: alertKISFailures(func(ctx context.Context, ready func()) error {
+			start: alertKISFailures("kis_session", func(ctx context.Context, ready func()) error {
 				if configErr != nil {
 					err := errors.Join(reader.ErrApprovalConfig, configErr)
 					hub.finish(nil, err)
@@ -298,7 +305,7 @@ func serveAlertInterval(contents []byte) (time.Duration, error) {
 	return interval, nil
 }
 
-func alertKISFailures(start func(context.Context, func()) error, alerter alert.Alerter) func(context.Context, func()) error {
+func alertKISFailures(name string, start func(context.Context, func()) error, alerter alert.Alerter) func(context.Context, func()) error {
 	return func(ctx context.Context, ready func()) error {
 		err := runAttempt(func() error { return start(ctx, ready) })
 		if ctx.Err() == nil {
@@ -307,6 +314,13 @@ func alertKISFailures(start func(context.Context, func()) error, alerter alert.A
 			}
 			if errors.Is(err, ws.ErrSessionOccupied) {
 				alerter.Alert(ctx, "session-occupied", "fillwire KIS session occupied; operator action required")
+			} else if name == "kis_quotes" || name == "kis_futures" {
+				switch reader.ProcessExitCode(err) {
+				case reader.ExitCodeConfiguration:
+					alerter.Alert(ctx, name+"-configuration", "fillwire "+name+" configuration failure; operator action required")
+				case 1:
+					alerter.Alert(ctx, name+"-transient", "fillwire "+name+" transient failure; retry or restart required")
+				}
 			} else {
 				exitCodeWithAlert(err, alerter)
 			}

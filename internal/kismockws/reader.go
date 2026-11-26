@@ -22,6 +22,7 @@ const (
 	overseasRecordingName = "overseas-fills"
 	futuresRecordingName  = "futures-fills"
 	readerOutputBuffer    = 32
+	quoteQueueSize        = 32
 	malformedRecording    = "malformed-notices"
 	noticeAckTimeout      = 5 * time.Second
 	subscribeRetryMin     = 500 * time.Millisecond
@@ -46,6 +47,7 @@ type Config struct {
 type Health struct {
 	Connected       bool      `json:"connected"`
 	LastReceivedAt  time.Time `json:"last_received_at,omitempty"`
+	DroppedQuotes   uint64    `json:"dropped_quotes"`
 	MalformedFrames uint64    `json:"malformed_frames"`
 	Reconnects      uint64    `json:"reconnects"`
 	LastError       string    `json:"last_error,omitempty"`
@@ -54,15 +56,16 @@ type Health struct {
 // Module records KIS mock quote and notice frames without ingesting them.
 type Module struct {
 	cfg          Config
-	appendRecord func(stream string, at time.Time, value any) error
+	appendRecord func(sink *recording.Sink, name string, at time.Time, value any) error
 
-	connected atomic.Bool
-	malformed atomic.Uint64
-	reconnect atomic.Uint64
-	mu        sync.RWMutex
-	lastAt    time.Time
-	lastErr   string
-	writeErr  error
+	connected     atomic.Bool
+	malformed     atomic.Uint64
+	droppedQuotes atomic.Uint64
+	reconnect     atomic.Uint64
+	mu            sync.RWMutex
+	lastAt        time.Time
+	lastErr       string
+	writeErr      error
 }
 
 func New(cfg Config) (*Module, error) {
@@ -76,7 +79,7 @@ func New(cfg Config) (*Module, error) {
 		return nil, errors.New("kismockws: at least one domestic symbol is required")
 	}
 	if cfg.FuturesNoticeTR == "" {
-		cfg.FuturesNoticeTR = TRFuturesNotice
+		cfg.FuturesNoticeTR = TRFuturesNoticeAlt
 	}
 	if cfg.FuturesNoticeTR != TRFuturesNotice && cfg.FuturesNoticeTR != TRFuturesNoticeAlt {
 		return nil, errors.New("kismockws: unsupported futures notice TR")
@@ -125,7 +128,7 @@ func (m *Module) Health() Health {
 	lastAt, lastErr := m.lastAt, m.lastErr
 	m.mu.RUnlock()
 	return Health{Connected: m.connected.Load(), LastReceivedAt: lastAt,
-		MalformedFrames: m.malformed.Load(), Reconnects: m.reconnect.Load(), LastError: lastErr}
+		DroppedQuotes: m.droppedQuotes.Load(), MalformedFrames: m.malformed.Load(), Reconnects: m.reconnect.Load(), LastError: lastErr}
 }
 
 // Run owns one VTS reader and the append-only recording sink until ctx ends.
@@ -140,8 +143,23 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
+	initialDrops := m.droppedQuotes.Load()
+	quoteEvents := make(chan ws.Event, quoteQueueSize)
+	quoteWriterDone := make(chan struct{})
+	go func() {
+		defer close(quoteWriterDone)
+		for event := range quoteEvents {
+			m.recordQuote(sink, event, cancel)
+		}
+	}()
 	quotes := func(event ws.Event) {
-		m.recordQuote(sink, event, cancel)
+		// The socket reader never waits for the quote recorder. Keep the
+		// queued quotes and drop the incoming quote on overflow.
+		select {
+		case quoteEvents <- event:
+		default:
+			m.droppedQuotes.Add(1)
+		}
 	}
 	attachErr := make(chan error, 1)
 	attachStarted := atomic.Bool{}
@@ -231,7 +249,12 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		if attachStarted.Load() {
 			<-attachDone
 		}
+		close(quoteEvents)
 		drain()
+		<-quoteWriterDone
+		if dropped := m.droppedQuotes.Load() - initialDrops; dropped > 0 {
+			m.cfg.Logger.Warn("KIS mock quote recording queue overflowed", "dropped_quotes", dropped)
+		}
 		m.connected.Store(false)
 		var subscriptionErr error
 		select {
@@ -360,11 +383,9 @@ func (m *Module) append(sink *recording.Sink, name string, at time.Time, value a
 	}
 	appendRecord := m.appendRecord
 	if appendRecord == nil {
-		appendRecord = func(stream string, at time.Time, value any) error {
-			return record(sink, stream, at, value)
-		}
+		appendRecord = record
 	}
-	if err := appendRecord(name, at, value); err != nil {
+	if err := appendRecord(sink, name, at, value); err != nil {
 		m.setWriteError(err)
 		m.setError("recording append failed")
 		if m.cfg.Logger != nil {
@@ -378,7 +399,9 @@ func (m *Module) append(sink *recording.Sink, name string, at time.Time, value a
 
 func (m *Module) received(at time.Time) {
 	m.mu.Lock()
-	m.lastAt = at
+	if at.After(m.lastAt) {
+		m.lastAt = at
+	}
 	m.mu.Unlock()
 }
 

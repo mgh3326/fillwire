@@ -187,18 +187,27 @@ func dial(ctx context.Context, endpoint string, headers http.Header) (Socket, in
 	return conn, response.StatusCode, nil
 }
 
-func (r *Reader) Run(ctx context.Context) error {
+func (r *Reader) Run(ctx context.Context) (runErr error) {
 	if !r.running.CompareAndSwap(false, true) {
 		return errors.New("Toss WS reader is already running")
 	}
 	defer r.running.Store(false)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	r.quoteRecords = make(chan Record, quoteQueueSize)
 	quoteWriterDone := make(chan struct{})
+	quoteWriteFailed := false
 	go func() {
 		defer close(quoteWriterDone)
 		for record := range r.quoteRecords {
+			if quoteWriteFailed {
+				r.dropQuote("recorder stopped")
+				continue
+			}
 			if err := r.cfg.AppendQuote(record); err != nil {
+				quoteWriteFailed = true
 				r.dropQuote("append failed")
+				cancel()
 			}
 		}
 	}()
@@ -206,6 +215,13 @@ func (r *Reader) Run(ctx context.Context) error {
 		close(r.quoteRecords)
 		<-quoteWriterDone
 		r.quoteRecords = nil
+		if quoteWriteFailed {
+			if runErr == context.Canceled {
+				runErr = ErrRecord
+			} else {
+				runErr = errors.Join(runErr, ErrRecord)
+			}
+		}
 	}()
 	var rejected string
 	var recoveryStarted time.Time

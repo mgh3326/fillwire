@@ -1,11 +1,13 @@
 package kismockws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -129,13 +131,13 @@ func TestModuleUsesVTSAndMockTRRegistrations(t *testing.T) {
 	transport.mu.Lock()
 	got := slices.Clone(transport.trs)
 	transport.mu.Unlock()
-	for _, tr := range []string{"H0STCNI9", "H0STCNT0", "H0STASP0", TROverseasNotice, "H0IFCNI9"} {
+	for _, tr := range []string{"H0STCNI9", "H0STCNT0", "H0STASP0", TROverseasNotice, "H0IFCNI0"} {
 		if !slices.Contains(got, tr) {
 			t.Errorf("subscriptions %v missing %s", got, tr)
 		}
 	}
-	if slices.Contains(got, "H0IFCNI0") {
-		t.Errorf("default subscriptions unexpectedly contain H0IFCNI0: %v", got)
+	if slices.Contains(got, "H0IFCNI9") {
+		t.Errorf("default subscriptions unexpectedly contain H0IFCNI9: %v", got)
 	}
 }
 
@@ -144,7 +146,7 @@ func TestModuleUsesConfiguredFuturesNoticeTR(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	module, err := New(Config{
 		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
-		FuturesNoticeTR: TRFuturesNoticeAlt, RecordingDirectory: t.TempDir(),
+		FuturesNoticeTR: TRFuturesNotice, RecordingDirectory: t.TempDir(),
 		Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
 		Dialer: ws.DialerFunc(func(_ context.Context, _ string) (ws.Transport, error) { return transport, nil }),
 	})
@@ -175,8 +177,8 @@ func TestModuleUsesConfiguredFuturesNoticeTR(t *testing.T) {
 	transport.mu.Lock()
 	got := slices.Clone(transport.trs)
 	transport.mu.Unlock()
-	if !slices.Contains(got, TRFuturesNoticeAlt) || slices.Contains(got, TRFuturesNotice) {
-		t.Fatalf("subscriptions = %v, want configured TR %s only", got, TRFuturesNoticeAlt)
+	if !slices.Contains(got, TRFuturesNotice) || slices.Contains(got, TRFuturesNoticeAlt) {
+		t.Fatalf("subscriptions = %v, want configured TR %s only", got, TRFuturesNotice)
 	}
 }
 
@@ -190,7 +192,7 @@ func TestModuleReturnsRecordingErrorAfterAppendFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	module.appendRecord = func(string, time.Time, any) error { return errors.New("disk full") }
+	module.appendRecord = func(*recording.Sink, string, time.Time, any) error { return errors.New("disk full") }
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -243,7 +245,7 @@ func TestModuleCanSelectLegacyFuturesTR(t *testing.T) {
 	defer cancel()
 	module, err := New(Config{
 		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
-		FuturesNoticeTR: TRFuturesNoticeAlt, RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		FuturesNoticeTR: TRFuturesNotice, RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
 		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
 	})
 	if err != nil {
@@ -258,8 +260,8 @@ func TestModuleCanSelectLegacyFuturesTR(t *testing.T) {
 		got := slices.Clone(transport.trs)
 		transport.mu.Unlock()
 		if count == 5 {
-			if !slices.Contains(got, TRFuturesNoticeAlt) {
-				t.Fatalf("subscriptions %v lack configurable futures TR %s", got, TRFuturesNoticeAlt)
+			if !slices.Contains(got, TRFuturesNotice) {
+				t.Fatalf("subscriptions %v lack configurable futures TR %s", got, TRFuturesNotice)
 			}
 			break
 		}
@@ -365,5 +367,115 @@ func TestSubscribeRegistrationTreatsShutdownAsClean(t *testing.T) {
 	got := <-result
 	if got.err != nil || !got.canceled {
 		t.Fatalf("shutdown subscription result = (%v, %v), want (nil, true)", got.err, got.canceled)
+	}
+}
+
+type blockingQuoteRecord struct {
+	value   any
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (r blockingQuoteRecord) MarshalJSON() ([]byte, error) {
+	close(r.started)
+	<-r.release
+	return json.Marshal(r.value)
+}
+
+func TestSlowQuoteWriterDropsOverflowAndDrains(t *testing.T) {
+	var logs bytes.Buffer
+	transport := newAckTransport()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	module, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoteStarted, releaseQuote, noticeWritten := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	quotesWritten, noticesWritten := 0, 0
+	const noticeCount = readerOutputBuffer + 2
+	module.appendRecord = func(sink *recording.Sink, name string, at time.Time, value any) error {
+		if name == quoteRecordingName && quotesWritten == 0 {
+			value = blockingQuoteRecord{value: value, started: quoteStarted, release: releaseQuote}
+		}
+		if err := record(sink, name, at, value); err != nil {
+			return err
+		}
+		if name == quoteRecordingName {
+			quotesWritten++
+		} else if name == futuresRecordingName {
+			noticesWritten++
+			if noticesWritten == noticeCount {
+				close(noticeWritten)
+			}
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- module.Run(ctx) }()
+	defer func() {
+		cancel()
+		close(releaseQuote)
+		if err := <-done; err != nil {
+			t.Errorf("Run: %v", err)
+		}
+		if !t.Failed() {
+			if quotesWritten != quoteQueueSize+1 {
+				t.Errorf("recorded %d quotes, want one in flight plus %d queued", quotesWritten, quoteQueueSize)
+			}
+			if !strings.Contains(logs.String(), "dropped_quotes=2") {
+				t.Error("shutdown log did not report the two discarded quotes")
+			}
+		}
+	}()
+	for {
+		transport.mu.Lock()
+		count := len(transport.trs)
+		transport.mu.Unlock()
+		if count == 5 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("subscriptions did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	fields := make([]string, 46)
+	fields[0], fields[1] = "005930", "100203"
+	fields[2], fields[12], fields[13], fields[21] = "100", "1", "1", "1"
+	frame := []byte("0|H0STCNT0|001|" + strings.Join(fields, "^"))
+	transport.reads <- frame
+	select {
+	case <-quoteStarted:
+	case <-ctx.Done():
+		t.Fatal("quote writer did not start")
+	}
+	for i := 0; i < quoteQueueSize+2; i++ {
+		select {
+		case transport.reads <- frame:
+		case <-ctx.Done():
+			t.Fatal("blocked quote writer stalled the reader")
+		}
+	}
+	noticeFields := make([]string, 22)
+	noticeFields[5], noticeFields[11], noticeFields[12], noticeFields[13] = "0", "0", "2", "2"
+	noticeFrame := []byte("0|" + TRFuturesNoticeAlt + "|001|" + strings.Join(noticeFields, "^"))
+	for i := 0; i < noticeCount; i++ {
+		select {
+		case transport.reads <- noticeFrame:
+		case <-ctx.Done():
+			t.Fatal("blocked quote write stalled socket draining")
+		}
+	}
+	select {
+	case <-noticeWritten:
+	case <-ctx.Done():
+		t.Fatal("blocked quote writer stalled notice processing")
 	}
 }

@@ -159,7 +159,7 @@ func TestMalformedNoticeIsRecordedAndWriteFailureCancels(t *testing.T) {
 		t.Fatalf("malformed recording = %#v", got)
 	}
 	canceled := false
-	module.appendRecord = func(string, time.Time, any) error { return errors.New("disk full") }
+	module.appendRecord = func(*recording.Sink, string, time.Time, any) error { return errors.New("disk full") }
 	if module.append(sink, overseasRecordingName, at, got, func() { canceled = true }) {
 		t.Fatal("failed append reported success")
 	}

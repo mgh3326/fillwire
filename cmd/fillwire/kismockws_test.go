@@ -66,6 +66,12 @@ recording_directory = "recordings"
 }
 
 func TestKISMockWSCommandExitCodes(t *testing.T) {
+	if got := dispatch([]string{"kis-mock-ws", "-h"}); got != 0 {
+		t.Fatalf("help exit code = %d, want 0", got)
+	}
+	if got := dispatch([]string{"kis-mock-ws", "-unknown"}); got != 2 {
+		t.Fatalf("unknown flag exit code = %d, want 2", got)
+	}
 	if got := kisMockWSCommandExitCode(errKISMockWSUsage); got != 2 {
 		t.Fatalf("usage exit code = %d, want 2", got)
 	}
