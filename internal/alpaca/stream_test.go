@@ -147,6 +147,37 @@ func TestReconnectDelayResetsAfterStableConnection(t *testing.T) {
 	}
 }
 
+func TestMixedMarketBatchDoesNotDropValidSiblings(t *testing.T) {
+	batch, err := os.ReadFile(filepath.Join("testdata", "market_batch.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := &fakeSocket{reads: []readResult{
+		{websocket.MessageText, []byte(`[{"T":"success","msg":"authenticated"}]`), nil},
+		{websocket.MessageText, []byte(`[{"T":"subscription","trades":["AAPL"]}]`), nil},
+		{websocket.MessageText, batch, nil},
+	}}
+	module := newTestModule(t, func(context.Context, string, http.Header) (Socket, error) { return socket, nil })
+	_ = module.session(context.Background(), "market_data", IEXEndpoint, "key", "secret")
+	path := filepath.Join(module.cfg.Root, MarketStream, module.cfg.Now().UTC().Format("2006-01-02"), "market_data.jsonl")
+	records := readRecords(t, path)
+	want := []string{"trade", "quote", "bar", "correction", "cancel_error"}
+	if len(records) != len(want) {
+		t.Fatalf("recorded batch elements = %d, want %d valid siblings", len(records), len(want))
+	}
+	for i := range want {
+		if records[i].Kind != want[i] {
+			t.Errorf("record %d kind = %q, want %q", i, records[i].Kind, want[i])
+		}
+		if records[i].ReceivedAt.IsZero() {
+			t.Errorf("record %d has zero received_at", i)
+		}
+	}
+	if got := module.malformed.Load(); got != 1 {
+		t.Fatalf("malformed elements = %d, want 1", got)
+	}
+}
+
 func TestPingFailureClosesSilentSession(t *testing.T) {
 	socket := &blockingSocket{fakeSocket: &fakeSocket{reads: []readResult{
 		{websocket.MessageText, []byte(`[{"T":"success","msg":"authenticated"}]`), nil},
@@ -155,9 +186,12 @@ func TestPingFailureClosesSilentSession(t *testing.T) {
 	module := newTestModule(t, func(context.Context, string, http.Header) (Socket, error) { return socket, nil })
 	module.cfg.PingInterval = time.Millisecond
 	module.cfg.PingTimeout = time.Second
-	err := module.session(context.Background(), "market_data", IEXEndpoint, "key", "secret")
-	if !errors.Is(err, errPing) {
-		t.Fatalf("session error = %v, want ping failure", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_ = module.session(ctx, "market_data", IEXEndpoint, "key", "secret")
+	if elapsed := time.Since(started); elapsed >= 100*time.Millisecond {
+		t.Fatalf("silent session took %s to close after ping failure", elapsed)
 	}
 }
 
@@ -181,7 +215,9 @@ func TestRecordingFailureReturnsCauseAndStopsBothStreams(t *testing.T) {
 		}
 		return trade, nil
 	})
-	err := module.Run(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := module.Run(ctx)
 	if !errors.Is(err, ErrRecordingAppend) || !errors.Is(err, syscall.ENOTDIR) {
 		t.Fatalf("Run error = %v, want recording append error with ENOTDIR cause", err)
 	}
