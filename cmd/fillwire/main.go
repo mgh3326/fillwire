@@ -356,6 +356,8 @@ func runWithDependencies(ctx context.Context, cfg runtimeConfig, logger *slog.Lo
 	quotes := startQuoteLane(cfg, logger, dependencies)
 	upbitRecorder := startUpbitLane(cfg.upbit, logger)
 	defer upbitRecorder.halt()
+	stopTossWS := startTossWS(ctx, cfg.tossWS, logger)
+	defer stopTossWS()
 	defer quotes.halt()
 
 	var (
