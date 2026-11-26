@@ -231,10 +231,11 @@ func TestRecordingFailureStopsRunAndCountsOnce(t *testing.T) {
 		}
 	case <-time.After(250 * time.Millisecond):
 		cancel()
-		err := <-done
-		if err == nil || errors.Is(err, context.Canceled) {
-			t.Fatalf("reader continued after failed append; Run returned %v", err)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
 		}
+		t.Fatal("reader did not stop promptly after failed append")
 	}
 	if got := r.Health().RecordErrors; got != 1 {
 		t.Fatalf("record errors = %d, want one", got)
