@@ -309,3 +309,42 @@ func tossPythonCompatiblePayload(value string) bool {
 	return json.Unmarshal(accessToken, &token) == nil && token != "" &&
 		json.Unmarshal(expiresAt, &expiry) == nil
 }
+
+type cancelingTossIssuer struct{ cancel context.CancelFunc }
+
+func (issuer cancelingTossIssuer) Issue(context.Context, string, string) (OAuthToken, error) {
+	issuer.cancel()
+	return OAuthToken{AccessToken: "synthetic-replacement", ExpiresIn: 3600}, nil
+}
+
+type cancellationAwareRedisStore struct{ *fakeRedisStore }
+
+func (store cancellationAwareRedisStore) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return store.fakeRedisStore.Set(ctx, key, value, ttl)
+}
+
+func TestTossEnsureReplacingPublishesAfterCallerCancellation(t *testing.T) {
+	now := testGatewayNow()
+	rawStore := newFakeRedisStore(func() time.Time { return now })
+	store := cancellationAwareRedisStore{rawStore}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	service := newTestEnsureServiceForProvider(t, store, cancelingTossIssuer{cancel}, now, ProviderToss)
+	rawStore.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+
+	state, err := service.EnsureReplacing(ctx, tokenSHA256("fresh-cache-token"))
+	if err != nil || state != EnsureStateIssued {
+		t.Fatalf("replacement publication after cancellation: state=%q, error=%v", state, err)
+	}
+	token, fresh, loadErr := loadTossCachedToken(t.Context(), store, service.CacheKey, now)
+	if loadErr != nil || !fresh || token != "synthetic-replacement" {
+		t.Fatal("cache did not contain the newly issued replacement")
+	}
+	locked := rawStore.savedWhileLocked()
+	if len(locked) != 1 || !locked[0] {
+		t.Fatal("replacement was not published while the lock was held")
+	}
+}

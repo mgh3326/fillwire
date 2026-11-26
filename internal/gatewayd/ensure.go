@@ -177,6 +177,7 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 	if err != nil {
 		return "", errEnsureUnavailable
 	}
+	lockStarted := time.Now()
 	locked, err := service.Store.SetNX(ctx, service.LockKey, lockValue, lockTTL)
 	if err != nil {
 		return "", errEnsureUnavailable
@@ -216,7 +217,19 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 	// Toss permits one valid token per client. A successful reissue invalidates
 	// the previous token, so publish the replacement while still owning this
 	// shared lock before any Python consumer can observe an unlocked stale key.
-	if err := service.Store.Set(ctx, service.CacheKey, payload, providerCacheTTL(service.Provider, issued.ExpiresIn)); err != nil {
+	publishCtx := ctx
+	if service.Provider == ProviderToss && rejectedSHA != "" {
+		// Once Toss has issued the replacement, caller cancellation must not
+		// strand the invalidated token in Redis. Bound publication by the lease.
+		deadline := time.Now().Add(redisDialTimeout)
+		if leaseEnd := lockStarted.Add(lockTTL); leaseEnd.Before(deadline) {
+			deadline = leaseEnd
+		}
+		var cancel context.CancelFunc
+		publishCtx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+		defer cancel()
+	}
+	if err := service.Store.Set(publishCtx, service.CacheKey, payload, providerCacheTTL(service.Provider, issued.ExpiresIn)); err != nil {
 		return "", errEnsureUnavailable
 	}
 	return EnsureStateIssued, nil
