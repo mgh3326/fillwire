@@ -180,8 +180,8 @@ func (store *Store) FindCancelAttempt(ctx context.Context, commandID string) (Ca
 }
 
 // FindCancelTarget returns only orders whose effective disposition is
-// ACCEPTED and whose broker order id is known. UNKNOWN and NOT_CREATED are
-// deliberately indistinguishable to callers: neither can safely be cancelled.
+// ACCEPTED and whose broker order ID is known. KIS resolution rows from older
+// releases can contain heuristic matches and cannot authorize cancellation.
 func (store *Store) FindCancelTarget(ctx context.Context, commandID string) (CancelTarget, bool, error) {
 	if store == nil || store.db == nil {
 		return CancelTarget{}, false, errors.New("store unavailable")
@@ -196,8 +196,9 @@ func (store *Store) FindCancelTarget(ctx context.Context, commandID string) (Can
 		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
 		LEFT JOIN command_contexts x ON x.command_id = c.command_id
 		WHERE c.command_id = ? AND COALESCE(r.disposition, c.disposition) = 'ACCEPTED'
+			AND (r.command_id IS NULL OR COALESCE(c.account_scope, '') NOT IN (?, ?))
 			AND COALESCE(CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END, '') <> ''
-	`, commandID).Scan(&target.CommandID, &target.AccountScope, &target.BrokerOrderID, &krxForwardOrderOrgNo, &side, &stockCode, &quantity, &price)
+	`, commandID, executioncontracts.AccountScopeKISMock, executioncontracts.AccountScopeKISMockUS).Scan(&target.CommandID, &target.AccountScope, &target.BrokerOrderID, &krxForwardOrderOrgNo, &side, &stockCode, &quantity, &price)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CancelTarget{}, false, nil
 	}

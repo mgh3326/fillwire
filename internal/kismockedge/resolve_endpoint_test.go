@@ -73,6 +73,23 @@ func TestResolveEndpointReportsCandidateWithoutCancelTarget(t *testing.T) {
 	}
 }
 
+func TestLegacyKISHistoryResolutionCannotAuthorizeCancel(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
+	service := resolveTestService(t, store, fakeOrderHistoryReader{})
+	ctx := context.Background()
+	receipt, err := service.Process(ctx, testCommand("legacy-heuristic-match"))
+	if err != nil || receipt.Disposition != executioncontracts.DispositionUnknown {
+		t.Fatalf("initial receipt = %+v err=%v", receipt, err)
+	}
+	if _, err := store.ResolveUnknown(ctx, receipt.CommandID, executioncontracts.DispositionAccepted, "9001", "", resolveTestNow); err != nil {
+		t.Fatal(err)
+	}
+	target, found, err := store.FindCancelTarget(ctx, receipt.CommandID)
+	if err != nil || found {
+		t.Fatalf("legacy heuristic cancel target = %+v found=%t err=%v", target, found, err)
+	}
+}
+
 func TestResolveEndpointForeignOrderNeverMatches(t *testing.T) {
 	// A same-symbol foreign order with a different price must never evidence
 	// this command: matching is by the command's own stored facts, never by

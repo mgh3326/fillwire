@@ -86,7 +86,8 @@ already allowlisted, GET-only VTS domestic daily-order history endpoint
 (`VTTC8001R`) and appends a resolution record; it does not alter the original
 receipt. Side, stock, quantity, price, and the five-minute send window
 identify candidates only. A matching candidate leaves the receipt `UNKNOWN`
-and cannot authorize cancellation. A successful complete query with no corresponding
+and cannot authorize cancellation. Historical KIS resolution rows also cannot
+authorize cancellation. A successful complete query with no corresponding
 order may yield `NOT_CREATED/resolved_absent` only after a ten-minute grace
 period. Query failure, ambiguous matches, and an unexpired grace period remain
 `UNKNOWN` without a resolution record. Legacy receipt rows that predate stored
