@@ -2,6 +2,7 @@ package nhplugws
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -59,5 +60,18 @@ func TestOAuthTokenSourceUsesSDKApprovalFormAndCaches(t *testing.T) {
 func TestOAuthEndpointIsPinnedToNHPLUGAuthHost(t *testing.T) {
 	if OAuthEndpoint != "https://api.nhplug.com:8443/oauth2/token" {
 		t.Fatalf("OAuth endpoint = %q", OAuthEndpoint)
+	}
+}
+
+func TestOAuthUnauthorizedResponseIsPermanentCredentialError(t *testing.T) {
+	source, err := NewOAuthTokenSource("fixture-key", "fixture-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})}
+	if _, err := source.Token(context.Background()); !errors.Is(err, ErrOAuthCredentialsRejected) {
+		t.Fatalf("unauthorized token error = %v", err)
 	}
 }

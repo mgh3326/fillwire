@@ -205,7 +205,8 @@ func (r *Reader) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if errors.Is(err, ErrAppend) {
+		if errors.Is(err, ErrAppend) || errors.Is(err, ErrOAuthCredentialsRejected) {
+			r.lastError.Store(err.Error())
 			return err
 		}
 		if err != nil {

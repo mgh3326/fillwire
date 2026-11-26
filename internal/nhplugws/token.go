@@ -19,6 +19,8 @@ const (
 	tokenLeeway   = time.Minute
 )
 
+var ErrOAuthCredentialsRejected = errors.New("NHPLUG OAuth credentials were rejected")
+
 // OAuthTokenSource follows the NH SDK client-credentials approval exchange.
 // It retains credentials and tokens only in memory and never includes either
 // in returned errors.
@@ -67,6 +69,9 @@ func (s *OAuthTokenSource) Token(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return "", fmt.Errorf("%w: HTTP %d", ErrOAuthCredentialsRejected, resp.StatusCode)
+		}
 		return "", fmt.Errorf("NHPLUG OAuth token request returned HTTP %d", resp.StatusCode)
 	}
 	var payload struct {

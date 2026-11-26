@@ -258,6 +258,25 @@ func TestAppendFailureIsFatal(t *testing.T) {
 	}
 }
 
+func TestPermanentOAuthCredentialFailureStopsReader(t *testing.T) {
+	reader, err := New(Config{
+		UserID: "user",
+		Token: func(context.Context) (string, error) {
+			return "", ErrOAuthCredentialsRejected
+		},
+		Append:   func(Record) error { return nil },
+		RetryMin: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := reader.Run(ctx); !errors.Is(err, ErrOAuthCredentialsRejected) {
+		t.Fatalf("reader error = %v", err)
+	}
+}
+
 func TestNotificationAcknowledgementTimeoutAndPingFailureReconnect(t *testing.T) {
 	t.Run("ack timeout", func(t *testing.T) {
 		socket := &fakeSocket{writeSignal: make(chan struct{}, 1)}
