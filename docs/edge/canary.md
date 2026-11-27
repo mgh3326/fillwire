@@ -39,6 +39,100 @@ run writes its result as one JSON object to stdout. Set `CANARY_TEXTFILE_DIR` (d
 `/var/lib/node_exporter/textfile`) to expose the atomically replaced
 `broker_edge_canary.prom` node_exporter textfile.
 
+## Cancel pacing
+
+Every cancel dispatch waits until at least `1.1 s` has passed since the most
+recent edge response, so the place acknowledgement and the cancel are never
+back to back. A live run had its cancel refused with `EGW00201`
+(`초당 거래건수를 초과하였습니다`, HTTP 500, `rt_cd` 1) only 88 ms after the place
+ack. The KIS mock per-second order limit could not be confirmed from a primary
+source: community sources disagree (about 2 versus 5 requests per second). The
+`1.1 s` value is the fallback that covers a one-request-per-second window. It
+applies to both the normal cancel and the post-check cleanup. The wait is not
+charged to `durations_ms.cancel_sent`. If the run deadline passes during that
+wait, the cancel still runs on a context detached from the deadline and bounded
+by the cancel budget, so an acknowledged order always gets its cancel attempt.
+
+## Carry-over of an unconfirmed cancel
+
+A cancel can end without a confirmed answer while the order still rests on the
+broker: a broker answer the edge could not classify (`UNKNOWN`), a throttle
+rejection (`REJECTED_THROTTLED`), a cancel that never reached the edge, or a
+pre-send failure that wrote no marker. Before any placement, each run asks the
+edge for this scope's unconfirmed canary commands in the current trading day:
+
+`GET /v1/cancel-carryover?scope=<kis_mock|kis_mock_us>&placed_from=<RFC3339>&placed_before=<RFC3339>&command_prefix=broker-edge-canary%3A`
+
+The window is the scope's exchange trading day: the Seoul day for `kis_mock`,
+the New York day for `kis_mock_us`. The edge lists accepted canary commands on
+that scope whose latest cancel is absent, `UNKNOWN`, or `REJECTED_THROTTLED`.
+Each candidate carries `actionable`, which is true only when a cancel can reach
+the broker: a never-sent command, or a `REJECTED_THROTTLED` one still under the
+attempt cap. An order resolved by command-scoped evidence is never actionable.
+A place left `UNKNOWN` (its outcome never settled and no resolution recorded) is
+listed too, as not actionable, so placement stays blocked until the day ends. When the list is empty, the run
+continues normally. When it is not empty, the run:
+
+- makes one cancel attempt for the first candidate the edge marks
+  `actionable` (its `POST /v1/commands/{command_id}/cancel`); when none is
+  actionable, it sends nothing;
+- places nothing in that run;
+- exits `1` with `outcome=carry_over_pending`, whatever the cancel answered,
+  because a carried-over cancel is not proof that a place works now.
+
+The result carries `carry_over.pending` (the count listed),
+`carry_over.command_id`, and `carry_over.cancel_state`. A lookup that fails,
+returns a non-200 response, lacks the `candidates` key, or lists a command
+outside the canary prefix or the requested scope, or with an unexpected cancel
+state, ends with `outcome=carry_over_check_failed`, exits `1`, and places
+nothing.
+
+**Release.** A candidate stops blocking the canary at the end of its trading
+day, because the window moves on. Day orders are assumed to lapse at the close
+of their session. That assumption is not verified against KIS mock behaviour
+and is recorded as an open item. Within the day, an `UNKNOWN` candidate blocks
+placement until the trading day ends.
+
+## Edge send contract for a cancel
+
+The edge's cancel contract, in `docs/edge/kis-mock-edge.md`, decides whether a
+carried-over cancel is sent:
+
+- A cancel attempt is a row in `cancel_attempts` keyed by command and attempt
+  number. The row is committed as a pending `UNKNOWN` marker before the send.
+- A re-send happens only after the latest attempt is `REJECTED_THROTTLED`. That
+  state is recorded only for a KIS mock HTTP 500 with `rt_cd` 1 and `msg_cd`
+  `EGW00201`: the broker did not process the request. A re-send waits at least
+  1.1 s after the previous attempt.
+- At most three cancel attempts per command, the first included.
+- Every other answer (any other error, timeout, or unreadable reply) is stored
+  `UNKNOWN` and is replayed without a broker call. It is never re-sent.
+- Placement is never re-sent.
+
+## Rollout order
+
+The canary and the edge must agree on `GET /v1/cancel-carryover`. Upgrade the
+edge before the canary. Roll the canary back before the edge. An edge that lacks
+the route answers `404`, so every in-session run ends `carry_over_check_failed`
+without placing. The `/metrics` gate does not detect this skew.
+
+**The `cancel_attempts` migration is forward-only.** On first start, this edge
+rebuilds `cancel_attempts` in place, keyed by (`command_id`, `attempt_no`). The
+`main` edge (b257db5) inserts with `ON CONFLICT(command_id)`, which has no
+matching unique constraint after the migration, so every new cancel marker
+would fail as `storage_failure` with no broker send. Rolling the edge back to
+`main` therefore leaves canary orders resting with no record. Before deploying
+this revision, stop the edge and back up `edge.sqlite`. Restoring that backup is
+the only supported way back to a pre-migration edge. This is a documentation
+requirement only; no test covers the rollback.
+
+## Overall deadline
+
+`Run` creates one overall deadline and passes it to both the carry-over check
+and the normal run. The carry-over lookup and its cancel therefore count
+against `OverallTimeout`. The normal run's worst chain is band 20 + place 25 +
+check 25 + cancel 25 + pacing 1.1, which is 96.1 s and inside the 120 s budget.
+
 ## Timeouts
 
 Every stage carries its own deadline and the whole run carries one overall
@@ -53,7 +147,7 @@ consume the placement budget and a hung stage could hold the run forever.
 | place (`place_sent`) | shared 15s | 25s | the edge's broker send is likewise ~10s-capped; 25s lets the edge's own receipt arrive instead of a local transport timeout |
 | resolve check (`check`) | — (did not exist) | 25s | one edge-side evidence read plus a small write margin |
 | cancel (`cancel_sent`) | shared 15s | 25s | same broker-side bound as place |
-| overall run | none | 120s | covers the worst-case band+place+check+cancel chain (95s) with margin |
+| overall run | none | 120s | one deadline in `Run` covers carry-over and the normal run; worst-case band+place+check+cancel+pacing chain is 96.1s |
 
 ## Evidence on every outcome line
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
 )
@@ -134,6 +135,42 @@ func NewHandler(service *Service) http.Handler {
 		writer.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(writer).Encode(check)
 	})
+	// GET /v1/cancel-carryover lists canary commands on one KIS mock scope whose
+	// cancel is not confirmed, placed inside one trading-day window. Read-only.
+	mux.HandleFunc("GET /v1/cancel-carryover", func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		from, fromErr := time.Parse(time.RFC3339, query.Get("placed_from"))
+		before, beforeErr := time.Parse(time.RFC3339, query.Get("placed_before"))
+		scope := query.Get("scope")
+		prefix := query.Get("command_prefix")
+		if len(query) != 4 || (scope != executioncontracts.AccountScopeKISMock && scope != executioncontracts.AccountScopeKISMockUS) ||
+			fromErr != nil || beforeErr != nil || !before.After(from) || !validCancelPrefix(prefix) {
+			writeShadowError(writer, http.StatusBadRequest, ErrorInvalidCommand)
+			return
+		}
+		candidates, err := service.CancelCarryOverCandidates(request.Context(), scope, prefix, from, before)
+		if err != nil {
+			writeShadowError(writer, http.StatusInternalServerError, ErrorStorageFailure)
+			return
+		}
+		type candidateJSON struct {
+			CommandID    string `json:"command_id"`
+			AccountScope string `json:"account_scope"`
+			PlacedAt     string `json:"placed_at"`
+			Attempts     int    `json:"attempts"`
+			CancelState  string `json:"cancel_state"`
+			Actionable   bool   `json:"actionable"`
+			Disposition  string `json:"disposition"`
+		}
+		out := make([]candidateJSON, 0, len(candidates))
+		for _, candidate := range candidates {
+			out = append(out, candidateJSON{CommandID: candidate.CommandID, AccountScope: candidate.AccountScope, PlacedAt: candidate.PlacedAt, Attempts: candidate.Attempts, CancelState: candidate.LatestState, Actionable: candidate.Actionable(), Disposition: candidate.Disposition})
+		}
+		writer.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(writer).Encode(struct {
+			Candidates []candidateJSON `json:"candidates"`
+		}{Candidates: out})
+	})
 	mux.HandleFunc("POST /v1/commands/{command_id}/cancel", func(writer http.ResponseWriter, request *http.Request) {
 		receipt, err := service.Cancel(request.Context(), request.PathValue("command_id"))
 		if err != nil {
@@ -204,6 +241,20 @@ func writeShadowError(writer http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(writer).Encode(struct {
 		ErrorCode string `json:"error_code"`
 	}{ErrorCode: strings.TrimSpace(code)})
+}
+
+// validCancelPrefix accepts a short printable-ASCII prefix. The listing is
+// scoped by prefix, so an empty prefix would list every mock cancel marker.
+func validCancelPrefix(prefix string) bool {
+	if prefix == "" || len(prefix) > 64 {
+		return false
+	}
+	for _, character := range prefix {
+		if character <= ' ' || character > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 func writeCancelReceipt(writer http.ResponseWriter, status int, receipt CancelReceipt) {

@@ -107,12 +107,18 @@ func OpenStore(path string) (*Store, error) {
 		)
 		;
 		CREATE TABLE IF NOT EXISTS cancel_attempts (
-			command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
-			state TEXT NOT NULL CHECK (state IN ('CANCELLED', 'NOT_FOUND', 'UNKNOWN')),
+			command_id TEXT NOT NULL REFERENCES commands(command_id),
+			attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+			state TEXT NOT NULL CHECK (state IN ('CANCELLED', 'NOT_FOUND', 'UNKNOWN', 'REJECTED_THROTTLED')),
 			error_code TEXT,
-			recorded_at TEXT NOT NULL
+			recorded_at TEXT NOT NULL,
+			PRIMARY KEY (command_id, attempt_no)
 		)
 	`); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	if err := migrateCancelAttempts(database); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
@@ -130,10 +136,14 @@ const (
 	CancelStateCancelled CancelState = "CANCELLED"
 	CancelStateNotFound  CancelState = "NOT_FOUND"
 	CancelStateUnknown   CancelState = "UNKNOWN"
+	// CancelStateRejectedThrottled is a broker answer the edge may re-send: a KIS
+	// per-second throttle (HTTP 500, rt_cd 1, msg_cd EGW00201) means the broker
+	// did not process the cancel.
+	CancelStateRejectedThrottled CancelState = "REJECTED_THROTTLED"
 )
 
 func (state CancelState) Valid() bool {
-	return state == CancelStateCancelled || state == CancelStateNotFound || state == CancelStateUnknown
+	return state == CancelStateCancelled || state == CancelStateNotFound || state == CancelStateUnknown || state == CancelStateRejectedThrottled
 }
 
 // CancelReceipt is the replayable result of cancelling an accepted command.
@@ -160,23 +170,108 @@ type CancelTarget struct {
 	Price                string
 }
 
-func (store *Store) FindCancelAttempt(ctx context.Context, commandID string) (CancelReceipt, bool, error) {
+// CancelAttempt is one durable broker cancel attempt. AttemptNo orders the
+// attempts of one command. A later attempt can exist only after the earlier
+// one was recorded as REJECTED_THROTTLED, and no command gets more than
+// maxCancelAttempts broker sends.
+type CancelAttempt struct {
+	CancelReceipt
+	AttemptNo int
+}
+
+// maxCancelAttempts caps broker cancel sends per command, the first included.
+const maxCancelAttempts = 3
+
+// FindLatestCancelAttempt returns the command's highest-numbered attempt.
+func (store *Store) FindLatestCancelAttempt(ctx context.Context, commandID string) (CancelAttempt, bool, error) {
+	return store.findCancelAttempt(ctx, commandID, 0)
+}
+
+// findCancelAttempt returns one attempt, or the latest when attemptNo is 0.
+func (store *Store) findCancelAttempt(ctx context.Context, commandID string, attemptNo int) (CancelAttempt, bool, error) {
 	if store == nil || store.db == nil {
-		return CancelReceipt{}, false, errors.New("store unavailable")
+		return CancelAttempt{}, false, errors.New("store unavailable")
 	}
-	var receipt CancelReceipt
-	err := store.db.QueryRowContext(ctx, `SELECT command_id, state, COALESCE(error_code, ''), recorded_at FROM cancel_attempts WHERE command_id = ?`, commandID).
-		Scan(&receipt.CommandID, &receipt.State, &receipt.ErrorCode, &receipt.RecordedAt)
+	query := `SELECT command_id, attempt_no, state, COALESCE(error_code, ''), recorded_at FROM cancel_attempts WHERE command_id = ? ORDER BY attempt_no DESC LIMIT 1`
+	args := []any{commandID}
+	if attemptNo > 0 {
+		query = `SELECT command_id, attempt_no, state, COALESCE(error_code, ''), recorded_at FROM cancel_attempts WHERE command_id = ? AND attempt_no = ?`
+		args = append(args, attemptNo)
+	}
+	var attempt CancelAttempt
+	err := store.db.QueryRowContext(ctx, query, args...).
+		Scan(&attempt.CommandID, &attempt.AttemptNo, &attempt.State, &attempt.ErrorCode, &attempt.RecordedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return CancelReceipt{}, false, nil
+		return CancelAttempt{}, false, nil
 	}
-	if err != nil || !validCancelReceipt(receipt) {
+	if err != nil || !validCancelReceipt(attempt.CancelReceipt) {
 		if err == nil {
 			err = errors.New("invalid stored cancel receipt")
 		}
-		return CancelReceipt{}, false, err
+		return CancelAttempt{}, false, err
 	}
-	return receipt, true, nil
+	return attempt, true, nil
+}
+
+// CancelCandidate is a canary command whose cancel is not confirmed. Attempts
+// counts the cancel attempts the edge recorded for it. Zero means the broker
+// was never asked, so a carry-over cancel for it is the first send.
+type CancelCandidate struct {
+	CommandID    string
+	AccountScope string
+	PlacedAt     string
+	Attempts     int
+	LatestState  string
+	// Disposition is the effective place disposition: ACCEPTED, or UNKNOWN for a
+	// place whose outcome was never settled.
+	Disposition string
+	// ResolvedByEvidence is true when a command-scoped resolution, not the place
+	// receipt, established the broker order. Such an order is never cancellable by
+	// the edge, so it blocks placement but is never sent.
+	ResolvedByEvidence bool
+}
+
+// CancelCandidates lists commands on one KIS mock scope, with the given
+// command-ID prefix, that were accepted and whose latest cancel is absent,
+// UNKNOWN or REJECTED_THROTTLED. A confirmed cancel is never listed. The list
+// is read-only; the caller applies the placement-window bound.
+func (store *Store) CancelCandidates(ctx context.Context, scope, prefix string) ([]CancelCandidate, error) {
+	if store == nil || store.db == nil {
+		return nil, errors.New("store unavailable")
+	}
+	rows, err := store.db.QueryContext(ctx, `
+		SELECT c.command_id, c.account_scope, c.recorded_at,
+			(SELECT COUNT(*) FROM cancel_attempts a WHERE a.command_id = c.command_id),
+			COALESCE(l.state, ''), r.command_id IS NOT NULL, COALESCE(r.disposition, c.disposition)
+		FROM commands c
+		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
+		LEFT JOIN cancel_attempts l ON l.command_id = c.command_id
+			AND l.attempt_no = (SELECT MAX(m.attempt_no) FROM cancel_attempts m WHERE m.command_id = c.command_id)
+		WHERE c.account_scope = ?
+			AND ((COALESCE(r.disposition, c.disposition) = 'ACCEPTED'
+				AND COALESCE(CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END, '') <> '')
+				OR (r.command_id IS NULL AND c.disposition = 'UNKNOWN'))
+			AND substr(c.command_id, 1, ?) = ?
+			AND (l.command_id IS NULL OR l.state IN ('UNKNOWN', 'REJECTED_THROTTLED'))
+		ORDER BY c.recorded_at, c.command_id`, scope, len(prefix), prefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	candidates := []CancelCandidate{}
+	for rows.Next() {
+		var candidate CancelCandidate
+		var resolved int
+		if err := rows.Scan(&candidate.CommandID, &candidate.AccountScope, &candidate.PlacedAt, &candidate.Attempts, &candidate.LatestState, &resolved, &candidate.Disposition); err != nil {
+			return nil, err
+		}
+		candidate.ResolvedByEvidence = resolved == 1
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return candidates, nil
 }
 
 // FindCancelTarget returns only orders whose effective disposition is
@@ -223,61 +318,64 @@ func (store *Store) FindCancelTarget(ctx context.Context, commandID string) (Can
 	return target, true, nil
 }
 
-// ReserveCancel commits the UNKNOWN pre-send marker. A conflicting marker is
-// returned unchanged, so duplicate callers cannot send a second request.
-func (store *Store) ReserveCancel(ctx context.Context, receipt CancelReceipt) (CancelReceipt, bool, error) {
-	if store == nil || store.db == nil || !validCancelReceipt(receipt) || receipt.State != CancelStateUnknown {
-		return CancelReceipt{}, false, errors.New("invalid cancel receipt")
+// ReserveCancel commits the UNKNOWN pre-send marker for one attempt. A marker
+// that already exists for that attempt is returned unchanged, so duplicate
+// callers cannot send a second request for it.
+func (store *Store) ReserveCancel(ctx context.Context, attempt CancelAttempt) (CancelAttempt, bool, error) {
+	if store == nil || store.db == nil || !validCancelReceipt(attempt.CancelReceipt) || attempt.State != CancelStateUnknown || attempt.AttemptNo < 1 {
+		return CancelAttempt{}, false, errors.New("invalid cancel receipt")
 	}
 	result, err := store.db.ExecContext(ctx, `
-		INSERT INTO cancel_attempts (command_id, state, error_code, recorded_at)
-		SELECT c.command_id, ?, NULLIF(?, ''), ? FROM commands c
+		INSERT INTO cancel_attempts (command_id, attempt_no, state, error_code, recorded_at)
+		SELECT c.command_id, ?, ?, NULLIF(?, ''), ? FROM commands c
 		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
 		WHERE c.command_id = ? AND COALESCE(r.disposition, c.disposition) = 'ACCEPTED'
 			AND COALESCE(CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END, '') <> ''
-		ON CONFLICT(command_id) DO NOTHING
-	`, receipt.State, receipt.ErrorCode, receipt.RecordedAt, receipt.CommandID)
+		ON CONFLICT(command_id, attempt_no) DO NOTHING
+	`, attempt.AttemptNo, attempt.State, attempt.ErrorCode, attempt.RecordedAt, attempt.CommandID)
 	if err != nil {
-		return CancelReceipt{}, false, err
+		return CancelAttempt{}, false, err
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return CancelReceipt{}, false, err
+		return CancelAttempt{}, false, err
 	}
 	if inserted == 1 {
-		return receipt, true, nil
+		return attempt, true, nil
 	}
-	existing, found, err := store.FindCancelAttempt(ctx, receipt.CommandID)
+	existing, found, err := store.findCancelAttempt(ctx, attempt.CommandID, attempt.AttemptNo)
 	if err != nil {
-		return CancelReceipt{}, false, err
+		return CancelAttempt{}, false, err
 	}
 	if !found {
-		return CancelReceipt{}, false, errors.New("cancel target disappeared")
+		return CancelAttempt{}, false, errors.New("cancel target disappeared")
 	}
 	return existing, false, nil
 }
 
-func (store *Store) FinalizeCancel(ctx context.Context, receipt CancelReceipt) (CancelReceipt, error) {
-	if store == nil || store.db == nil || !validCancelReceipt(receipt) {
-		return CancelReceipt{}, errors.New("invalid cancel receipt")
+// FinalizeCancel records the broker answer for a reserved attempt. Only a
+// pending UNKNOWN attempt can change, so a finalized attempt is never rewritten.
+func (store *Store) FinalizeCancel(ctx context.Context, attempt CancelAttempt) (CancelAttempt, error) {
+	if store == nil || store.db == nil || !validCancelReceipt(attempt.CancelReceipt) || attempt.AttemptNo < 1 {
+		return CancelAttempt{}, errors.New("invalid cancel receipt")
 	}
-	result, err := store.db.ExecContext(ctx, `UPDATE cancel_attempts SET state = ?, error_code = NULLIF(?, ''), recorded_at = ? WHERE command_id = ? AND state = 'UNKNOWN'`, receipt.State, receipt.ErrorCode, receipt.RecordedAt, receipt.CommandID)
+	result, err := store.db.ExecContext(ctx, `UPDATE cancel_attempts SET state = ?, error_code = NULLIF(?, ''), recorded_at = ? WHERE command_id = ? AND attempt_no = ? AND state = 'UNKNOWN'`, attempt.State, attempt.ErrorCode, attempt.RecordedAt, attempt.CommandID, attempt.AttemptNo)
 	if err != nil {
-		return CancelReceipt{}, err
+		return CancelAttempt{}, err
 	}
 	updated, err := result.RowsAffected()
 	if err != nil {
-		return CancelReceipt{}, err
+		return CancelAttempt{}, err
 	}
 	if updated == 1 {
-		return receipt, nil
+		return attempt, nil
 	}
-	existing, found, err := store.FindCancelAttempt(ctx, receipt.CommandID)
+	existing, found, err := store.findCancelAttempt(ctx, attempt.CommandID, attempt.AttemptNo)
 	if err != nil {
-		return CancelReceipt{}, err
+		return CancelAttempt{}, err
 	}
 	if !found {
-		return CancelReceipt{}, errors.New("cancel receipt missing")
+		return CancelAttempt{}, errors.New("cancel receipt missing")
 	}
 	return existing, nil
 }
@@ -810,4 +908,61 @@ func validReceipt(receipt executioncontracts.ExecutionReceiptV1) bool {
 		validCommandID(receipt.CommandID) &&
 		receipt.Disposition.Valid() &&
 		receipt.RecordedAt != ""
+}
+
+// migrateCancelAttempts rebuilds a pre-attempt-number cancel_attempts table in
+// place. Each legacy row becomes attempt 1 unchanged, so an existing UNKNOWN
+// marker keeps its send-boundary meaning.
+func migrateCancelAttempts(database *sql.DB) error {
+	rows, err := database.Query("PRAGMA table_info(cancel_attempts)")
+	if err != nil {
+		return err
+	}
+	current := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "attempt_no" {
+			current = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if current {
+		return nil
+	}
+	transaction, err := database.Begin()
+	if err != nil {
+		return err
+	}
+	statements := []string{
+		`ALTER TABLE cancel_attempts RENAME TO cancel_attempts_legacy`,
+		`CREATE TABLE cancel_attempts (
+			command_id TEXT NOT NULL REFERENCES commands(command_id),
+			attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+			state TEXT NOT NULL CHECK (state IN ('CANCELLED', 'NOT_FOUND', 'UNKNOWN', 'REJECTED_THROTTLED')),
+			error_code TEXT,
+			recorded_at TEXT NOT NULL,
+			PRIMARY KEY (command_id, attempt_no)
+		)`,
+		`INSERT INTO cancel_attempts (command_id, attempt_no, state, error_code, recorded_at)
+			SELECT command_id, 1, state, error_code, recorded_at FROM cancel_attempts_legacy`,
+		`DROP TABLE cancel_attempts_legacy`,
+	}
+	for _, statement := range statements {
+		if _, err := transaction.Exec(statement); err != nil {
+			_ = transaction.Rollback()
+			return err
+		}
+	}
+	return transaction.Commit()
 }

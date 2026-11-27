@@ -27,6 +27,9 @@ type TokenLoader interface {
 type Service struct {
 	Store        *Store
 	PlaceEnabled bool
+	// Sleep paces a cancel re-send after REJECTED_THROTTLED. Nil uses time.Sleep;
+	// tests inject a recorder.
+	Sleep func(time.Duration)
 	// KISLiveShadowEnabled is a separate fail-closed admission gate. It does
 	// not enable live placement: kis_live is witness-only in this release.
 	KISLiveShadowEnabled bool
