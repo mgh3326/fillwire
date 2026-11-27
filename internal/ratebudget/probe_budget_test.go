@@ -86,3 +86,22 @@ func TestProbesStayBoundedByTheEndpointBucket(t *testing.T) {
 	clock.advance(30 * time.Second)
 	mustRefuse(t, l.Acquire(quote), ratebudget.CodeRateLimited)
 }
+
+// A due probe on an idle endpoint must not starve the regular pass when the
+// provider bucket cannot hold a reserved token on top of one request. With
+// burst 1 there is no room to reserve, so the regular pass still runs.
+func TestIdleDueProbeDoesNotStarveTheRegularPassOnBurstOne(t *testing.T) {
+	clock := newTestClock()
+	_, endpoint := highLimits()
+	l := newLimiter(t, clock, 1, ratebudget.Limit{Rate: 1, Burst: 1},
+		endpoint,
+		ratebudget.Endpoint{Name: testCandles, Limit: endpoint.Limit})
+
+	candles := ratebudget.Key{Provider: testProvider, AccountRef: testAccount, Endpoint: testCandles}
+	tripEndpoint(t, l, quoteKey())
+	clock.advance(30 * time.Second) // quote's probe is due, but nobody probes it
+
+	mustAcquire(t, l, candles)
+	clock.advance(time.Second)
+	mustAcquire(t, l, candles)
+}

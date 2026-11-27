@@ -430,8 +430,11 @@ func (l *Limiter) jittered(d time.Duration) time.Duration {
 	return d
 }
 
-// probesDue counts the endpoints whose half-open probe is due now. Each one
-// holds one provider token back from the regular pass until its probe takes it.
+// probesDue counts the endpoints whose half-open probe is due now, capped at
+// burst-1. Each one holds one provider token back from the regular pass until
+// its probe takes it. The cap is needed because the bucket never holds more
+// than burst tokens: a larger hold would refuse every regular request forever,
+// for example an idle endpoint left past its open window on a burst-1 provider.
 func (p *providerState) probesDue(now time.Time) int {
 	due := 0
 	for _, ep := range p.order {
@@ -439,7 +442,7 @@ func (p *providerState) probesDue(now time.Time) int {
 			due++
 		}
 	}
-	return due
+	return min(due, max(int(p.global.burst)-1, 0))
 }
 
 // blocked reports whether a majority of the provider's endpoints, isolated ones
