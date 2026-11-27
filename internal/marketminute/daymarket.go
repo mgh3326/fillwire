@@ -62,6 +62,11 @@ const DayMarketEndpoint = OverseasTR + ".US_DAY|" + OverseasPath
 // KIS_DAY_MARKET_GRACE length.
 const DefaultDayMarketTrail = 15 * time.Minute
 
+// DefaultDayMarketBudget caps one day-market pass, waits and retries included,
+// so a rate-limited day source delays the next regular poll by at most this
+// much.
+const DefaultDayMarketBudget = 30 * time.Second
+
 // DayMarketState is the day market's own open or closed state. It comes only
 // from the calendar's day-market windows: the regular session being closed (or
 // open) says nothing about it.

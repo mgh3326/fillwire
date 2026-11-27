@@ -26,6 +26,7 @@ const (
 	classCanceled          = "canceled"
 	classCredentialHost    = "credential_host"
 	classCircuitOpen       = "circuit_open"
+	classDayBudget         = "day_budget"
 )
 
 var (

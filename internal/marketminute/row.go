@@ -67,6 +67,20 @@ func (s MultiSink) Write(ctx context.Context, bar Bar) error {
 	return nil
 }
 
+// Flush flushes every member that buffers rows, in order. Without it the
+// poller's flush would see no buffer behind the production sink.
+func (s MultiSink) Flush() error {
+	var errs []error
+	for _, sink := range s {
+		if f, ok := sink.(flusher); ok {
+			if err := f.Flush(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // ErrNoSink reports a poller with nowhere to write.
 var ErrNoSink = errors.New("marketminute: no sink configured")
 

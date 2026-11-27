@@ -154,25 +154,8 @@ type dayHarness struct {
 func newDayHarness(t *testing.T, enabled bool, targets []Target, fetch func(Target) FetchResult) *dayHarness {
 	t.Helper()
 	harness := &dayHarness{reader: &venueReader{fetch: fetch}, sink: &recordSink{}, clock: &testClock{}}
-	fast := ratebudget.Limit{Rate: 1000, Burst: 100}
-	domestic, _ := Endpoint("KRX")
-	overseas, _ := Endpoint("NASD")
-	limiter, err := ratebudget.New(ratebudget.Config{
-		Providers: []ratebudget.Provider{{
-			Name: "kis", AccountRef: "live", Limit: fast,
-			Endpoints: []ratebudget.Endpoint{
-				{Name: domestic, Limit: fast},
-				{Name: overseas, Limit: fast},
-				{Name: DayMarketEndpoint, Limit: fast, Isolated: true},
-			},
-		}},
-		ResearchShare: 1,
-		Clock:         harness.clock,
-		Jitter:        func(d time.Duration) time.Duration { return d },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	limiter := newDayLimiter(t, harness.clock)
+	var err error
 	harness.poller, err = NewPoller(Config{
 		Targets: targets, Reader: harness.reader, Limiter: limiter, Sink: harness.sink,
 		Calendar: dayCalendar(t), Provider: "kis", AccountRef: "live",
