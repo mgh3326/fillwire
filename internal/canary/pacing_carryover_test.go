@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -43,8 +44,9 @@ func pacingEdge(t *testing.T, log *callLog, lookupStatus int, lookupBody, cancel
 	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("content-type", "application/json")
 		switch {
-		case request.Method == http.MethodGet && request.URL.Path == "/v1/cancel-attempts":
-			if request.URL.Query().Get("state") != "UNKNOWN" || request.URL.Query().Get("command_prefix") != commandIDPrefix {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/cancel-carryover":
+			query := request.URL.Query()
+			if query.Get("scope") != "kis_mock" || query.Get("command_prefix") != commandIDPrefix || query.Get("placed_from") == "" || query.Get("placed_before") == "" {
 				t.Errorf("lookup query = %q", request.URL.RawQuery)
 			}
 			log.add("lookup")
@@ -74,7 +76,7 @@ func recordingSleep(log *callLog) func(time.Duration) {
 
 func TestCancelIsPacedAfterPlaceAck(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"cancel_attempts":[]}`, "CANCELLED")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[]}`, "CANCELLED")
 	defer server.Close()
 	at := fixedKR(2026, time.September, 2, 10, 0)
 	budgets := Options{Sleep: recordingSleep(log)}.timeouts()
@@ -118,7 +120,7 @@ func TestCancelPacerWaitsOnlyTheRemainingGap(t *testing.T) {
 
 func TestCarryOverCancelsOnceAndPlacesNothing(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"cancel_attempts":[{"command_id":"broker-edge-canary:old-1","state":"UNKNOWN","error_code":"broker_5xx","recorded_at":"2026-11-27T00:13:00Z"}]}`, "UNKNOWN")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:old-1","account_scope":"kis_mock","cancel_state":"UNKNOWN"}]}`, "UNKNOWN")
 	defer server.Close()
 	at := fixedKR(2026, time.September, 2, 10, 0)
 
@@ -140,7 +142,7 @@ func TestCarryOverCancelsOnceAndPlacesNothing(t *testing.T) {
 
 func TestRunPendingCarryOverExitsNonZeroWithoutPlacement(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"cancel_attempts":[{"command_id":"broker-edge-canary:old-1","state":"UNKNOWN","error_code":"broker_5xx","recorded_at":"2026-11-27T00:13:00Z"}]}`, "UNKNOWN")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:old-1","account_scope":"kis_mock","cancel_state":"UNKNOWN"}]}`, "UNKNOWN")
 	defer server.Close()
 	directory := t.TempDir()
 	at := fixedKR(2026, time.September, 2, 10, 0)
@@ -171,7 +173,7 @@ func TestRunPendingCarryOverExitsNonZeroWithoutPlacement(t *testing.T) {
 
 func TestRunLooksUpBeforePlacingWhenNothingIsPending(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"cancel_attempts":[]}`, "CANCELLED")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[]}`, "CANCELLED")
 	defer server.Close()
 	directory := t.TempDir()
 	at := fixedKR(2026, time.September, 2, 10, 0)
@@ -199,8 +201,10 @@ func TestCarryOverLookupFailureFailsClosed(t *testing.T) {
 	}{
 		{"edge error", http.StatusInternalServerError, `{"error_code":"storage_failure"}`},
 		{"missing key is malformed", http.StatusOK, `{}`},
-		{"foreign command ID", http.StatusOK, `{"cancel_attempts":[{"command_id":"order-123"}]}`},
-		{"bare prefix is not a command", http.StatusOK, `{"cancel_attempts":[{"command_id":"broker-edge-canary:"}]}`},
+		{"foreign command ID", http.StatusOK, `{"candidates":[{"command_id":"order-123","account_scope":"kis_mock","cancel_state":""}]}`},
+		{"bare prefix is not a command", http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:","account_scope":"kis_mock","cancel_state":""}]}`},
+		{"other scope", http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:x","account_scope":"kis_mock_us","cancel_state":""}]}`},
+		{"unexpected cancel state", http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:x","account_scope":"kis_mock","cancel_state":"CANCELLED"}]}`},
 		{"not JSON", http.StatusOK, `<html>`},
 	}
 	for _, test := range tests {
@@ -224,7 +228,7 @@ func TestCarryOverLookupFailureFailsClosed(t *testing.T) {
 
 func TestCarryOverNoSessionMakesNoRequest(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"cancel_attempts":[]}`, "CANCELLED")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[]}`, "CANCELLED")
 	defer server.Close()
 	// 20:00 KST is after the KR window and 07:00 New York is before the US one.
 	offHours := fixedKR(2026, time.September, 2, 20, 0)
@@ -239,7 +243,7 @@ func TestCarryOverNoSessionMakesNoRequest(t *testing.T) {
 
 func TestCarryOverWithEmptyListingProceedsNormally(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"cancel_attempts":[]}`, "CANCELLED")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[]}`, "CANCELLED")
 	defer server.Close()
 	at := fixedKR(2026, time.September, 2, 10, 0)
 
@@ -250,5 +254,62 @@ func TestCarryOverWithEmptyListingProceedsNormally(t *testing.T) {
 	}
 	if want := []string{"lookup"}; !reflect.DeepEqual(log.snapshot(), want) {
 		t.Fatalf("edge calls = %v, want only the lookup", log.snapshot())
+	}
+}
+
+func TestCarryOverLookupUsesTheScopeTradingDay(t *testing.T) {
+	var seen []url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/cancel-carryover" {
+			seen = append(seen, request.URL.Query())
+		}
+		_, _ = io.WriteString(writer, `{"candidates":[]}`)
+	}))
+	defer server.Close()
+	// 2026-03-09 13:35 UTC is 09:35 EDT: the US window of that New York day.
+	usOpen := time.Date(2026, time.March, 9, 13, 35, 0, 0, time.UTC)
+	// 2026-09-02 10:00 KST: the KR window of that Seoul day.
+	krOpen := fixedKR(2026, time.September, 2, 10, 0)
+
+	if _, carried := carryOverRun(context.Background(), Config{EdgeURL: server.URL}, func() time.Time { return usOpen }, server.Client(), Options{}.timeouts()); carried {
+		t.Fatal("empty listing must not end the run")
+	}
+	if _, carried := carryOverRun(context.Background(), Config{EdgeURL: server.URL}, func() time.Time { return krOpen }, server.Client(), Options{}.timeouts()); carried {
+		t.Fatal("empty listing must not end the run")
+	}
+	if len(seen) != 2 {
+		t.Fatalf("lookups = %d", len(seen))
+	}
+	us, kr := seen[0], seen[1]
+	if us.Get("scope") != "kis_mock_us" || us.Get("placed_from") != "2026-03-09T00:00:00-04:00" || us.Get("placed_before") != "2026-03-10T00:00:00-04:00" {
+		t.Fatalf("US window = %v", us)
+	}
+	if kr.Get("scope") != "kis_mock" || kr.Get("placed_from") != "2026-09-02T00:00:00+09:00" || kr.Get("placed_before") != "2026-09-03T00:00:00+09:00" {
+		t.Fatalf("KR window = %v", kr)
+	}
+}
+
+func TestCarryOverLookupStopsAtTheRunOverallDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// Hold the lookup until the caller gives up.
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	directory := t.TempDir()
+	at := fixedKR(2026, time.September, 2, 10, 0)
+	var stdout strings.Builder
+	lookup := func(key string) string {
+		return map[string]string{"CANARY_EDGE_URL": server.URL, "CANARY_TEXTFILE_DIR": directory}[key]
+	}
+
+	started := time.Now()
+	code := Run(context.Background(), Options{Now: func() time.Time { return at }, Client: server.Client(), Stdout: &stdout, Stderr: io.Discard, Lookup: lookup, OverallTimeout: 200 * time.Millisecond, Sleep: func(time.Duration) {}})
+	elapsed := time.Since(started)
+
+	if code != 1 || elapsed > 5*time.Second {
+		t.Fatalf("Run() = %d after %s; the overall deadline must bound the lookup", code, elapsed)
+	}
+	if !strings.Contains(stdout.String(), `"outcome":"carry_over_check_failed"`) {
+		t.Fatalf("stdout = %s", stdout.String())
 	}
 }

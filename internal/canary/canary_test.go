@@ -205,8 +205,8 @@ func TestRunWritesJSONAndTextfileWithSafeLabels(t *testing.T) {
 	directory := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("content-type", "application/json")
-		if request.URL.Path == "/v1/cancel-attempts" {
-			_, _ = writer.Write([]byte(`{"cancel_attempts":[]}`))
+		if request.URL.Path == "/v1/cancel-carryover" {
+			_, _ = writer.Write([]byte(`{"candidates":[]}`))
 			return
 		}
 		if request.URL.Path == "/v1/price-band" {
@@ -666,7 +666,7 @@ func TestPlaceTimeoutNoRestingOrderCancelsNothing(t *testing.T) {
 	if transport.cancelCalls.Load() != 0 {
 		t.Fatalf("cancel calls = %d; a foreign order must never be cancelled", transport.cancelCalls.Load())
 	}
-	if _, found, _ := service.Store.FindCancelAttempt(context.Background(), result.CommandID); found {
+	if _, found, _ := service.Store.FindLatestCancelAttempt(context.Background(), result.CommandID); found {
 		t.Fatal("cancel attempt was recorded for an unproven order")
 	}
 	resolved, found, err := service.Store.Find(context.Background(), result.CommandID)

@@ -305,11 +305,14 @@ func Run(ctx context.Context, options Options) int {
 	}
 	config := ConfigFromEnv(lookup)
 	budgets := options.timeouts()
+	// One overall deadline bounds the carry-over check and the normal run alike.
+	runCtx, stopRun := context.WithTimeout(ctx, budgets.overall)
+	defer stopRun()
 	// The carry-over check runs before any placement, so a run with an
 	// unconfirmed earlier cancel cannot add a second resting order.
-	result, carried := carryOverRun(ctx, config, now, options.Client, budgets)
+	result, carried := carryOverRun(runCtx, config, now, options.Client, budgets)
 	if !carried {
-		result = execute(ctx, config, now, options.Client, budgets)
+		result = execute(runCtx, config, now, options.Client, budgets)
 	}
 	_ = json.NewEncoder(stdout).Encode(result)
 	if err := WriteTextfile(config.TextfileDir, result, now().UTC()); err != nil {
@@ -586,16 +589,17 @@ func (pacer *cancelPacer) wait() {
 	}
 }
 
-// carryOverRun is the pre-placement check. An earlier run's cancel that ended
-// UNKNOWN may still rest on the broker, so this run first asks the edge for
-// those markers. When one exists it makes exactly one cancel attempt for the
-// first one and reports carry_over_pending; the place leg never runs, so the
-// run returns carried=true. With no markers it returns carried=false and the
+// carryOverRun is the pre-placement check. An earlier cancel of this canary
+// that is still unconfirmed may rest on the broker, so this run first asks the
+// edge for the candidates of its own scope and trading day. When one exists it
+// makes exactly one cancel attempt for the first candidate (never-sent commands
+// first) and reports carry_over_pending; the place leg never runs, so the run
+// returns carried=true. With no candidates it returns carried=false and the
 // normal run proceeds. A failed or malformed lookup fails closed.
 //
-// The attempt uses the edge's own cancel endpoint. A committed UNKNOWN marker
-// answers with its stored state, so only the edge can decide whether a re-send
-// is permitted.
+// The attempt uses the edge's own cancel endpoint. The edge decides whether it
+// may send: a never-sent command or a REJECTED_THROTTLED one is sent, and an
+// UNKNOWN one is answered from its stored state.
 func carryOverRun(ctx context.Context, config Config, now func() time.Time, client *http.Client, budgets timeouts) (Result, bool) {
 	runAt := now().UTC()
 	scope := SelectScope(runAt)
@@ -608,9 +612,22 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 		client = &http.Client{}
 	}
 	result := Result{Scope: scope, Timestamp: runAt.Format(time.RFC3339), StageDurationsMS: map[string]int64{}}
+	accountScope := executioncontracts.AccountScopeKISMock
+	if scope == ScopeUS {
+		accountScope = executioncontracts.AccountScopeKISMockUS
+	}
+	from, before, err := tradingDayWindow(scope, runAt)
+	if err != nil {
+		return carryOverFailed(result, err), true
+	}
 
-	lookupRequest, _ := http.NewRequestWithContext(ctx, http.MethodGet,
-		base+"/v1/cancel-attempts?state=UNKNOWN&command_prefix="+url.QueryEscape(commandIDPrefix), nil)
+	query := url.Values{
+		"scope":          {accountScope},
+		"placed_from":    {from},
+		"placed_before":  {before},
+		"command_prefix": {commandIDPrefix},
+	}
+	lookupRequest, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/cancel-carryover?"+query.Encode(), nil)
 	lookupResponse, err := timedRequest(ctx, client, result.StageDurationsMS, "carry_over", budgets.check, lookupRequest)
 	if err != nil {
 		return carryOverFailed(result, err), true
@@ -618,30 +635,33 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 	var listed struct {
 		// A pointer distinguishes a missing key, which is malformed, from an
 		// empty list, which is a clean edge.
-		CancelAttempts *[]struct {
-			CommandID string `json:"command_id"`
-		} `json:"cancel_attempts"`
+		Candidates *[]struct {
+			CommandID    string `json:"command_id"`
+			AccountScope string `json:"account_scope"`
+			CancelState  string `json:"cancel_state"`
+		} `json:"candidates"`
 	}
 	decodeErr := json.NewDecoder(lookupResponse.Body).Decode(&listed)
 	lookupResponse.Body.Close()
-	if decodeErr != nil || lookupResponse.StatusCode != http.StatusOK || listed.CancelAttempts == nil {
+	if decodeErr != nil || lookupResponse.StatusCode != http.StatusOK || listed.Candidates == nil {
 		return carryOverFailed(result, nil), true
 	}
-	attempts := *listed.CancelAttempts
-	for _, attempt := range attempts {
-		if len(attempt.CommandID) <= len(commandIDPrefix) || !strings.HasPrefix(attempt.CommandID, commandIDPrefix) {
-			// Only this canary's own commands may be cancelled from here.
+	candidates := *listed.Candidates
+	for _, candidate := range candidates {
+		// Only this canary's own commands on this scope may be cancelled from here.
+		if len(candidate.CommandID) <= len(commandIDPrefix) || !strings.HasPrefix(candidate.CommandID, commandIDPrefix) ||
+			candidate.AccountScope != accountScope || !validCarryOverState(candidate.CancelState) {
 			return carryOverFailed(result, nil), true
 		}
 	}
-	if len(attempts) == 0 {
+	if len(candidates) == 0 {
 		return Result{}, false
 	}
 
-	first := attempts[0].CommandID
+	first := candidates[0].CommandID
 	result.Outcome = OutcomeCarryOverPending
 	result.Stage = StageCancelSent
-	result.CarryOver = &CarryOverEvidence{Pending: len(attempts), CommandID: first}
+	result.CarryOver = &CarryOverEvidence{Pending: len(candidates), CommandID: first}
 	cancelRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		base+"/v1/commands/"+url.PathEscape(first)+"/cancel", nil)
 	cancelRequest.Header.Set("X-Correlation-ID", first)
@@ -662,6 +682,30 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 		result.Rejection = cancelled.Rejection
 	}
 	return result, true
+}
+
+// validCarryOverState accepts only the edge's candidate cancel states: "" for
+// a command the broker was never asked about, or one of the two states whose
+// latest attempt the edge will still act on.
+func validCarryOverState(state string) bool {
+	return state == "" || state == "UNKNOWN" || state == "REJECTED_THROTTLED"
+}
+
+// tradingDayWindow returns the placement window of the trading day that runAt
+// falls in, in the scope's exchange time zone, as RFC 3339 bounds.
+func tradingDayWindow(scope string, runAt time.Time) (string, string, error) {
+	name := "Asia/Seoul"
+	if scope == ScopeUS {
+		name = "America/New_York"
+	}
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		return "", "", err
+	}
+	local := runAt.In(location)
+	start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+	end := start.AddDate(0, 0, 1)
+	return start.Format(time.RFC3339), end.Format(time.RFC3339), nil
 }
 
 func carryOverFailed(result Result, err error) Result {
