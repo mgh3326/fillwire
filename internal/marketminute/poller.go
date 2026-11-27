@@ -27,7 +27,7 @@ func (t Target) validate() error {
 		}
 	case "us":
 		switch t.Venue {
-		case "NASD", "NYSE", "AMEX":
+		case "NASD", "NYSE", "AMEX", VenueDayNASD, VenueDayNYSE, VenueDayAMEX:
 		default:
 			return fmt.Errorf("%w: US venue %q is not NASD, NYSE or AMEX", ErrConfig, t.Venue)
 		}
@@ -60,6 +60,8 @@ func Endpoint(venue string) (string, error) {
 		return DomesticTR + "|" + DomesticPath, nil
 	case "NASD", "NYSE", "AMEX":
 		return OverseasTR + "|" + OverseasPath, nil
+	case VenueDayNASD, VenueDayNYSE, VenueDayAMEX:
+		return DayMarketEndpoint, nil
 	default:
 		return "", fmt.Errorf("%w: unknown venue %q", ErrConfig, venue)
 	}
@@ -101,6 +103,21 @@ type Report struct {
 	Duplicates     int            `json:"duplicates"`
 	Refusals       map[string]int `json:"refusals,omitempty"`
 	Errors         []TargetError  `json:"errors,omitempty"`
+	// USDayMarket is absent unless the day-market source is on.
+	USDayMarket *DayMarketReport `json:"us_day_market,omitempty"`
+}
+
+// DayMarketReport says why the day-market source did or did not read, so a run
+// with no day rows is never silent. Report.Targets counts the listed targets
+// only; the other Report counters include the day-market reads.
+type DayMarketReport struct {
+	State DayMarketState `json:"state"`
+	// Targets is the number of day-market targets derived from the list.
+	Targets int `json:"targets"`
+	// Read is true when the targets were polled: the market is open, or a
+	// window ended within the trail.
+	Read bool `json:"read"`
+	Rows int  `json:"rows"`
 }
 
 // Config wires one poll run.
@@ -118,6 +135,13 @@ type Config struct {
 	// Sleep is the cancellable wait used between ratebudget refusals. Zero
 	// takes ctxwait.Sleep.
 	Sleep func(context.Context, time.Duration) error
+	// USDayMarket turns on the KIS US day-market source: every listed US target
+	// is also read under its day-market code while the calendar's day-market
+	// window allows it. Off by default.
+	USDayMarket bool
+	// DayMarketTrail is how long after a window ends the day targets are still
+	// read. Zero takes DefaultDayMarketTrail.
+	DayMarketTrail time.Duration
 }
 
 // Poller runs one concurrent shadow poll over a target list.
@@ -128,6 +152,9 @@ type Poller struct {
 	// re-reads the same trailing KIS page, so rows at or below the watermark
 	// are duplicates and are not emitted again.
 	written map[string]time.Time
+	// dayTargets are derived from the listed US targets; empty when the
+	// day-market source is off.
+	dayTargets []Target
 }
 
 const defaultWorkers = 4
@@ -162,18 +189,38 @@ func NewPoller(config Config) (*Poller, error) {
 	if config.Workers < 0 {
 		return nil, fmt.Errorf("%w: workers must not be negative", ErrConfig)
 	}
-	endpoints := make(map[string]string, 3)
+	if config.USDayMarket && !config.Calendar.HasUSDayMarket() {
+		return nil, fmt.Errorf("%w: the US day-market source needs us_day_market windows in the calendar", ErrConfig)
+	}
+	if config.DayMarketTrail == 0 {
+		config.DayMarketTrail = DefaultDayMarketTrail
+	}
+	if config.DayMarketTrail < 0 {
+		return nil, fmt.Errorf("%w: day-market trail must not be negative", ErrConfig)
+	}
+	var dayTargets []Target
 	for _, target := range config.Targets {
 		if err := target.validate(); err != nil {
 			return nil, err
 		}
-		name, err := Endpoint(target.Venue)
-		if err != nil {
-			return nil, err
+		if isDayVenue(target.Venue) {
+			return nil, fmt.Errorf("%w: day-market venue %q is derived by the US day-market source and must not be listed", ErrConfig, target.Venue)
 		}
-		endpoints[target.Venue] = name
+		if venue, ok := dayVenueOf[target.Venue]; ok && config.USDayMarket {
+			dayTargets = append(dayTargets, Target{Market: target.Market, Symbol: target.Symbol, Venue: venue})
+		}
 	}
-	return &Poller{config: config, endpoint: endpoints, written: make(map[string]time.Time)}, nil
+	endpoints := make(map[string]string, 6)
+	for _, targets := range [][]Target{config.Targets, dayTargets} {
+		for _, target := range targets {
+			name, err := Endpoint(target.Venue)
+			if err != nil {
+				return nil, err
+			}
+			endpoints[target.Venue] = name
+		}
+	}
+	return &Poller{config: config, endpoint: endpoints, written: make(map[string]time.Time), dayTargets: dayTargets}, nil
 }
 
 // Key is the ratebudget key for a target.
@@ -194,13 +241,38 @@ type jobResult struct {
 // Run polls every target with a bounded worker pool. Bars are written in target
 // order so the JSONL output is deterministic. The reader's ratebudget outcome
 // is recorded for every request; a refusal is retried after its RetryAfter.
+//
+// With the day-market source on, its targets are polled after the listed ones
+// are written, and only while the day market's own windows allow it. A day
+// target refused by an open circuit is skipped instead of waited for.
 func (p *Poller) Run(ctx context.Context) (Report, error) {
 	report := Report{Targets: len(p.config.Targets), Refusals: map[string]int{}}
 	if len(p.config.Targets) == 0 {
 		return report, nil
 	}
-	results := make([]jobResult, len(p.config.Targets))
-	workers := min(p.config.Workers, len(p.config.Targets))
+	if err := p.pass(ctx, p.config.Targets, &report); err != nil {
+		return report, err
+	}
+	if !p.config.USDayMarket {
+		return report, nil
+	}
+	at := p.config.Clock()
+	day := &DayMarketReport{State: p.config.Calendar.USDayMarket(at), Targets: len(p.dayTargets)}
+	report.USDayMarket = day
+	if len(p.dayTargets) == 0 || !p.config.Calendar.inUSDayWindow(at, p.config.DayMarketTrail) {
+		return report, nil
+	}
+	day.Read = true
+	before := report.Rows
+	err := p.pass(ctx, p.dayTargets, &report)
+	day.Rows = report.Rows - before
+	return report, err
+}
+
+// pass polls one target list and writes its closed bars.
+func (p *Poller) pass(ctx context.Context, targets []Target, report *Report) error {
+	results := make([]jobResult, len(targets))
+	workers := min(p.config.Workers, len(targets))
 	jobs := make(chan int)
 	var wait sync.WaitGroup
 	for range workers {
@@ -208,23 +280,23 @@ func (p *Poller) Run(ctx context.Context) (Report, error) {
 		go func() {
 			defer wait.Done()
 			for index := range jobs {
-				results[index] = p.pollOne(ctx, p.config.Targets[index])
+				results[index] = p.pollOne(ctx, targets[index])
 			}
 		}()
 	}
-	for index := range p.config.Targets {
+	for index := range targets {
 		select {
 		case jobs <- index:
 		case <-ctx.Done():
 			close(jobs)
 			wait.Wait()
-			return report, ctx.Err()
+			return ctx.Err()
 		}
 	}
 	close(jobs)
 	wait.Wait()
 	if err := ctx.Err(); err != nil {
-		return report, err
+		return err
 	}
 
 	for index, result := range results {
@@ -242,18 +314,18 @@ func (p *Poller) Run(ctx context.Context) (Report, error) {
 			report.Errors = append(report.Errors, *result.targetError)
 			continue
 		}
-		target := p.config.Targets[index]
+		target := targets[index]
 		fresh := p.freshBars(target, result.bars)
 		report.Duplicates += len(result.bars) - len(fresh)
 		if err := p.write(ctx, fresh); err != nil {
-			return report, err
+			return err
 		}
 		report.Rows += len(fresh)
 		if len(fresh) > 0 {
 			p.written[targetKey(target)] = fresh[len(fresh)-1].TimeUTC
 		}
 	}
-	return report, nil
+	return nil
 }
 
 // freshBars drops bars at or below the target's watermark. KIS returns the
@@ -304,6 +376,12 @@ func (p *Poller) pollOne(ctx context.Context, target Target) jobResult {
 			return result
 		}
 		result.refusals = append(result.refusals, string(code))
+		if code == ratebudget.CodeCircuitOpen && isDayVenue(target.Venue) {
+			// Waiting would admit one probe per open window and hold the next
+			// regular poll behind a failing day source.
+			result.targetError = &TargetError{Market: target.Market, Symbol: target.Symbol, Venue: target.Venue, Class: classCircuitOpen}
+			return result
+		}
 		wait := time.Second
 		var refusal *ratebudget.Refusal
 		if errors.As(err, &refusal) && refusal.RetryAfter > 0 {

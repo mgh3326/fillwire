@@ -93,10 +93,14 @@ func (l Limit) validate(where string) error {
 	return nil
 }
 
-// Endpoint is one broker endpoint with its own bucket.
+// Endpoint is one broker endpoint with its own bucket. An Isolated endpoint's
+// circuit does not count toward the provider circuit, so its failures never
+// block the provider's other endpoints; it is still refused while the others
+// hold the provider open.
 type Endpoint struct {
-	Name  string
-	Limit Limit
+	Name     string
+	Limit    Limit
+	Isolated bool
 }
 
 // Provider is one broker with exactly one account_ref. A second Provider with
@@ -164,6 +168,7 @@ type endpointState struct {
 	bucket   *bucket
 	breaker  *breaker
 	failures int
+	isolated bool
 }
 
 // New validates cfg and builds the limiter. It returns an error wrapping
@@ -255,8 +260,9 @@ func New(cfg Config) (*Limiter, error) {
 				return nil, err
 			}
 			ep := &endpointState{
-				bucket:  newBucket(e.Limit, now),
-				breaker: &breaker{openAfter: circuit.OpenAfter, openFor: circuit.OpenFor},
+				bucket:   newBucket(e.Limit, now),
+				breaker:  &breaker{openAfter: circuit.OpenAfter, openFor: circuit.OpenFor},
+				isolated: e.Isolated,
 			}
 			ps.endpoints[e.Name] = ep
 			ps.order = append(ps.order, ep)
@@ -416,16 +422,17 @@ func (l *Limiter) jittered(d time.Duration) time.Duration {
 	return d
 }
 
-// blocked reports whether a majority of the provider's endpoints are
-// unhealthy. The wait is the longest endpoint window, at least one open
-// window, because only a probe can close the provider.
+// blocked reports whether a majority of the provider's endpoints, isolated ones
+// aside, are unhealthy. The wait is the longest endpoint window, at least one
+// open window, because only a probe can close the provider.
 func (p *providerState) blocked(now time.Time) (bool, time.Duration) {
-	if len(p.order) == 0 {
-		return false, 0
-	}
-	tripped := 0
+	voters, tripped := 0, 0
 	var wait time.Duration
 	for _, ep := range p.order {
+		if ep.isolated {
+			continue
+		}
+		voters++
 		if !ep.breaker.unhealthy() {
 			continue
 		}
@@ -434,7 +441,7 @@ func (p *providerState) blocked(now time.Time) (bool, time.Duration) {
 			wait = w
 		}
 	}
-	if 2*tripped <= len(p.order) {
+	if 2*tripped <= voters {
 		return false, 0
 	}
 	if wait <= 0 {

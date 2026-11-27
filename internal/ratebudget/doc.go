@@ -31,7 +31,7 @@
 //     no header it uses jittered exponential backoff (1s→30s, ±20%).
 //   - Circuits: Consecutive endpoint failures (default 5) open the endpoint for
 //     30s, then allow one half-open probe. A provider is open while a majority
-//     of its endpoints are unhealthy.
+//     of its endpoints are unhealthy; an Isolated endpoint is not counted.
 //
 // A refusal is a *Refusal carrying one of the closed result codes
 // (rate_limited, circuit_open, budget_cut) and the wait before the next

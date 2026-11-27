@@ -49,6 +49,7 @@ type calendarFile struct {
 	KRClosed     []string          `json:"kr_closed"`
 	USClosed     []string          `json:"us_closed"`
 	USEarlyClose map[string]string `json:"us_early_close"`
+	USDayMarket  []dayWindowFile   `json:"us_day_market"`
 }
 
 type clockTime struct {
@@ -68,6 +69,9 @@ type Calendar struct {
 	krClosed     map[string]bool
 	usClosed     map[string]bool
 	usEarlyClose map[string]clockTime
+	// usDayWindows are the day-market windows. The closed days above do not
+	// apply to them.
+	usDayWindows []dayWindow
 }
 
 // LoadCalendar parses the calendar JSON. Unknown fields are refused so a
@@ -107,6 +111,11 @@ func LoadCalendar(data []byte) (*Calendar, error) {
 		}
 		calendar.usEarlyClose[key] = clock
 	}
+	windows, err := parseDayWindows(file.USDayMarket)
+	if err != nil {
+		return nil, err
+	}
+	calendar.usDayWindows = windows
 	return calendar, nil
 }
 
@@ -214,6 +223,11 @@ func (c *Calendar) krSegment(venue string, at time.Time) string {
 func (c *Calendar) usSegment(venue string, at time.Time) string {
 	switch venue {
 	case "NASD", "NYSE", "AMEX":
+	case VenueDayNASD, VenueDayNYSE, VenueDayAMEX:
+		if c.inUSDayWindow(at, 0) {
+			return SegmentUSDay
+		}
+		return SegmentUnknown
 	default:
 		return SegmentUnknown
 	}

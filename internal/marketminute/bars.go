@@ -10,8 +10,9 @@ import (
 // Source is the row's source label. The shadow poller only writes KIS rows.
 const Source = "KIS"
 
-// FrameRow is one row of a KIS minute-chart page: the bar START label in the
-// exchange's local clock (KST for KR, ET for US) plus the raw numeric fields.
+// FrameRow is one row of a KIS minute-chart page: the bar START label (KST for
+// KR and the US day-market venues, ET for the other US venues) plus the raw
+// numeric fields.
 // Value is the KR ACCUMULATED trade value of the day; for US it is the per-bar
 // value. A nil field is a value the page did not carry (or did not carry a
 // number for).
@@ -102,7 +103,7 @@ func BarsFromFrame(rows []FrameRow, market, symbol, venue string, observedBefore
 		return result
 	}
 	local := kst.Zone
-	if market != "kr" {
+	if market != "kr" && !isDayVenue(venue) {
 		local = Eastern
 	}
 	parsedRows := make(map[int64]parsedRow, len(rows))

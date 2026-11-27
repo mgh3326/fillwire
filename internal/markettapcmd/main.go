@@ -8,8 +8,12 @@
 //
 //	market-tap -enabled -targets targets.json -calendar calendar.json -out bars.jsonl -once
 //
-// The command is off unless -enabled is set. noorder_test.go fails if an order
-// package, an order transaction or the go-kis broker client is linked in.
+// -us-day-market adds the KIS US day-market (주간거래) minute source, rows
+// labelled US_DAY (hk 6347; see internal/marketminute/daymarket.go).
+//
+// The command and that source are each off by default. noorder_test.go fails if
+// an order package, an order transaction or the go-kis broker client is linked
+// in.
 package markettapcmd
 
 import (
@@ -54,6 +58,7 @@ type options struct {
 	host       string
 	appKeyEnv  string
 	appSecret  string
+	usDay      bool
 
 	tokenSource   string
 	tokenKey      string
@@ -80,6 +85,7 @@ func parseFlags(args []string) (*options, error) {
 	flags.BoolVar(&opts.once, "once", false, "run one poll instead of the interval loop")
 	flags.DurationVar(&opts.interval, "interval", 5*time.Minute, "delay between polls")
 	flags.IntVar(&opts.workers, "workers", 4, "concurrent minute-chart reads")
+	flags.BoolVar(&opts.usDay, "us-day-market", false, "also read the KIS US day-market minute chart (default off; needs us_day_market windows in -calendar)")
 	flags.StringVar(&opts.provider, "provider", "kis", "ratebudget provider name")
 	flags.StringVar(&opts.accountRef, "account-ref", "live", "the one ratebudget account_ref for this broker")
 	flags.StringVar(&opts.host, "host", marketminute.DefaultHost, "KIS REST host")
@@ -150,6 +156,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "market-tap: %v\n", err)
 		return ExitConfiguration
 	}
+	if opts.usDay && !calendar.HasUSDayMarket() {
+		fmt.Fprintln(stderr, "market-tap: -us-day-market needs us_day_market windows in the calendar")
+		return ExitConfiguration
+	}
 	limiter, err := newLimiter(opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "market-tap: %v\n", err)
@@ -189,6 +199,11 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		Provider:   opts.provider,
 		AccountRef: opts.accountRef,
 		Workers:    opts.workers,
+
+		USDayMarket: opts.usDay,
+		// A window's last bars need a poll after they close; two intervals
+		// leave room for the poll's own duration.
+		DayMarketTrail: max(marketminute.DefaultDayMarketTrail, 2*opts.interval),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "market-tap: %v\n", err)
@@ -245,15 +260,19 @@ func newLimiter(opts *options) (*ratebudget.Limiter, error) {
 	endpoint := ratebudget.Limit{Rate: opts.endpointRate, Burst: opts.endpointBurst}
 	domestic, _ := marketminute.Endpoint("KRX")
 	overseas, _ := marketminute.Endpoint("NASD")
+	endpoints := []ratebudget.Endpoint{
+		{Name: domestic, Limit: endpoint},
+		{Name: overseas, Limit: endpoint},
+	}
+	if opts.usDay {
+		endpoints = append(endpoints, ratebudget.Endpoint{Name: marketminute.DayMarketEndpoint, Limit: endpoint, Isolated: true})
+	}
 	return ratebudget.New(ratebudget.Config{
 		Providers: []ratebudget.Provider{{
 			Name:       opts.provider,
 			AccountRef: opts.accountRef,
 			Limit:      global,
-			Endpoints: []ratebudget.Endpoint{
-				{Name: domestic, Limit: endpoint},
-				{Name: overseas, Limit: endpoint},
-			},
+			Endpoints:  endpoints,
 		}},
 		ResearchShare: opts.researchShare,
 	})
