@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -401,58 +402,67 @@ func TestTossEnsureReplacingRefusesIssueWhenLeaseCannotCoverPublish(t *testing.T
 	}
 }
 
-// Once the caller is gone the detached finish is bounded by the shutdown
-// publish budget, not the whole remaining lease: a mid-rotation shutdown
-// returns promptly instead of parking until the lock expires.
-func TestTossEnsureReplacingBoundsShutdownWaitToPublishBudget(t *testing.T) {
+// Nothing has been minted when the caller is already gone, so refusing is
+// safe — and required: a request-context cancel is a client disconnect, not
+// a shutdown signal the rotation should keep working under.
+func TestTossEnsureReplacingRefusesWhenCallerLeftBeforeIssuance(t *testing.T) {
+	now := testGatewayNow()
+	store := newFakeRedisStore(func() time.Time { return now })
+	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "late-token", ExpiresIn: 3600}}
+	service := newTestEnsureServiceForProvider(t, store, issuer, now, ProviderToss)
+	store.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if _, err := service.EnsureReplacing(ctx, tokenSHA256("fresh-cache-token")); err != errEnsureUnavailable {
+		t.Fatalf("replacement with caller gone = %v, want unavailable", err)
+	}
+	if issuer.callCount() != 0 {
+		t.Fatal("caller-gone replacement still issued a Toss token")
+	}
+	if len(store.savedRecords()) != 0 {
+		t.Fatal("caller-gone replacement still wrote Redis")
+	}
+}
+
+// Once issuance has started the caller may leave (client disconnect or
+// shutdown): the detached finish keeps the whole remaining lock lease, so a
+// slower-than-usual OAuth response can still be published. A shorter bound
+// here could abort the publish after Toss already rotated, leaving every
+// consumer on a dead token.
+func TestTossEnsureReplacingKeepsLeaseBudgetAfterCallerLeft(t *testing.T) {
 	now := testGatewayNow()
 	store := newFakeRedisStore(func() time.Time { return now })
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	issuer := testOAuthIssue(func(ctx context.Context) (OAuthToken, error) {
-		cancel() // the caller leaves mid-issuance (shutdown)
-		<-ctx.Done()
-		return OAuthToken{}, ctx.Err()
+		cancel() // the caller leaves mid-issuance
+		select {
+		case <-ctx.Done():
+			return OAuthToken{}, errors.New("detached rotation was cut short")
+		case <-time.After(200 * time.Millisecond):
+			return OAuthToken{AccessToken: "synthetic-replacement", ExpiresIn: 3600}, nil
+		}
 	})
 	service := newTestEnsureServiceForProvider(t, store, issuer, now, ProviderToss)
-	service.ShutdownPublishBudget = 100 * time.Millisecond
 	store.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
-
-	started := time.Now()
-	if _, err := service.EnsureReplacing(ctx, tokenSHA256("fresh-cache-token")); err != errEnsureUnavailable {
-		t.Fatalf("shutdown replacement = %v, want unavailable", err)
-	}
-	if elapsed := time.Since(started); elapsed >= lockTTL/2 {
-		t.Fatalf("shutdown wait = %v, want bounded by the publish budget, not the lease", elapsed)
-	}
-}
-
-// A caller already gone at the recheck still finishes the publish, inside
-// the shutdown publish budget rather than the whole remaining lease.
-func TestTossEnsureReplacingPublishesWithinShutdownBudgetAfterCallerLeft(t *testing.T) {
-	now := testGatewayNow()
-	rawStore := newFakeRedisStore(func() time.Time { return now })
-	store := &deadlineObservingRedisStore{fakeRedisStore: rawStore}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "synthetic-replacement", ExpiresIn: 3600}}
-	service := newTestEnsureServiceForProvider(t, store, issuer, now, ProviderToss)
-	service.ShutdownPublishBudget = 150 * time.Millisecond
-	rawStore.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
 
 	state, err := service.EnsureReplacing(ctx, tokenSHA256("fresh-cache-token"))
 	if err != nil || state != EnsureStateIssued {
-		t.Fatalf("shutdown replacement: state=%q, error=%v", state, err)
+		t.Fatalf("detached rotation: state=%q, error=%v", state, err)
 	}
-	token, fresh, loadErr := loadTossCachedToken(t.Context(), rawStore, service.CacheKey, now)
+	token, fresh, loadErr := loadTossCachedToken(t.Context(), store, service.CacheKey, now)
 	if loadErr != nil || !fresh || token != "synthetic-replacement" {
-		t.Fatal("shutdown replacement did not publish")
+		t.Fatal("detached rotation did not publish")
 	}
-	if locked := rawStore.savedWhileLocked(); len(locked) != 1 || !locked[0] {
-		t.Fatal("shutdown replacement was not published while the lock was held")
-	}
-	if store.remaining <= 0 || store.remaining > 150*time.Millisecond {
-		t.Fatalf("detached publish deadline = %v, want within the shutdown publish budget", store.remaining)
+}
+
+// The default issuance floor reserves an OAuth round trip plus both Redis
+// phases — dial and the post-connect deadline — for the publish.
+func TestTossIssuePublishBudgetCoversBothRedisPhases(t *testing.T) {
+	service := newTestEnsureServiceForProvider(t, newFakeRedisStore(testGatewayNow), &fakeOAuthIssuer{}, testGatewayNow(), ProviderToss)
+	if got := service.minIssueLease(); got != 10*time.Second+2*redisDialTimeout {
+		t.Fatalf("issue+publish floor = %v, want OAuth plus dial and connection phases", got)
 	}
 }
 
