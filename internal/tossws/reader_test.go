@@ -846,6 +846,7 @@ func TestQuoteWriteFailureDegradesHealthUntilNextRun(t *testing.T) {
 	var dials atomic.Int32
 	failQuotes := atomic.Bool{}
 	failQuotes.Store(true)
+	orderAppendEntered := make(chan struct{})
 	releaseFirstOrder := make(chan struct{})
 	firstOrderAppend := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -858,6 +859,7 @@ func TestQuoteWriteFailureDegradesHealthUntilNextRun(t *testing.T) {
 			}
 			switch dials.Load() {
 			case 1:
+				close(orderAppendEntered)
 				firstOrderAppend <- struct{}{}
 				<-releaseFirstOrder
 				if reader.Health() {
@@ -867,6 +869,13 @@ func TestQuoteWriteFailureDegradesHealthUntilNextRun(t *testing.T) {
 					t.Error("connection health cleared before the session ended")
 				}
 			case 2:
+				// Recovery requires a successful quote write, not just a new
+				// run: wait until the trade frame's AppendQuote cleared the
+				// degraded flag before checking health.
+				deadline := time.Now().Add(5 * time.Second)
+				for !reader.Health() && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+				}
 				if !reader.Health() {
 					t.Error("reader did not recover after quote writes succeeded again")
 				}
@@ -876,6 +885,9 @@ func TestQuoteWriteFailureDegradesHealthUntilNextRun(t *testing.T) {
 		},
 		AppendQuote: func(Record) error {
 			if failQuotes.Load() {
+				// Hold the failure until the order frame is consumed so its
+				// cancel cannot race the buffered frame and starve Append.
+				<-orderAppendEntered
 				return errors.New("disk full")
 			}
 			return nil
@@ -948,5 +960,101 @@ func TestQuoteWriteFailureDegradesHealthUntilNextRun(t *testing.T) {
 	}
 	if dials.Load() != 2 {
 		t.Fatalf("dials = %d, want 2", dials.Load())
+	}
+}
+
+func TestQuoteWriteFailureClearsOnlyOnSuccessfulWrite(t *testing.T) {
+	trade := fixture(t, "trade-us-asyncapi-example.json")
+	var reader *Reader
+	var dials atomic.Int32
+	failQuotes := atomic.Bool{}
+	failQuotes.Store(true)
+	frameQueues := make(chan chan []byte, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, err := New(Config{
+		AccountSeq: "3", Tokens: testTokens{}, Symbols: []quote.Symbol{{Market: quote.MarketUS, Code: "AAPL"}},
+		Append: func(Record) error { return nil },
+		AppendQuote: func(Record) error {
+			if failQuotes.Load() {
+				return errors.New("disk full")
+			}
+			return nil
+		},
+		Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+			dial := dials.Add(1)
+			frames := make(chan []byte, 4)
+			frameQueues <- frames
+			return fakeSocket{
+				write: func(raw []byte) error {
+					if bytes.Equal(raw, []byte("PING")) {
+						return nil
+					}
+					frames <- fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3","trade:us:AAPL","orderbook:us:AAPL"],"rejected":[]}`, requestID(raw))
+					if dial == 1 {
+						frames <- trade
+					}
+					return nil
+				},
+				read: func(ctx context.Context) ([]byte, error) {
+					select {
+					case frame := <-frames:
+						return frame, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+				close: func() {},
+			}, 0, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 2)
+	go func() { runDone <- reader.Run(ctx) }()
+	<-frameQueues
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRecord) {
+			t.Fatalf("Run() = %v, want recording error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first run did not stop after the quote write failure")
+	}
+	if reader.Health() {
+		t.Fatal("reader recovered without a new run")
+	}
+
+	failQuotes.Store(false)
+	go func() { runDone <- reader.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !reader.healthy.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !reader.healthy.Load() {
+		t.Fatal("second run did not acknowledge its subscription")
+	}
+	if reader.Health() {
+		t.Fatal("health recovered at run start before any quote write succeeded")
+	}
+
+	second := <-frameQueues
+	second <- trade
+	deadline = time.Now().Add(5 * time.Second)
+	for !reader.Health() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !reader.Health() {
+		t.Fatal("health did not recover after a quote write succeeded")
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("second Run() = %v, want context cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second run did not stop after cancellation")
 	}
 }

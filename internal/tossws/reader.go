@@ -101,7 +101,9 @@ type Reader struct {
 }
 
 // Health reports whether this reader has an acknowledged live connection and
-// is not dropping quote records to a failed recorder.
+// is not dropping quote records to a failed recorder. A quote write failure
+// degrades health until an AppendQuote succeeds: the failure cancels the
+// session, so only a later Run's successful quote write proves recovery.
 func (r *Reader) Health() bool { return r.healthy.Load() && !r.quoteWriteFailed.Load() }
 
 func New(cfg Config) (*Reader, error) {
@@ -199,18 +201,25 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 	defer cancel()
 	r.quoteRecords = make(chan Record, quoteQueueSize)
 	quoteWriterDone := make(chan struct{})
-	r.quoteWriteFailed.Store(false)
+	// writeFailed is scoped to this Run for fail-stop draining and ErrRecord
+	// reporting. r.quoteWriteFailed is the persistent degraded state: it is
+	// set by a failed AppendQuote and cleared only by a successful one, so a
+	// restarted lane stays degraded until a quote write actually succeeds.
+	writeFailed := false
 	go func() {
 		defer close(quoteWriterDone)
 		for record := range r.quoteRecords {
-			if r.quoteWriteFailed.Load() {
+			if writeFailed {
 				r.dropQuote("recorder stopped")
 				continue
 			}
 			if err := r.cfg.AppendQuote(record); err != nil {
+				writeFailed = true
 				r.quoteWriteFailed.Store(true)
 				r.dropQuote("append failed")
 				cancel()
+			} else {
+				r.quoteWriteFailed.Store(false)
 			}
 		}
 	}()
@@ -218,7 +227,7 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 		close(r.quoteRecords)
 		<-quoteWriterDone
 		r.quoteRecords = nil
-		if r.quoteWriteFailed.Load() {
+		if writeFailed {
 			if runErr == context.Canceled {
 				runErr = ErrRecord
 			} else {
