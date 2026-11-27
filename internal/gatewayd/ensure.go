@@ -21,6 +21,19 @@ const (
 	lockInitialWait   = 200 * time.Millisecond
 	lockPollInterval  = 100 * time.Millisecond
 	lockWaitTimeout   = 3 * time.Second
+
+	// tossIssuePublishBudget is the lock lease a Toss replacement must still
+	// have after the final cache check before issuance may start: one OAuth
+	// round trip (bounded by the OAuth client timeout) plus the Redis
+	// publish (bounded by redisDialTimeout). Toss permits a single valid
+	// token per client, so minting a token the lease cannot carry through
+	// publish would kill the old one without installing the new.
+	tossIssuePublishBudget = 10*time.Second + redisDialTimeout
+	// tossShutdownPublishBudget bounds a Toss replacement whose caller is
+	// gone (shutdown): issue and publish may still finish, but only inside
+	// this window — the daemon's graceful shutdown does not wait a whole
+	// lock lease.
+	tossShutdownPublishBudget = 5 * time.Second
 )
 
 var (
@@ -57,6 +70,12 @@ type EnsureService struct {
 	InitialLockWait time.Duration
 	LockPollEvery   time.Duration
 	LockWaitTimeout time.Duration
+
+	// MinIssueLease overrides the lock lease a Toss replacement must still
+	// hold before issuance may start; ShutdownPublishBudget overrides the
+	// bound applied once its caller is gone. Zero uses the package defaults.
+	MinIssueLease         time.Duration
+	ShutdownPublishBudget time.Duration
 }
 
 // NewEnsureService preserves the existing kis-mock-only constructor. New
@@ -177,6 +196,7 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 	if err != nil {
 		return "", errEnsureUnavailable
 	}
+	tossReplacement := service.Provider == ProviderToss && rejectedSHA != ""
 	lockStarted := time.Now()
 	locked, err := service.Store.SetNX(ctx, service.LockKey, lockValue, lockTTL)
 	if err != nil {
@@ -186,6 +206,29 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 		return service.waitForFreshToken(ctx)
 	}
 	defer service.releaseLock(lockValue)
+
+	leaseEnd := lockStarted.Add(lockTTL)
+	if tossReplacement {
+		// Toss permits one valid token per client: a reissue invalidates the
+		// previous token, so the rotation must settle — a peer's rechecked
+		// token or our own publish — while this process still holds the lock.
+		// Detach from the caller so a shutdown mid-rotation still finishes
+		// the publish. The work is bounded by the remaining lease, and once
+		// the caller is gone the tighter shutdown publish budget applies.
+		deadline := leaseEnd
+		if ctx.Err() != nil {
+			if bounded := time.Now().Add(service.shutdownPublishBudget()); bounded.Before(deadline) {
+				deadline = bounded
+			}
+		}
+		detached, detachCancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+		defer detachCancel()
+		stopShrink := context.AfterFunc(ctx, func() {
+			time.AfterFunc(service.shutdownPublishBudget(), detachCancel)
+		})
+		defer stopShrink()
+		ctx = detached
+	}
 
 	// A peer can populate the cache between the initial GET and SET NX. Check
 	// again while owning the lock before contacting the provider.
@@ -206,19 +249,11 @@ func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSH
 			return EnsureStateFresh, nil
 		}
 	}
-	tossReplacement := service.Provider == ProviderToss && rejectedSHA != ""
-	if tossReplacement {
-		// A caller can leave after Toss rotates its token but before we read
-		// the response. Finish the rotation within the remaining lock lease.
-		if ctx.Err() != nil {
-			return "", errEnsureUnavailable
-		}
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(context.WithoutCancel(ctx), lockStarted.Add(lockTTL))
-		defer cancel()
-		if ctx.Err() != nil {
-			return "", errEnsureUnavailable
-		}
+	if tossReplacement && time.Until(leaseEnd) < service.minIssueLease() {
+		// The remaining lease cannot cover OAuth issuance plus the Redis
+		// publish, and a minted Toss token kills the previous one. Refuse so
+		// the caller retries under a fresh lease instead.
+		return "", errEnsureUnavailable
 	}
 	issued, err := service.OAuth.Issue(ctx, service.AppKey, service.AppSecret)
 	if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
@@ -341,6 +376,20 @@ func (service *EnsureService) lockWaitTimeout() time.Duration {
 		return providerLockWaitTimeout(service.Provider)
 	}
 	return service.LockWaitTimeout
+}
+
+func (service *EnsureService) minIssueLease() time.Duration {
+	if service.MinIssueLease <= 0 {
+		return tossIssuePublishBudget
+	}
+	return service.MinIssueLease
+}
+
+func (service *EnsureService) shutdownPublishBudget() time.Duration {
+	if service.ShutdownPublishBudget <= 0 {
+		return tossShutdownPublishBudget
+	}
+	return service.ShutdownPublishBudget
 }
 
 func waitContext(ctx context.Context, duration time.Duration) bool {

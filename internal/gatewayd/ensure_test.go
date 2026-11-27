@@ -377,6 +377,85 @@ func TestTossEnsureReplacingDoesNotOverwritePeerAfterLeaseLoss(t *testing.T) {
 	}
 }
 
+// A replacement that reaches issuance too late to publish inside its lease
+// must refuse: a minted Toss token invalidates the previous one, so issuing
+// without the lease to publish would leave consumers on a dead token. The
+// caller retries and starts the whole rotation under a fresh lease.
+func TestTossEnsureReplacingRefusesIssueWhenLeaseCannotCoverPublish(t *testing.T) {
+	now := testGatewayNow()
+	store := newFakeRedisStore(func() time.Time { return now })
+	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "unpublishable-token", ExpiresIn: 3600}}
+	service := newTestEnsureServiceForProvider(t, store, issuer, now, ProviderToss)
+	// Model a nearly-spent lease: even a fresh 30s lease is below the floor.
+	service.MinIssueLease = lockTTL + time.Second
+	store.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+
+	if _, err := service.EnsureReplacing(t.Context(), tokenSHA256("fresh-cache-token")); err != errEnsureUnavailable {
+		t.Fatalf("late-start replacement = %v, want unavailable", err)
+	}
+	if issuer.callCount() != 0 {
+		t.Fatal("issued a Toss token the lock could not carry to publish")
+	}
+	if len(store.savedRecords()) != 0 {
+		t.Fatal("refused replacement still wrote Redis")
+	}
+}
+
+// Once the caller is gone the detached finish is bounded by the shutdown
+// publish budget, not the whole remaining lease: a mid-rotation shutdown
+// returns promptly instead of parking until the lock expires.
+func TestTossEnsureReplacingBoundsShutdownWaitToPublishBudget(t *testing.T) {
+	now := testGatewayNow()
+	store := newFakeRedisStore(func() time.Time { return now })
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	issuer := testOAuthIssue(func(ctx context.Context) (OAuthToken, error) {
+		cancel() // the caller leaves mid-issuance (shutdown)
+		<-ctx.Done()
+		return OAuthToken{}, ctx.Err()
+	})
+	service := newTestEnsureServiceForProvider(t, store, issuer, now, ProviderToss)
+	service.ShutdownPublishBudget = 100 * time.Millisecond
+	store.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+
+	started := time.Now()
+	if _, err := service.EnsureReplacing(ctx, tokenSHA256("fresh-cache-token")); err != errEnsureUnavailable {
+		t.Fatalf("shutdown replacement = %v, want unavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed >= lockTTL/2 {
+		t.Fatalf("shutdown wait = %v, want bounded by the publish budget, not the lease", elapsed)
+	}
+}
+
+// A caller already gone at the recheck still finishes the publish, inside
+// the shutdown publish budget rather than the whole remaining lease.
+func TestTossEnsureReplacingPublishesWithinShutdownBudgetAfterCallerLeft(t *testing.T) {
+	now := testGatewayNow()
+	rawStore := newFakeRedisStore(func() time.Time { return now })
+	store := &deadlineObservingRedisStore{fakeRedisStore: rawStore}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "synthetic-replacement", ExpiresIn: 3600}}
+	service := newTestEnsureServiceForProvider(t, store, issuer, now, ProviderToss)
+	service.ShutdownPublishBudget = 150 * time.Millisecond
+	rawStore.save(service.CacheKey, testFreshPayload(t, ProviderToss, now), time.Hour)
+
+	state, err := service.EnsureReplacing(ctx, tokenSHA256("fresh-cache-token"))
+	if err != nil || state != EnsureStateIssued {
+		t.Fatalf("shutdown replacement: state=%q, error=%v", state, err)
+	}
+	token, fresh, loadErr := loadTossCachedToken(t.Context(), rawStore, service.CacheKey, now)
+	if loadErr != nil || !fresh || token != "synthetic-replacement" {
+		t.Fatal("shutdown replacement did not publish")
+	}
+	if locked := rawStore.savedWhileLocked(); len(locked) != 1 || !locked[0] {
+		t.Fatal("shutdown replacement was not published while the lock was held")
+	}
+	if store.remaining <= 0 || store.remaining > 150*time.Millisecond {
+		t.Fatalf("detached publish deadline = %v, want within the shutdown publish budget", store.remaining)
+	}
+}
+
 func TestTossEnsureReplacingPreservesRedisPhaseBudgets(t *testing.T) {
 	now := testGatewayNow()
 	store := newFakeRedisStore(func() time.Time { return now })
