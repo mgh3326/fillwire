@@ -167,24 +167,6 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 			}
 			return runUpbitRecorder(ctx, settings, logger, ready)
 		},
-		"toss_ws": func(ctx context.Context, ready func()) error {
-			var input struct {
-				KIS struct {
-					Gatewayd gatewaydSettings `toml:"gatewayd"`
-				} `toml:"kis"`
-			}
-			if err := toml.Unmarshal(contents, &input); err != nil {
-				return errors.New("잘못된 Toss WS gatewayd 설정")
-			}
-			if err := validateGatewaydTableKeys(contents); err != nil {
-				return err
-			}
-			settings, err := resolveTossWSSettings(contents, input.KIS.Gatewayd)
-			if err != nil {
-				return err
-			}
-			return runTossWS(ctx, settings, logger, ready)
-		},
 		"quotes": func(ctx context.Context, ready func()) error {
 			return runTossQuoteFeed(ctx, contents, logger, ready)
 		},
@@ -220,6 +202,24 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 				return err
 			}
 			return runUpbitFills(ctx, settings.Directory, observe)
+		}},
+		"toss_ws": &streamModule{name: "toss_ws", start: func(ctx context.Context, observe func(func() bool)) error {
+			var input struct {
+				KIS struct {
+					Gatewayd gatewaydSettings `toml:"gatewayd"`
+				} `toml:"kis"`
+			}
+			if err := toml.Unmarshal(contents, &input); err != nil {
+				return errors.New("잘못된 Toss WS gatewayd 설정")
+			}
+			if err := validateGatewaydTableKeys(contents); err != nil {
+				return err
+			}
+			settings, err := resolveTossWSSettings(contents, input.KIS.Gatewayd)
+			if err != nil {
+				return err
+			}
+			return runTossWS(ctx, settings, logger, observe)
 		}},
 	}
 	for name, start := range registry {
