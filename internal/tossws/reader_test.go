@@ -787,7 +787,7 @@ func TestQuoteRecorderFailureClosesConnection(t *testing.T) {
 	var reader *Reader
 	healthyAtAppend := make(chan bool, 1)
 	closed := make(chan struct{}, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	reader, err := New(Config{
 		AccountSeq: "3", Tokens: testTokens{}, Symbols: []quote.Symbol{{Market: quote.MarketUS, Code: "AAPL"}},
@@ -819,8 +819,15 @@ func TestQuoteRecorderFailureClosesConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reader.Run(ctx); !errors.Is(err, ErrRecord) {
-		t.Fatalf("Run() = %v, want recording error", err)
+	runDone := make(chan error, 1)
+	go func() { runDone <- reader.Run(ctx) }()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRecord) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Run() = %v, want the recorder failure alone", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("quote recorder failure did not close the connection")
 	}
 	if !<-healthyAtAppend || reader.Health() {
 		t.Fatal("health should transition from connected to disconnected on recorder failure")
@@ -829,5 +836,117 @@ func TestQuoteRecorderFailureClosesConnection(t *testing.T) {
 	case <-closed:
 	default:
 		t.Fatal("failed recorder left socket open")
+	}
+}
+
+func TestQuoteWriteFailureDegradesHealthUntilNextRun(t *testing.T) {
+	trade := fixture(t, "trade-us-asyncapi-example.json")
+	order := fixture(t, "order.json")
+	var reader *Reader
+	var dials atomic.Int32
+	failQuotes := atomic.Bool{}
+	failQuotes.Store(true)
+	releaseFirstOrder := make(chan struct{})
+	firstOrderAppend := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, err := New(Config{
+		AccountSeq: "3", Tokens: testTokens{}, Symbols: []quote.Symbol{{Market: quote.MarketUS, Code: "AAPL"}},
+		Append: func(record Record) error {
+			if record.Kind != "order" {
+				return nil
+			}
+			switch dials.Load() {
+			case 1:
+				firstOrderAppend <- struct{}{}
+				<-releaseFirstOrder
+				if reader.Health() {
+					t.Error("reader reported healthy while quote records were dropped")
+				}
+				if !reader.healthy.Load() {
+					t.Error("connection health cleared before the session ended")
+				}
+			case 2:
+				if !reader.Health() {
+					t.Error("reader did not recover after quote writes succeeded again")
+				}
+				cancel()
+			}
+			return nil
+		},
+		AppendQuote: func(Record) error {
+			if failQuotes.Load() {
+				return errors.New("disk full")
+			}
+			return nil
+		},
+		Dial: func(context.Context, string, http.Header) (Socket, int, error) {
+			dials.Add(1)
+			frames := make(chan []byte, 4)
+			return fakeSocket{
+				write: func(raw []byte) error {
+					if bytes.Equal(raw, []byte("PING")) {
+						return nil
+					}
+					frames <- fmt.Appendf(nil, `{"type":"subscriptions","id":%q,"subscribed":["personal:order:3","trade:us:AAPL","orderbook:us:AAPL"],"rejected":[]}`, requestID(raw))
+					frames <- trade
+					frames <- order
+					return nil
+				},
+				read: func(ctx context.Context) ([]byte, error) {
+					select {
+					case frame := <-frames:
+						return frame, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+				close: func() {},
+			}, 0, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- reader.Run(ctx) }()
+	select {
+	case <-firstOrderAppend:
+	case <-time.After(5 * time.Second):
+		t.Fatal("order record was not appended")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for reader.Health() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if reader.Health() {
+		t.Fatal("quote write failure did not degrade reader health")
+	}
+	if !reader.healthy.Load() {
+		t.Fatal("session ended before the degraded health check")
+	}
+	close(releaseFirstOrder)
+	if err := <-runDone; !errors.Is(err, ErrRecord) {
+		t.Fatalf("Run() = %v, want recording error", err)
+	}
+	if reader.droppedQuotes.Load() == 0 {
+		t.Fatal("dropped quote records were not counted")
+	}
+	if reader.Health() {
+		t.Fatal("reader recovered without a new run")
+	}
+
+	failQuotes.Store(false)
+	go func() { runDone <- reader.Run(ctx) }()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("second Run() = %v, want context cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second run did not stop after the order record")
+	}
+	if dials.Load() != 2 {
+		t.Fatalf("dials = %d, want 2", dials.Load())
 	}
 }

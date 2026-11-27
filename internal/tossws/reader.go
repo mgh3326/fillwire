@@ -88,19 +88,21 @@ type Config struct {
 }
 
 type Reader struct {
-	cfg            Config
-	decoder        *quote.Decoder
-	topics         []string
-	running        atomic.Bool
-	healthy        atomic.Bool
-	malformed      atomic.Uint64
-	rejectedQuotes atomic.Uint64
-	droppedQuotes  atomic.Uint64
-	quoteRecords   chan Record
+	cfg              Config
+	decoder          *quote.Decoder
+	topics           []string
+	running          atomic.Bool
+	healthy          atomic.Bool
+	quoteWriteFailed atomic.Bool
+	malformed        atomic.Uint64
+	rejectedQuotes   atomic.Uint64
+	droppedQuotes    atomic.Uint64
+	quoteRecords     chan Record
 }
 
-// Health reports whether this reader has an acknowledged live connection.
-func (r *Reader) Health() bool { return r.healthy.Load() }
+// Health reports whether this reader has an acknowledged live connection and
+// is not dropping quote records to a failed recorder.
+func (r *Reader) Health() bool { return r.healthy.Load() && !r.quoteWriteFailed.Load() }
 
 func New(cfg Config) (*Reader, error) {
 	if !ValidAccountSeq(cfg.AccountSeq) || cfg.Tokens == nil || cfg.Append == nil {
@@ -197,16 +199,16 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 	defer cancel()
 	r.quoteRecords = make(chan Record, quoteQueueSize)
 	quoteWriterDone := make(chan struct{})
-	quoteWriteFailed := false
+	r.quoteWriteFailed.Store(false)
 	go func() {
 		defer close(quoteWriterDone)
 		for record := range r.quoteRecords {
-			if quoteWriteFailed {
+			if r.quoteWriteFailed.Load() {
 				r.dropQuote("recorder stopped")
 				continue
 			}
 			if err := r.cfg.AppendQuote(record); err != nil {
-				quoteWriteFailed = true
+				r.quoteWriteFailed.Store(true)
 				r.dropQuote("append failed")
 				cancel()
 			}
@@ -216,7 +218,7 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 		close(r.quoteRecords)
 		<-quoteWriterDone
 		r.quoteRecords = nil
-		if quoteWriteFailed {
+		if r.quoteWriteFailed.Load() {
 			if runErr == context.Canceled {
 				runErr = ErrRecord
 			} else {

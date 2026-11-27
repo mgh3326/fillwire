@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mgh3326/fillwire/internal/reader"
+	"github.com/mgh3326/fillwire/internal/tossws"
 	"github.com/mgh3326/go-kis/kis/ws"
 )
 
@@ -280,6 +281,23 @@ func TestSupervisorStopsKISTerminalErrors(t *testing.T) {
 				t.Fatalf("state=%+v attempts=%d", got, attempts.Load())
 			}
 		})
+	}
+}
+
+func TestSupervisorDoesNotRestartTossWSForbidden(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var attempts atomic.Int32
+	slot := &moduleSlot{name: "toss_ws", Module: &serviceModule{name: "toss_ws", start: func(context.Context, func()) error {
+		attempts.Add(1)
+		return errors.Join(errModuleStopped, errors.Join(tossws.ErrForbidden, tossws.ErrRecord))
+	}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	s := newSupervisor([]*moduleSlot{slot}, logger)
+	s.retryMin, s.retryMax = time.Millisecond, 2*time.Millisecond
+	s.run(ctx)
+	if got := slot.snapshot(); got != (moduleStatus{State: "failed"}) || attempts.Load() != 1 {
+		t.Fatalf("state=%+v attempts=%d", got, attempts.Load())
 	}
 }
 

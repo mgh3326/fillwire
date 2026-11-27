@@ -84,7 +84,7 @@ func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logg
 	}
 }
 
-func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger, ready func()) error {
+func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger, observe func(func() bool)) error {
 	logger = logger.With("lane", "toss_ws")
 	client, err := tokenfetch.NewClient(settings.fetchURL, settings.credential)
 	if err != nil {
@@ -122,15 +122,29 @@ func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger
 	if err != nil {
 		return err
 	}
-	if ready != nil {
-		ready()
+	if observe != nil {
+		observe(reader.Health)
 	}
 	err = reader.Run(ctx)
 	// Reader.Run retries transport failures itself. Preserve its deliberate
 	// authentication stops and subscription rejections under the supervisor.
-	if ready != nil && err != nil && ctx.Err() == nil &&
-		(!errors.Is(err, tossws.ErrRecord) || errors.Is(err, tossws.ErrAuthRevokedStop)) {
+	if observe != nil && err != nil && ctx.Err() == nil && tossWSModuleStop(err) {
 		return errors.Join(errModuleStopped, err)
 	}
 	return err
+}
+
+// tossWSModuleStop reports whether a reader.Run result is a deliberate stop
+// the supervisor must not retry. A pure recording failure stays retryable,
+// but a permanent rejection joined with ErrRecord is still a stop.
+func tossWSModuleStop(err error) bool {
+	for _, stop := range []error{
+		tossws.ErrAccountNotFound, tossws.ErrRejected, tossws.ErrAck,
+		tossws.ErrForbidden, tossws.ErrAuthRevokedStop,
+	} {
+		if errors.Is(err, stop) {
+			return true
+		}
+	}
+	return !errors.Is(err, tossws.ErrRecord)
 }

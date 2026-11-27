@@ -307,7 +307,9 @@ websocket stays dedicated to `fills:kis`; the quote reader never uses KIS.
 시세 프레임은 `directory/toss-quote/<UTC 날짜>/<account_seq>.jsonl`에
 `received_at`(로컬 수신 시각), `kind`, `topic`, 세션 ID, 원본 JSON과 함께
 추가됩니다. 시세 기록은 별도 bounded queue와 기록기를 사용해 날짜 압축이
-주문 프레임 수신을 막지 않게 합니다. 구문이 잘못됐거나 구독 심볼과 맞지 않는
+주문 프레임 수신을 막지 않게 합니다. 시세 기록 추가가 실패하면 연결을 닫고
+모듈 상태를 저하시키며 감독자가 재시작하고, 재시작 후 기록이 다시 성공하면
+상태가 회복됩니다. 구문이 잘못됐거나 구독 심볼과 맞지 않는
 프레임은 버리고 malformed 카운터를 올립니다. 이 기능은 Redis 시세 스트림이나
 원장에 쓰지 않고 주문도 내지 않습니다.
 

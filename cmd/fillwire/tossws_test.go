@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mgh3326/fillwire/internal/tossws"
 )
 
 func TestTossWSConfigExplicitOptIn(t *testing.T) {
@@ -48,5 +51,33 @@ func TestTossWSConfigExplicitOptIn(t *testing.T) {
 	gateway.URL = "http://gateway.invalid"
 	if _, err := resolveTossWSSettings([]byte(on), gateway); err == nil {
 		t.Fatal("untrusted credential transport accepted")
+	}
+}
+
+func TestTossWSModuleStop(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		stop bool
+	}{
+		{"record-only", tossws.ErrRecord, false},
+		{"forbidden", tossws.ErrForbidden, true},
+		{"account-not-found", tossws.ErrAccountNotFound, true},
+		{"rejected", tossws.ErrRejected, true},
+		{"ack", tossws.ErrAck, true},
+		{"auth-revoked-stop", tossws.ErrAuthRevokedStop, true},
+		{"forbidden-with-record", errors.Join(tossws.ErrForbidden, tossws.ErrRecord), true},
+		{"account-not-found-with-record", errors.Join(tossws.ErrAccountNotFound, tossws.ErrRecord), true},
+		{"rejected-with-record", errors.Join(tossws.ErrRejected, tossws.ErrRecord), true},
+		{"ack-with-record", errors.Join(tossws.ErrAck, tossws.ErrRecord), true},
+		{"auth-stop-with-record", errors.Join(tossws.ErrAuthRevokedStop, tossws.ErrRecord), true},
+		{"generic", errors.New("dial failed"), true},
+		{"generic-with-record", errors.Join(errors.New("dial failed"), tossws.ErrRecord), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tossWSModuleStop(tc.err); got != tc.stop {
+				t.Fatalf("tossWSModuleStop(%v) = %v, want %v", tc.err, got, tc.stop)
+			}
+		})
 	}
 }
