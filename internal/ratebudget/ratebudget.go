@@ -327,14 +327,23 @@ func (l *Limiter) Acquire(k Key) error {
 			return &Refusal{Code: CodeCircuitOpen, RetryAfter: wait}
 		}
 	}
+	// A half-open probe pays from its endpoint bucket only. The provider bucket
+	// is the regular-pass budget: a probe spending it would starve the regular
+	// poll, and a drained regular poll would starve the probe. The probe stays
+	// bounded because the breaker admits one per open window.
 	endpointWait := ep.bucket.ready(now)
-	providerWait := ps.global.ready(now)
+	var providerWait time.Duration
+	if !probe {
+		providerWait = ps.global.ready(now)
+	}
 	if wait := max(endpointWait, providerWait); wait > 0 {
 		ep.breaker.abandonProbe()
 		return &Refusal{Code: CodeRateLimited, RetryAfter: wait}
 	}
 	ep.bucket.take(now)
-	ps.global.take(now)
+	if !probe {
+		ps.global.take(now)
+	}
 	return nil
 }
 
