@@ -134,6 +134,26 @@ func NewHandler(service *Service) http.Handler {
 		writer.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(writer).Encode(check)
 	})
+	// GET /v1/cancel-attempts lists UNKNOWN cancel markers on the KIS mock
+	// scopes for one command-ID prefix. It exists so a fresh canary run can see
+	// a cancel an earlier run could not confirm. It is read-only.
+	mux.HandleFunc("GET /v1/cancel-attempts", func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		prefix := query.Get("command_prefix")
+		if query.Get("state") != string(CancelStateUnknown) || len(query) != 2 || !validCancelPrefix(prefix) {
+			writeShadowError(writer, http.StatusBadRequest, ErrorInvalidCommand)
+			return
+		}
+		attempts, err := service.UnknownCancelAttempts(request.Context(), prefix)
+		if err != nil {
+			writeShadowError(writer, http.StatusInternalServerError, ErrorStorageFailure)
+			return
+		}
+		writer.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(writer).Encode(struct {
+			CancelAttempts []CancelReceipt `json:"cancel_attempts"`
+		}{CancelAttempts: attempts})
+	})
 	mux.HandleFunc("POST /v1/commands/{command_id}/cancel", func(writer http.ResponseWriter, request *http.Request) {
 		receipt, err := service.Cancel(request.Context(), request.PathValue("command_id"))
 		if err != nil {
@@ -204,6 +224,20 @@ func writeShadowError(writer http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(writer).Encode(struct {
 		ErrorCode string `json:"error_code"`
 	}{ErrorCode: strings.TrimSpace(code)})
+}
+
+// validCancelPrefix accepts a short printable-ASCII prefix. The listing is
+// scoped by prefix, so an empty prefix would list every mock cancel marker.
+func validCancelPrefix(prefix string) bool {
+	if prefix == "" || len(prefix) > 64 {
+		return false
+	}
+	for _, character := range prefix {
+		if character <= ' ' || character > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 func writeCancelReceipt(writer http.ResponseWriter, status int, receipt CancelReceipt) {

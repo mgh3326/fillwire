@@ -179,6 +179,47 @@ func (store *Store) FindCancelAttempt(ctx context.Context, commandID string) (Ca
 	return receipt, true, nil
 }
 
+// maxUnknownCancelList bounds one listing. A canary leaves at most one marker
+// per run, so the bound only guards against a runaway caller.
+const maxUnknownCancelList = 20
+
+// UnknownCancelAttempts lists committed UNKNOWN cancel markers for KIS mock
+// orders whose command IDs start with prefix, oldest first. It only reads
+// markers: it cannot change one and cannot authorize a broker send.
+func (store *Store) UnknownCancelAttempts(ctx context.Context, prefix string) ([]CancelReceipt, error) {
+	if store == nil || store.db == nil {
+		return nil, errors.New("store unavailable")
+	}
+	rows, err := store.db.QueryContext(ctx, `
+		SELECT a.command_id, a.state, COALESCE(a.error_code, ''), a.recorded_at
+		FROM cancel_attempts a
+		JOIN commands c ON c.command_id = a.command_id
+		WHERE a.state = ? AND c.account_scope IN (?, ?) AND substr(a.command_id, 1, ?) = ?
+		ORDER BY a.recorded_at, a.command_id
+		LIMIT ?`,
+		CancelStateUnknown, executioncontracts.AccountScopeKISMock, executioncontracts.AccountScopeKISMockUS,
+		len(prefix), prefix, maxUnknownCancelList)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	receipts := []CancelReceipt{}
+	for rows.Next() {
+		var receipt CancelReceipt
+		if err := rows.Scan(&receipt.CommandID, &receipt.State, &receipt.ErrorCode, &receipt.RecordedAt); err != nil {
+			return nil, err
+		}
+		if !validCancelReceipt(receipt) {
+			return nil, errors.New("invalid stored cancel receipt")
+		}
+		receipts = append(receipts, receipt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return receipts, nil
+}
+
 // FindCancelTarget returns only orders whose effective disposition is
 // ACCEPTED and whose broker order ID is known. KIS resolution rows from older
 // releases can contain heuristic matches and cannot authorize cancellation.

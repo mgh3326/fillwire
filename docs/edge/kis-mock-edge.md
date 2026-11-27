@@ -11,7 +11,8 @@ redirect Python traffic, or modify `auto_trader`.
 The receiver exposes `POST /v1/commands`,
 `POST /v1/commands/{command_id}/cancel`, the bounded
 `POST /v1/commands/{command_id}/resolve`, and the read-only
-`GET /v1/price-band`, and binds to `127.0.0.1:8080` by
+`GET /v1/price-band` and `GET /v1/cancel-attempts?state=UNKNOWN&command_prefix=<prefix>`,
+and binds to `127.0.0.1:8080` by
 default. `BROKER_EDGE_LISTEN_ADDR` may select another loopback address (for
 example `127.0.0.1:0` in tests), but cannot expose the unauthenticated receiver
 on a non-loopback interface. Authentication and authorization remain a later,
@@ -177,6 +178,9 @@ and again inside the RoundTripper immediately before any transport call.
   `CANCELLED`, `NOT_FOUND` (`cancel_not_found`), or `UNKNOWN`; duplicate POSTs
   replay that result and never resend the broker request.
 - No retry or replay path can issue a second broker POST for a command ID.
+- `GET /v1/cancel-attempts` lists committed `UNKNOWN` cancel markers for the
+  KIS mock scopes whose command IDs match the required prefix. It only reads
+  them. An empty prefix is refused, so the call cannot list every marker.
 - No account, order, or token values are emitted as metrics or response data.
 - This repository's tests use fake transports only; they do not execute a real
   KIS VTS or Alpaca paper placement.

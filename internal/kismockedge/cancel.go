@@ -97,6 +97,15 @@ func (service *Service) Cancel(ctx context.Context, commandID string) (receipt C
 	return service.Store.FinalizeCancel(ctx, final)
 }
 
+// UnknownCancelAttempts is the read-only inventory of UNKNOWN cancel markers
+// behind the canary's carry-over check. See Store.UnknownCancelAttempts.
+func (service *Service) UnknownCancelAttempts(ctx context.Context, prefix string) ([]CancelReceipt, error) {
+	if service == nil || service.Store == nil {
+		return nil, errors.New("store unavailable")
+	}
+	return service.Store.UnknownCancelAttempts(ctx, prefix)
+}
+
 func (service *Service) cancelReceipt(commandID string, state CancelState, code string) CancelReceipt {
 	now := time.Now
 	if service != nil && service.Now != nil {
