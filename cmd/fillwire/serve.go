@@ -17,6 +17,7 @@ import (
 	"github.com/mgh3326/fillwire/internal/alert"
 	"github.com/mgh3326/fillwire/internal/gatewayd"
 	"github.com/mgh3326/fillwire/internal/reader"
+	"github.com/mgh3326/fillwire/internal/tossws"
 	"github.com/mgh3326/go-kis/kis/ws"
 
 	"github.com/pelletier/go-toml/v2"
@@ -126,6 +127,8 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 	hub := newKISHub()
 	books, booksErr := enabled("books")
 	futures, _ := enabled("kis_futures")
+	// One quote health outlives every toss_ws attempt the supervisor starts.
+	tossQuote := tossws.NewQuoteHealth()
 	registry := map[string]func(context.Context, func()) error{
 		"gatewayd": func(ctx context.Context, ready func()) error {
 			return runGatewaydModule(ctx, contents, ready)
@@ -219,7 +222,7 @@ func serveModules(contents []byte, logger *slog.Logger) ([]*moduleSlot, string, 
 			if err != nil {
 				return err
 			}
-			return runTossWS(ctx, settings, logger, observe)
+			return runTossWS(ctx, settings, logger, observe, tossWSDeps{quote: tossQuote})
 		}},
 	}
 	for name, start := range registry {

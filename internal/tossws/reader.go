@@ -76,6 +76,20 @@ type wallClock struct{}
 func (wallClock) Now() time.Time                         { return time.Now() }
 func (wallClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
+// QuoteHealth is the quote recorder's failure state. Its owner keeps it across
+// Reader restarts: a failed quote write cancels its session, and a fresh Reader
+// must not report healthy until one of its own quote writes succeeds.
+type QuoteHealth struct {
+	failed atomic.Bool
+}
+
+// NewQuoteHealth returns a quote recorder state that has not failed.
+func NewQuoteHealth() *QuoteHealth { return &QuoteHealth{} }
+
+// Degraded reports whether the last quote write failed and no later write has
+// succeeded.
+func (q *QuoteHealth) Degraded() bool { return q.failed.Load() }
+
 type Config struct {
 	AccountSeq  string
 	Symbols     []quote.Symbol
@@ -85,6 +99,9 @@ type Config struct {
 	Dial        Dialer
 	Clock       Clock
 	Logger      *slog.Logger
+	// QuoteHealth outlives the Reader when its owner restarts readers. Nil
+	// gives this Reader its own state.
+	QuoteHealth *QuoteHealth
 }
 
 type Reader struct {
@@ -93,21 +110,21 @@ type Reader struct {
 	topics  []string
 	running atomic.Bool
 	healthy atomic.Bool
-	// quoteWriteFailed degrades Health until an AppendQuote succeeds; a failed
-	// write cancels the session, so only a later Run's successful quote write
-	// proves the recorder recovered.
-	quoteWriteFailed atomic.Bool
-	malformed        atomic.Uint64
-	rejectedQuotes   atomic.Uint64
-	droppedQuotes    atomic.Uint64
-	quoteRecords     chan Record
+	// quote degrades Health until an AppendQuote succeeds; a failed write
+	// cancels the session, so only a later Run's successful quote write proves
+	// the recorder recovered.
+	quote          *QuoteHealth
+	malformed      atomic.Uint64
+	rejectedQuotes atomic.Uint64
+	droppedQuotes  atomic.Uint64
+	quoteRecords   chan Record
 }
 
 // Health reports whether this reader has an acknowledged live connection and
 // is not dropping quote records to a failed recorder. A quote write failure
 // degrades health until an AppendQuote succeeds: the failure cancels the
 // session, so only a later Run's successful quote write proves recovery.
-func (r *Reader) Health() bool { return r.healthy.Load() && !r.quoteWriteFailed.Load() }
+func (r *Reader) Health() bool { return r.healthy.Load() && !r.quote.Degraded() }
 
 func New(cfg Config) (*Reader, error) {
 	if !ValidAccountSeq(cfg.AccountSeq) || cfg.Tokens == nil || cfg.Append == nil {
@@ -129,7 +146,10 @@ func New(cfg Config) (*Reader, error) {
 	if cfg.AppendQuote == nil {
 		cfg.AppendQuote = cfg.Append
 	}
-	return &Reader{cfg: cfg, decoder: quote.NewDecoder(cfg.Symbols), topics: topics}, nil
+	if cfg.QuoteHealth == nil {
+		cfg.QuoteHealth = NewQuoteHealth()
+	}
+	return &Reader{cfg: cfg, decoder: quote.NewDecoder(cfg.Symbols), topics: topics, quote: cfg.QuoteHealth}, nil
 }
 
 // buildDeclaration creates Toss's full-replacement subscription declaration.
@@ -216,11 +236,11 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 			}
 			if err := r.cfg.AppendQuote(record); err != nil {
 				writeFailed = true
-				r.quoteWriteFailed.Store(true)
+				r.quote.failed.Store(true)
 				r.dropQuote("append failed")
 				cancel()
 			} else {
-				r.quoteWriteFailed.Store(false)
+				r.quote.failed.Store(false)
 			}
 		}
 	}()
