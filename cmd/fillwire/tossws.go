@@ -66,6 +66,17 @@ func resolveTossWSSettings(contents []byte, g gatewaydSettings) (tossWSSettings,
 	return tossWSSettings{tossWSFileConfig: f, symbols: symbols, fetchURL: base, credential: credential}, nil
 }
 
+// tossWSDeps is what a Reader attempt needs beyond its settings. Quote holds
+// recorder health across supervisor restarts, so the owner must pass the same
+// value to every attempt. The other fields replace production I/O for tests;
+// nil means production.
+type tossWSDeps struct {
+	quote       *tossws.QuoteHealth
+	dial        tossws.Dialer
+	tokens      tossws.TokenSource
+	appendQuote func(tossws.Record) error
+}
+
 func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger) func() {
 	if !settings.Enabled {
 		return func() {}
@@ -74,7 +85,7 @@ func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logg
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := runTossWS(ctx, settings, logger, nil); err != nil && !errors.Is(err, context.Canceled) {
+		if err := runTossWS(ctx, settings, logger, nil, tossWSDeps{}); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("Toss WS reader stopped", "reason", err)
 		}
 	}()
@@ -84,11 +95,15 @@ func startTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logg
 	}
 }
 
-func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger, observe func(func() bool)) error {
+func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger, observe func(func() bool), deps tossWSDeps) error {
 	logger = logger.With("lane", "toss_ws")
-	client, err := tokenfetch.NewClient(settings.fetchURL, settings.credential)
-	if err != nil {
-		return errors.New("Toss WS gatewayd client setup failed")
+	tokens := deps.tokens
+	if tokens == nil {
+		client, err := tokenfetch.NewClient(settings.fetchURL, settings.credential)
+		if err != nil {
+			return errors.New("Toss WS gatewayd client setup failed")
+		}
+		tokens = tokenfetch.NewHolder(client, string(gatewayd.ProviderToss), 2*time.Minute, false, nil)
 	}
 	orderSink, err := recording.NewSink(settings.Directory, tossOrderStream)
 	if err != nil {
@@ -107,17 +122,23 @@ func runTossWS(ctx context.Context, settings tossWSSettings, logger *slog.Logger
 			logger.Error("Toss WS quote recorder close failed", "reason", err)
 		}
 	}()
+	appendQuote := deps.appendQuote
+	if appendQuote == nil {
+		appendQuote = func(r tossws.Record) error {
+			return quoteSink.Append(tossQuoteStream, settings.AccountSeq, r.ReceivedAt, r)
+		}
+	}
 	reader, err := tossws.New(tossws.Config{
 		AccountSeq: settings.AccountSeq,
 		Symbols:    settings.symbols,
-		Tokens:     tokenfetch.NewHolder(client, string(gatewayd.ProviderToss), 2*time.Minute, false, nil),
+		Tokens:     tokens,
 		Append: func(r tossws.Record) error {
 			return orderSink.Append(tossOrderStream, settings.AccountSeq, r.ReceivedAt, r)
 		},
-		AppendQuote: func(r tossws.Record) error {
-			return quoteSink.Append(tossQuoteStream, settings.AccountSeq, r.ReceivedAt, r)
-		},
-		Logger: logger,
+		AppendQuote: appendQuote,
+		Dial:        deps.dial,
+		QuoteHealth: deps.quote,
+		Logger:      logger,
 	})
 	if err != nil {
 		return err
