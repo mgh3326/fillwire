@@ -385,7 +385,12 @@ type Sink struct {
 	writers map[string]*DailyWriter
 	locks   map[string]*StreamLock
 	closed  bool
+	shut    bool
 }
+
+// ErrCloseTimeout reports that CloseWithin stopped waiting for accepted appends.
+// The writers and stream locks stay open until the process exits.
+var ErrCloseTimeout = errors.New("recording: 기록 쓰기가 끝나기 전에 싱크 닫기 시간이 초과되었습니다")
 
 func NewSink(root string, streams ...string) (*Sink, error) {
 	if root == "" {
@@ -444,16 +449,29 @@ func (s *Sink) beginAppend(stream, name string) (*DailyWriter, error) {
 	s.pending.Add(1)
 	return w, nil
 }
-func (s *Sink) Close() error {
+
+// Close refuses new appends, waits for accepted ones, and closes every writer
+// and lock.
+func (s *Sink) Close() error { return s.CloseWithin(0) }
+
+// CloseWithin is Close with a bound on the wait for accepted appends. A timeout
+// above zero returns ErrCloseTimeout when the wait expires; a later call waits
+// again. A timeout of zero or less waits without a bound.
+func (s *Sink) CloseWithin(timeout time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	// Appends register under mu and finish without it. Refusing new appends
+	// first stops the pending count from growing during the wait.
+	s.closed = true
+	if s.shut {
 		return nil
 	}
-	s.closed = true
-	// Appends register under mu and finish without it. Keep the process
-	// locks until all accepted writes and writer closes have completed.
-	s.pending.Wait()
+	// Keep the process locks until all accepted writes and writer closes have
+	// completed, or until the bound expires.
+	if err := s.waitPending(timeout); err != nil {
+		return err
+	}
+	s.shut = true
 	var errs []error
 	for _, w := range s.writers {
 		if err := w.Close(); err != nil {
@@ -466,4 +484,26 @@ func (s *Sink) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// waitPending waits for accepted appends. It is called with s.mu held and only
+// after closed is set, so no new append can add to the pending count.
+func (s *Sink) waitPending(timeout time.Duration) error {
+	if timeout <= 0 {
+		s.pending.Wait()
+		return nil
+	}
+	drained := make(chan struct{})
+	go func() {
+		s.pending.Wait()
+		close(drained)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-drained:
+		return nil
+	case <-timer.C:
+		return ErrCloseTimeout
+	}
 }

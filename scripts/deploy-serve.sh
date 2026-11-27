@@ -117,6 +117,11 @@ if [[ $2 == --recover ]]; then
   exit 0
 fi
 [[ ! -e $pending ]] || fail "interrupted deployment; run --recover first"
+# Install the handlers before the recovery record is published. A signal before
+# that exits and releases the lock; a signal after it restores the previous pin.
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
+trap 'interrupted 129' HUP
 
 old=
 if [[ -e $current ]]; then
@@ -141,9 +146,6 @@ else
   : > "$lock/pin"
   mv -f "$lock/pin" "$pending"
 fi
-trap 'interrupted 130' INT
-trap 'interrupted 143' TERM
-trap 'interrupted 129' HUP
 sync -f "$state"
 write_pin "$current" "$pin"
 if restart_and_gate "$pin"; then
