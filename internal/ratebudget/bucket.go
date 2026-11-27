@@ -36,14 +36,20 @@ func (b *bucket) refill(now time.Time) {
 // the bucket but never removes a token, so a caller can price both layers of a
 // request before spending either.
 func (b *bucket) ready(now time.Time) time.Duration {
+	return b.readyHolding(now, 0)
+}
+
+// readyHolding is ready for a caller that must leave hold tokens in the bucket
+// for others: it waits until hold+1 tokens are available.
+func (b *bucket) readyHolding(now time.Time, hold int) time.Duration {
 	if now.Before(b.closed) {
 		return b.closed.Sub(now)
 	}
 	b.refill(now)
-	if b.tokens >= 1 {
+	if b.tokens >= float64(hold)+1 {
 		return 0
 	}
-	need := (1 - b.tokens) / b.rate
+	need := (float64(hold) + 1 - b.tokens) / b.rate
 	wait := time.Duration(math.Ceil(need * float64(time.Second)))
 	if wait <= 0 {
 		wait = time.Nanosecond
