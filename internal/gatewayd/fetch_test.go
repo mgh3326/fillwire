@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -973,9 +974,11 @@ func TestFetchTossReadsTokenRotatedByEnsure(t *testing.T) {
 type blockingPanicSource struct {
 	fetchSource
 	started, release chan struct{}
+	calls            atomic.Int32
 }
 
-func (source blockingPanicSource) EnsureReplacing(context.Context, string) (EnsureState, error) {
+func (source *blockingPanicSource) EnsureReplacing(context.Context, string) (EnsureState, error) {
+	source.calls.Add(1)
 	close(source.started)
 	<-source.release
 	panic("synthetic issuer panic")
@@ -995,7 +998,7 @@ func TestFetchPanicFailsLeaderAndFollower(t *testing.T) {
 	h := newFetchHarness(t, ProviderKISMock)
 	h.seed("synthetic-rejected")
 	state := h.fetch.providers[h.provider]
-	source := blockingPanicSource{state.source, make(chan struct{}), make(chan struct{})}
+	source := &blockingPanicSource{fetchSource: state.source, started: make(chan struct{}), release: make(chan struct{})}
 	state.source = source
 	body := `{"failed_token_sha256":"` + shaHex("synthetic-rejected") + `"}`
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1035,6 +1038,9 @@ func TestFetchPanicFailsLeaderAndFollower(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("leader or follower did not return")
 		}
+	}
+	if calls := source.calls.Load(); calls != 1 {
+		t.Errorf("EnsureReplacing calls = %d, want 1: the follower shares the leader's attempt", calls)
 	}
 }
 
