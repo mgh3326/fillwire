@@ -49,8 +49,9 @@ ack. The KIS mock per-second order limit could not be confirmed from a primary
 source: community sources disagree (about 2 versus 5 requests per second). The
 `1.1 s` value is the fallback that covers a one-request-per-second window. It
 applies to both the normal cancel and the post-check cleanup. The wait is not
-charged to `durations_ms.cancel_sent`. It is also never cut short by the run
-deadline, so an acknowledged order always gets its cancel attempt.
+charged to `durations_ms.cancel_sent`. If the run deadline passes during that
+wait, the cancel still runs on a context detached from the deadline and bounded
+by the cancel budget, so an acknowledged order always gets its cancel attempt.
 
 ## Carry-over of an unconfirmed cancel
 
