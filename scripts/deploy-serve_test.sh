@@ -4,6 +4,7 @@ cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/bin"
+export TEST_REAL_MV=$(command -v mv)
 export PATH="$tmp/bin:$PATH"
 export FILLWIRE_DEPLOY_STATE_DIR="$tmp/state"
 export TEST_LOG="$tmp/log"
@@ -14,6 +15,7 @@ export TEST_RESTARTS="$tmp/restarts"
 export TEST_STARTS="$tmp/starts"
 export TEST_STOPPED="$tmp/stopped"
 export TEST_INTERRUPT="$tmp/interrupt"
+export TEST_PUBLISH_INTERRUPT="$tmp/publish-interrupt"
 touch "$TEST_TICK" "$TEST_RESTARTS" "$TEST_STARTS"
 a=ghcr.io/mgh3326/fillwire@sha256:$(printf '%064d' 1)
 b=ghcr.io/mgh3326/fillwire@sha256:$(printf '%064d' 2)
@@ -94,6 +96,17 @@ fi
 MOCK
 printf '#!/bin/bash\necho tick >> "$TEST_TICK"\n' > "$tmp/bin/sleep"
 printf '#!/bin/bash\n[[ $1 == -f && -d $2 ]]\n' > "$tmp/bin/sync"
+# After the recovery record is published, the mock signals the deploy process
+# once, so the handlers must restore the pin before the candidate is switched.
+cat > "$tmp/bin/mv" <<'MOCK'
+#!/bin/bash
+"$TEST_REAL_MV" "$@" || exit
+if [[ ${@: -1} == *.pending && -f $TEST_PUBLISH_INTERRUPT ]]; then
+  signal=$(cat "$TEST_PUBLISH_INTERRUPT")
+  rm "$TEST_PUBLISH_INTERRUPT"
+  kill -s "$signal" "$PPID"
+fi
+MOCK
 chmod +x "$tmp/bin/"*
 deploy() { bash scripts/deploy-serve.sh fillwire-serve "$1"; }
 refuse() {
@@ -187,6 +200,22 @@ refuse "$b"
 rmdir "$FILLWIRE_DEPLOY_STATE_DIR/fillwire-serve.service.lock"
 deploy --recover
 [[ ! -e $current && ! -e $current.previous && ! -e $current.pending ]]
+
+# A signal that lands after the recovery record is published must restore the
+# previous pin and release the lock. The first-deployment case has no old pin.
+deploy "$a"
+for signal in INT TERM HUP; do
+  echo "$signal" > "$TEST_PUBLISH_INTERRUPT"
+  refuse "$b"
+  assert_pin "$current" "$a"
+  [[ ! -e $current.pending && ! -e $current.previous ]]
+  [[ ! -e $FILLWIRE_DEPLOY_STATE_DIR/fillwire-serve.service.lock ]]
+done
+rm "$current"
+echo TERM > "$TEST_PUBLISH_INTERRUPT"
+refuse "$b"
+[[ ! -e $current && ! -e $current.pending && ! -e $current.previous ]]
+[[ ! -e $FILLWIRE_DEPLOY_STATE_DIR/fillwire-serve.service.lock ]]
 
 printf 'IMAGE=%s\nEXTRA=bad' "$a" > "$current"
 refuse --check

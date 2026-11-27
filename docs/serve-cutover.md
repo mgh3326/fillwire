@@ -25,7 +25,7 @@
   두 유닛 모두 같은 컨테이너가 자동 재시작 없이 6초 이상 연속으로 검사를 통과해야 합니다.
   두 검사와 별도로 기록의 신선도를 확인합니다. 성공한 교체의 직전 핀은 `.previous`에 남습니다.
   이전 이미지의 로컬 캐시는 롤백을 위해 보존합니다. INT, TERM, HUP를 받으면 직전
-  핀 복구를 시도합니다. 강제 종료, 전원 장애, 복구 실패 뒤 `<unit>.service.image.pending`이
+  핀 복구를 시도합니다. 처리기는 복구 기록을 발행하기 전부터 설치되므로 발행 경계에서 받은 신호도 같은 복구를 거칩니다. 강제 종료, 전원 장애, 복구 실패 뒤 `<unit>.service.image.pending`이
   남으면 해당 유닛에 새 배포나 `--rollback`을 실행하기 전에 아래 복구 절차를 따릅니다.
 
 ```sh
@@ -182,11 +182,29 @@ sudo systemctl disable gatewayd.service
 sudo systemctl enable fillwire-serve.service quote-collector.service
 ```
 
+재부팅 전에 두 유닛의 `.pending`이 남아 있지 않은지 확인합니다. 남아 있으면 위 복구
+절차를 먼저 마칩니다. 해소되지 않은 배포가 있는 상태에서는 재부팅하지 않습니다.
+
+```sh
+sudo sh -c 'ls /var/lib/fillwire-deploy/*.service.image.pending 2>/dev/null' || echo 'pending 없음'
+```
+
 운영자가 재부팅을 승인하면 `sudo systemctl reboot`를 실행합니다. pi에 다시 접속해
-아래를 실행합니다. 먼저 부팅 ID가 바뀌었는지 확인합니다. 새 유닛은 둘 다
-`enabled`, `active`이며 이번 부팅의 `NRestarts`는 0이어야 합니다. 변경한 기존 소유
-유닛은 `disabled`, `inactive`여야 합니다. 명령 실행 전 중단된 배포의 `.pending`을
-위 절차대로 복구합니다.
+먼저 `.pending`이 남았는지 확인합니다. 남아 있으면 이번 부팅은 미검증입니다. 아래 블록이
+부팅 ID를 `unverified-boots`에 기록합니다. 그다음 위 복구 절차를 마치고 재부팅을 다시
+승인받아 검증을 처음부터 반복합니다.
+
+```sh
+state="$HOME/fillwire-cutover-state"
+if sudo sh -c 'ls /var/lib/fillwire-deploy/*.service.image.pending 2>/dev/null'; then
+  cat /proc/sys/kernel/random/boot_id >> "$state/unverified-boots"
+  echo '미검증 부팅으로 기록했습니다. 복구 후 재부팅하고 검증을 처음부터 반복합니다.' >&2
+fi
+```
+
+`.pending`이 없을 때만 아래 검증을 실행합니다. 먼저 부팅 ID가 바뀌었는지 확인합니다.
+새 유닛은 둘 다 `enabled`, `active`이며 이번 부팅의 `NRestarts`는 0이어야 합니다.
+변경한 기존 소유 유닛은 `disabled`, `inactive`여야 합니다.
 
 ```sh
 state="$HOME/fillwire-cutover-state"
