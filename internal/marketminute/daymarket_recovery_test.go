@@ -1,6 +1,7 @@
 package marketminute
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"maps"
@@ -232,5 +233,42 @@ func TestDayPassIsCappedAtItsBudget(t *testing.T) {
 	}
 	if report.USDayMarket == nil || !report.USDayMarket.Read {
 		t.Fatalf("day report = %+v", report.USDayMarket)
+	}
+}
+
+// failingVenueSink fails when a bar of its venue is written.
+type failingVenueSink struct{ venue string }
+
+func (s failingVenueSink) Write(_ context.Context, bar Bar) error {
+	if bar.Venue == s.venue {
+		return errors.New("disk full")
+	}
+	return nil
+}
+
+// The production sink is a MultiSink around a JSONLSink, which buffers its rows.
+// The regular rows must reach the writer before the day pass starts, and they
+// must still be written when the day pass fails.
+func TestMultiSinkFlushesTheJSONLRowsBeforeTheDayPass(t *testing.T) {
+	clock := &testClock{now: kstAt(t, "2026-11-24T11:00:00")}
+	var out bytes.Buffer
+	sink := MultiSink{NewJSONLSink(&out), failingVenueSink{venue: VenueDayNASD}}
+	var beforeDay string
+	reader := &venueReader{fetch: func(target Target) FetchResult {
+		if target.Venue == VenueDayNASD {
+			beforeDay = out.String()
+		}
+		return FetchResult{Rows: labelled("2026-11-24 10:58")}
+	}}
+	targets := []Target{{Market: "kr", Symbol: "005930", Venue: "KRX"}, {Market: "us", Symbol: "NVDA", Venue: "NASD"}}
+	_, err := newDayPoller(t, clock, sink, reader, targets, 1).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("err = %v, want the day-pass sink failure", err)
+	}
+	if !strings.Contains(beforeDay, "005930") {
+		t.Fatalf("the regular row was not flushed before the day pass: %q", beforeDay)
+	}
+	if !strings.Contains(out.String(), "005930") {
+		t.Fatalf("the regular row was lost on the day-pass error: %q", out.String())
 	}
 }
