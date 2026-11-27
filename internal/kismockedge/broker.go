@@ -207,6 +207,18 @@ func (broker KISMockBroker) PrepareCancel(ctx context.Context, target CancelTarg
 	}, ""
 }
 
+// kisThrottleMsgCode is the KIS per-second order-count rejection (초당 거래건수 초과).
+const kisThrottleMsgCode = "EGW00201"
+
+// jsonString returns a top-level string field, or "" when it is absent or not a string.
+func jsonString(body map[string]json.RawMessage, key string) string {
+	var text string
+	if json.Unmarshal(body[key], &text) != nil {
+		return ""
+	}
+	return text
+}
+
 type mockCancelRequest struct {
 	CANO                 string `json:"CANO"`
 	AccountProduct       string `json:"ACNT_PRDT_CD"`
@@ -255,6 +267,11 @@ func (prepared *preparedKISMockCancel) SendCancel(ctx context.Context) CancelBro
 	rejection := maskedRejection(response.StatusCode, body, prepared.masker)
 	if response.StatusCode == http.StatusNotFound {
 		return CancelBrokerResult{State: CancelStateNotFound, ErrorCode: ErrorCancelNotFound, Rejection: rejection}
+	}
+	// KIS gateway per-second throttle: the broker did not process the cancel, so
+	// this is the one 5xx that may be re-sent. Only this exact triple qualifies.
+	if response.StatusCode == http.StatusInternalServerError && jsonString(body, "rt_cd") == "1" && jsonString(body, "msg_cd") == kisThrottleMsgCode {
+		return CancelBrokerResult{State: CancelStateRejectedThrottled, ErrorCode: kisThrottleMsgCode, Rejection: rejection}
 	}
 	if response.StatusCode >= http.StatusInternalServerError {
 		return CancelBrokerResult{State: CancelStateUnknown, ErrorCode: ErrorBroker5xx, Rejection: rejection}

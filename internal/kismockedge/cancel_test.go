@@ -119,7 +119,7 @@ func TestCancelReservedUnknownIsReplayedWithoutBrokerSend(t *testing.T) {
 		t.Fatal(err)
 	}
 	pending := service.cancelReceipt(command.CommandID, CancelStateUnknown, ErrorCancelSendPending)
-	if _, reserved, err := store.ReserveCancel(context.Background(), pending); err != nil || !reserved {
+	if _, reserved, err := store.ReserveCancel(context.Background(), CancelAttempt{CancelReceipt: pending, AttemptNo: 1}); err != nil || !reserved {
 		t.Fatalf("reserve=%t err=%v", reserved, err)
 	}
 	receipt, err := service.Cancel(context.Background(), command.CommandID)

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	executioncontracts "github.com/mgh3326/fillwire/execution_contracts"
 )
@@ -134,25 +135,39 @@ func NewHandler(service *Service) http.Handler {
 		writer.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(writer).Encode(check)
 	})
-	// GET /v1/cancel-attempts lists UNKNOWN cancel markers on the KIS mock
-	// scopes for one command-ID prefix. It exists so a fresh canary run can see
-	// a cancel an earlier run could not confirm. It is read-only.
-	mux.HandleFunc("GET /v1/cancel-attempts", func(writer http.ResponseWriter, request *http.Request) {
+	// GET /v1/cancel-carryover lists canary commands on one KIS mock scope whose
+	// cancel is not confirmed, placed inside one trading-day window. Read-only.
+	mux.HandleFunc("GET /v1/cancel-carryover", func(writer http.ResponseWriter, request *http.Request) {
 		query := request.URL.Query()
+		from, fromErr := time.Parse(time.RFC3339, query.Get("placed_from"))
+		before, beforeErr := time.Parse(time.RFC3339, query.Get("placed_before"))
+		scope := query.Get("scope")
 		prefix := query.Get("command_prefix")
-		if query.Get("state") != string(CancelStateUnknown) || len(query) != 2 || !validCancelPrefix(prefix) {
+		if len(query) != 4 || (scope != executioncontracts.AccountScopeKISMock && scope != executioncontracts.AccountScopeKISMockUS) ||
+			fromErr != nil || beforeErr != nil || !before.After(from) || !validCancelPrefix(prefix) {
 			writeShadowError(writer, http.StatusBadRequest, ErrorInvalidCommand)
 			return
 		}
-		attempts, err := service.UnknownCancelAttempts(request.Context(), prefix)
+		candidates, err := service.CancelCarryOverCandidates(request.Context(), scope, prefix, from, before)
 		if err != nil {
 			writeShadowError(writer, http.StatusInternalServerError, ErrorStorageFailure)
 			return
 		}
+		type candidateJSON struct {
+			CommandID    string `json:"command_id"`
+			AccountScope string `json:"account_scope"`
+			PlacedAt     string `json:"placed_at"`
+			Attempts     int    `json:"attempts"`
+			CancelState  string `json:"cancel_state"`
+		}
+		out := make([]candidateJSON, 0, len(candidates))
+		for _, candidate := range candidates {
+			out = append(out, candidateJSON{CommandID: candidate.CommandID, AccountScope: candidate.AccountScope, PlacedAt: candidate.PlacedAt, Attempts: candidate.Attempts, CancelState: candidate.LatestState})
+		}
 		writer.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(writer).Encode(struct {
-			CancelAttempts []CancelReceipt `json:"cancel_attempts"`
-		}{CancelAttempts: attempts})
+			Candidates []candidateJSON `json:"candidates"`
+		}{Candidates: out})
 	})
 	mux.HandleFunc("POST /v1/commands/{command_id}/cancel", func(writer http.ResponseWriter, request *http.Request) {
 		receipt, err := service.Cancel(request.Context(), request.PathValue("command_id"))

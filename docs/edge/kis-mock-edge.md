@@ -11,7 +11,7 @@ redirect Python traffic, or modify `auto_trader`.
 The receiver exposes `POST /v1/commands`,
 `POST /v1/commands/{command_id}/cancel`, the bounded
 `POST /v1/commands/{command_id}/resolve`, and the read-only
-`GET /v1/price-band` and `GET /v1/cancel-attempts?state=UNKNOWN&command_prefix=<prefix>`,
+`GET /v1/price-band` and `GET /v1/cancel-carryover?scope=<scope>&placed_from=<RFC3339>&placed_before=<RFC3339>&command_prefix=<prefix>`,
 and binds to `127.0.0.1:8080` by
 default. `BROKER_EDGE_LISTEN_ADDR` may select another loopback address (for
 example `127.0.0.1:0` in tests), but cannot expose the unauthenticated receiver
@@ -175,12 +175,21 @@ and again inside the RoundTripper immediately before any transport call.
 - No modification, market order, or other mutation endpoint is exposed.
 - `POST /v1/commands/{command_id}/cancel` may cancel only a durably
   `ACCEPTED` command with a broker order id. It persists one closed result:
-  `CANCELLED`, `NOT_FOUND` (`cancel_not_found`), or `UNKNOWN`; duplicate POSTs
-  replay that result and never resend the broker request.
-- No retry or replay path can issue a second broker POST for a command ID.
-- `GET /v1/cancel-attempts` lists committed `UNKNOWN` cancel markers for the
-  KIS mock scopes whose command IDs match the required prefix. It only reads
-  them. An empty prefix is refused, so the call cannot list every marker.
+  `CANCELLED`, `NOT_FOUND` (`cancel_not_found`), `UNKNOWN`, or
+  `REJECTED_THROTTLED`. Each cancel send is one `cancel_attempts` row keyed by
+  command and attempt number, and the row is committed as a pending `UNKNOWN`
+  marker before the send. Duplicate POSTs replay the latest stored result.
+- Only a KIS mock HTTP 500 with `rt_cd` 1 and `msg_cd` `EGW00201` is recorded as
+  `REJECTED_THROTTLED`: the broker did not process the cancel. Only that state
+  may be re-sent, paced at least 1.1 s after the previous attempt and capped at
+  three attempts per command including the first. Every other answer (any other
+  error, timeout, or unreadable reply) stays `UNKNOWN` and is never re-sent.
+- Placement is never re-sent.
+- `GET /v1/cancel-carryover` is read-only. It lists accepted commands on one
+  KIS mock scope, with a required command-ID prefix and a placement window, whose
+  latest cancel is absent, `UNKNOWN`, or `REJECTED_THROTTLED`. Commands never
+  sent come first. An empty prefix, unknown scope, unparsable window, or
+  extra parameter is refused.
 - No account, order, or token values are emitted as metrics or response data.
 - This repository's tests use fake transports only; they do not execute a real
   KIS VTS or Alpaca paper placement.
