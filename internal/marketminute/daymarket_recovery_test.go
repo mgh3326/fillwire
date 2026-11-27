@@ -272,3 +272,29 @@ func TestMultiSinkFlushesTheJSONLRowsBeforeTheDayPass(t *testing.T) {
 		t.Fatalf("the regular row was lost on the day-pass error: %q", out.String())
 	}
 }
+
+// markettapcmd.newSink returns MultiSink{jsonl} for JSONL-only output, which is
+// the composition the production command runs. Its rows must reach the writer
+// before the day pass starts, and after the run.
+func TestJSONLOnlyMultiSinkFlushesBeforeTheDayPass(t *testing.T) {
+	clock := &testClock{now: kstAt(t, "2026-11-24T11:00:00")}
+	var out bytes.Buffer
+	sink := MultiSink{NewJSONLSink(&out)}
+	var beforeDay string
+	reader := &venueReader{fetch: func(target Target) FetchResult {
+		if target.Venue == VenueDayNASD {
+			beforeDay = out.String()
+		}
+		return FetchResult{Rows: labelled("2026-11-24 10:58")}
+	}}
+	targets := []Target{{Market: "kr", Symbol: "005930", Venue: "KRX"}, {Market: "us", Symbol: "NVDA", Venue: "NASD"}}
+	if _, err := newDayPoller(t, clock, sink, reader, targets, 1).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(beforeDay, "005930") {
+		t.Fatalf("the regular row was not flushed before the day pass: %q", beforeDay)
+	}
+	if !strings.Contains(out.String(), "NVDA") {
+		t.Fatalf("the day row was not written: %q", out.String())
+	}
+}
