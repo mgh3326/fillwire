@@ -313,3 +313,25 @@ func TestCarryOverLookupStopsAtTheRunOverallDeadline(t *testing.T) {
 		t.Fatalf("stdout = %s", stdout.String())
 	}
 }
+
+func TestCancelStillReachesEdgeWhenRunDeadlineExpiresDuringPacing(t *testing.T) {
+	log := &callLog{}
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[]}`, "CANCELLED")
+	defer server.Close()
+	at := fixedKR(2026, time.September, 2, 10, 0)
+	// The overall deadline (200 ms) expires during the 1 s pacing wait. The
+	// acknowledged order must still get its cancel, bounded by the cancel budget.
+	budgets := Options{OverallTimeout: 200 * time.Millisecond, CancelGap: time.Second, Sleep: func(d time.Duration) {
+		log.add("sleep")
+		time.Sleep(d)
+	}}.timeouts()
+
+	got := execute(context.Background(), Config{EdgeURL: server.URL, KRSymbol: "005930"}, func() time.Time { return at }, server.Client(), budgets)
+
+	if got.Outcome != OutcomeOK {
+		t.Fatalf("outcome = %q (error %q): the cancel of an acknowledged order was lost to the expired run deadline", got.Outcome, got.ErrorCode)
+	}
+	if want := []string{"band", "place", "sleep", "cancel"}; !reflect.DeepEqual(log.snapshot(), want) {
+		t.Fatalf("call order = %v, want %v", log.snapshot(), want)
+	}
+}

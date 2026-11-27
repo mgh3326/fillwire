@@ -357,10 +357,17 @@ func execute(ctx context.Context, config Config, now func() time.Time, client *h
 	// to the cancel_sent stage duration.
 	pacer := cancelPacer{now: now, sleep: budgets.sleep, gap: budgets.cancelGap}
 	timed := func(stage string, budget time.Duration, request *http.Request) (*http.Response, error) {
+		dispatchCtx := ctx
 		if stage == StageCancelSent {
 			pacer.wait()
+			// The pacing wait can outlast the run deadline. An acknowledged order
+			// must still get its cancel, so a cancel dispatched after the deadline
+			// runs on a detached context. The cancel stage budget still bounds it.
+			if ctx.Err() != nil {
+				dispatchCtx = context.WithoutCancel(ctx)
+			}
 		}
-		response, err := timedRequest(ctx, client, result.StageDurationsMS, stage, budget, request)
+		response, err := timedRequest(dispatchCtx, client, result.StageDurationsMS, stage, budget, request)
 		pacer.mark()
 		return response, err
 	}
