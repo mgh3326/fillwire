@@ -839,7 +839,7 @@ func TestQuoteRecorderFailureClosesConnection(t *testing.T) {
 	}
 }
 
-func TestQuoteWriteFailureDegradesHealthUntilNextRun(t *testing.T) {
+func TestQuoteWriteFailureDegradesHealthUntilNextSuccessfulWrite(t *testing.T) {
 	trade := fixture(t, "trade-us-asyncapi-example.json")
 	order := fixture(t, "order.json")
 	var reader *Reader

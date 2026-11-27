@@ -88,11 +88,14 @@ type Config struct {
 }
 
 type Reader struct {
-	cfg              Config
-	decoder          *quote.Decoder
-	topics           []string
-	running          atomic.Bool
-	healthy          atomic.Bool
+	cfg     Config
+	decoder *quote.Decoder
+	topics  []string
+	running atomic.Bool
+	healthy atomic.Bool
+	// quoteWriteFailed degrades Health until an AppendQuote succeeds; a failed
+	// write cancels the session, so only a later Run's successful quote write
+	// proves the recorder recovered.
 	quoteWriteFailed atomic.Bool
 	malformed        atomic.Uint64
 	rejectedQuotes   atomic.Uint64
@@ -202,9 +205,7 @@ func (r *Reader) Run(ctx context.Context) (runErr error) {
 	r.quoteRecords = make(chan Record, quoteQueueSize)
 	quoteWriterDone := make(chan struct{})
 	// writeFailed is scoped to this Run for fail-stop draining and ErrRecord
-	// reporting. r.quoteWriteFailed is the persistent degraded state: it is
-	// set by a failed AppendQuote and cleared only by a successful one, so a
-	// restarted lane stays degraded until a quote write actually succeeds.
+	// reporting; the Reader's degraded flag outlives the Run.
 	writeFailed := false
 	go func() {
 		defer close(quoteWriterDone)
