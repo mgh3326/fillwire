@@ -175,11 +175,13 @@ func (service *Service) CancelCarryOverCandidates(ctx context.Context, scope, pr
 }
 
 // Actionable reports whether a cancel for this candidate can reach the broker.
-// Evidence-resolved orders are never cancelled by the edge. Otherwise a send
-// happens only for a never-sent command, or for a REJECTED_THROTTLED one still
+// Only an ACCEPTED place with a broker order ID can be cancelled, and never one
+// that resolution proved: FindCancelTarget refuses both. An UNKNOWN place is
+// listed only to block placement; it is never sent. For an ACCEPTED place, a
+// send happens only for a never-sent command, or a REJECTED_THROTTLED one still
 // under the attempt cap. Everything else is answered from stored state.
 func (candidate CancelCandidate) Actionable() bool {
-	if candidate.ResolvedByEvidence {
+	if candidate.Disposition != "ACCEPTED" || candidate.ResolvedByEvidence {
 		return false
 	}
 	if candidate.Attempts == 0 {

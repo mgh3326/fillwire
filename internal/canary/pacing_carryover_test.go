@@ -135,8 +135,9 @@ func TestCarryOverCancelsOnceAndPlacesNothing(t *testing.T) {
 	if got.CarryOver == nil || got.CarryOver.Pending != 1 || got.CarryOver.CommandID != "broker-edge-canary:old-1" || got.CarryOver.CancelState != "UNKNOWN" {
 		t.Fatalf("carry_over = %+v", got.CarryOver)
 	}
-	if want := []string{"lookup", "cancel"}; !reflect.DeepEqual(log.snapshot(), want) {
-		t.Fatalf("edge calls = %v, want %v (no band, no place, no sleep)", log.snapshot(), want)
+	// The carry-over cancel is paced after the lookup, and nothing else runs.
+	if want := []string{"lookup", "sleep:1.1s", "cancel"}; !reflect.DeepEqual(log.snapshot(), want) {
+		t.Fatalf("edge calls = %v, want %v (no band, no place)", log.snapshot(), want)
 	}
 }
 
@@ -353,7 +354,7 @@ func TestCarryOverAttemptsOnlyAnActionableCandidate(t *testing.T) {
 	if got.CarryOver == nil || got.CarryOver.Pending != 2 || got.CarryOver.CommandID != "broker-edge-canary:next-2" {
 		t.Fatalf("carry_over = %+v", got.CarryOver)
 	}
-	if want := []string{"lookup", "cancel"}; !reflect.DeepEqual(log.snapshot(), want) {
+	if want := []string{"lookup", "sleep:1.1s", "cancel"}; !reflect.DeepEqual(log.snapshot(), want) {
 		t.Fatalf("edge calls = %v, want %v", log.snapshot(), want)
 	}
 }

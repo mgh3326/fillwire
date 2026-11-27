@@ -391,3 +391,44 @@ func TestEvidenceResolvedMockOrderIsListedAndNeverCancelled(t *testing.T) {
 		t.Fatalf("candidates = %+v, want the resolved order listed and not actionable", got)
 	}
 }
+
+// A place left UNKNOWN has an unsettled outcome: the broker may hold the order.
+// It must block placement for the day, but it is never sent. A place that a
+// resolution later settled NOT_CREATED is not on the account and is not listed.
+func TestUnsettledPlaceBlocksPlacementAndIsNeverSent(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
+	var cancels atomic.Int64
+	transport := &countingTransport{respond: func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == mockCancelPath {
+			cancels.Add(1)
+		}
+		return testHTTPResponse(http.StatusInternalServerError, cancelBodyOther5xx), nil
+	}}
+	service := newTestService(store, testKISMockBroker(transport), true)
+	day := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	service.Now = func() time.Time { return day }
+	ctx := context.Background()
+
+	for _, id := range []string{"broker-edge-canary:unsettled-1", "broker-edge-canary:settled-2"} {
+		receipt, err := service.Process(ctx, testCommand(id))
+		if err != nil || receipt.Disposition != executioncontracts.DispositionUnknown {
+			t.Fatalf("place %s = %+v err=%v, want UNKNOWN", id, receipt, err)
+		}
+	}
+	if _, err := store.ResolveUnknown(ctx, "broker-edge-canary:settled-2", executioncontracts.DispositionNotCreated, "", "rejected_before_send", day); err != nil {
+		t.Fatal(err)
+	}
+
+	from := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	got, err := service.CancelCarryOverCandidates(ctx, executioncontracts.AccountScopeKISMock, "broker-edge-canary:", from, from.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].CommandID != "broker-edge-canary:unsettled-1" || got[0].Disposition != "UNKNOWN" || got[0].Actionable() {
+		t.Fatalf("candidates = %+v, want only the unsettled place, not actionable", got)
+	}
+	cancel, _ := service.Cancel(ctx, "broker-edge-canary:unsettled-1")
+	if cancel.State != CancelStateUnknown || cancels.Load() != 0 {
+		t.Fatalf("cancel of an unsettled place = %+v cancels=%d, want no send", cancel, cancels.Load())
+	}
+}

@@ -635,7 +635,9 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 		"command_prefix": {commandIDPrefix},
 	}
 	lookupRequest, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/cancel-carryover?"+query.Encode(), nil)
+	pacer := cancelPacer{now: now, sleep: budgets.sleep, gap: budgets.cancelGap}
 	lookupResponse, err := timedRequest(ctx, client, result.StageDurationsMS, "carry_over", budgets.check, lookupRequest)
+	pacer.mark()
 	if err != nil {
 		return carryOverFailed(result, err), true
 	}
@@ -688,7 +690,14 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 	cancelRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		base+"/v1/commands/"+url.PathEscape(first)+"/cancel", nil)
 	cancelRequest.Header.Set("X-Correlation-ID", first)
-	cancelResponse, err := timedRequest(ctx, client, result.StageDurationsMS, StageCancelSent, budgets.cancel, cancelRequest)
+	// Every cancel dispatch is paced, the carry-over included. The lookup is not a
+	// broker call, but it is the last edge response, and the gap is cheap.
+	pacer.wait()
+	dispatchCtx := ctx
+	if ctx.Err() != nil {
+		dispatchCtx = context.WithoutCancel(ctx)
+	}
+	cancelResponse, err := timedRequest(dispatchCtx, client, result.StageDurationsMS, StageCancelSent, budgets.cancel, cancelRequest)
 	if err != nil {
 		if isDeadline(err) {
 			result.ErrorCode = ErrorCanaryTimeout

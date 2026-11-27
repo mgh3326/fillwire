@@ -222,6 +222,9 @@ type CancelCandidate struct {
 	PlacedAt     string
 	Attempts     int
 	LatestState  string
+	// Disposition is the effective place disposition: ACCEPTED, or UNKNOWN for a
+	// place whose outcome was never settled.
+	Disposition string
 	// ResolvedByEvidence is true when a command-scoped resolution, not the place
 	// receipt, established the broker order. Such an order is never cancellable by
 	// the edge, so it blocks placement but is never sent.
@@ -239,13 +242,15 @@ func (store *Store) CancelCandidates(ctx context.Context, scope, prefix string) 
 	rows, err := store.db.QueryContext(ctx, `
 		SELECT c.command_id, c.account_scope, c.recorded_at,
 			(SELECT COUNT(*) FROM cancel_attempts a WHERE a.command_id = c.command_id),
-			COALESCE(l.state, ''), r.command_id IS NOT NULL
+			COALESCE(l.state, ''), r.command_id IS NOT NULL, COALESCE(r.disposition, c.disposition)
 		FROM commands c
 		LEFT JOIN command_resolutions r ON r.command_id = c.command_id
 		LEFT JOIN cancel_attempts l ON l.command_id = c.command_id
 			AND l.attempt_no = (SELECT MAX(m.attempt_no) FROM cancel_attempts m WHERE m.command_id = c.command_id)
-		WHERE c.account_scope = ? AND COALESCE(r.disposition, c.disposition) = 'ACCEPTED'
-			AND COALESCE(CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END, '') <> ''
+		WHERE c.account_scope = ?
+			AND ((COALESCE(r.disposition, c.disposition) = 'ACCEPTED'
+				AND COALESCE(CASE WHEN r.command_id IS NULL THEN c.broker_order_id ELSE r.broker_order_id END, '') <> '')
+				OR (r.command_id IS NULL AND c.disposition = 'UNKNOWN'))
 			AND substr(c.command_id, 1, ?) = ?
 			AND (l.command_id IS NULL OR l.state IN ('UNKNOWN', 'REJECTED_THROTTLED'))
 		ORDER BY c.recorded_at, c.command_id`, scope, len(prefix), prefix)
@@ -257,7 +262,7 @@ func (store *Store) CancelCandidates(ctx context.Context, scope, prefix string) 
 	for rows.Next() {
 		var candidate CancelCandidate
 		var resolved int
-		if err := rows.Scan(&candidate.CommandID, &candidate.AccountScope, &candidate.PlacedAt, &candidate.Attempts, &candidate.LatestState, &resolved); err != nil {
+		if err := rows.Scan(&candidate.CommandID, &candidate.AccountScope, &candidate.PlacedAt, &candidate.Attempts, &candidate.LatestState, &resolved, &candidate.Disposition); err != nil {
 			return nil, err
 		}
 		candidate.ResolvedByEvidence = resolved == 1

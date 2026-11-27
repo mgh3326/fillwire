@@ -68,7 +68,9 @@ the New York day for `kis_mock_us`. The edge lists accepted canary commands on
 that scope whose latest cancel is absent, `UNKNOWN`, or `REJECTED_THROTTLED`.
 Each candidate carries `actionable`, which is true only when a cancel can reach
 the broker: a never-sent command, or a `REJECTED_THROTTLED` one still under the
-attempt cap. An order resolved by command-scoped evidence is never actionable. When the list is empty, the run
+attempt cap. An order resolved by command-scoped evidence is never actionable.
+A place left `UNKNOWN` (its outcome never settled and no resolution recorded) is
+listed too, as not actionable, so placement stays blocked until the day ends. When the list is empty, the run
 continues normally. When it is not empty, the run:
 
 - makes one cancel attempt for the first candidate the edge marks
@@ -89,7 +91,7 @@ nothing.
 day, because the window moves on. Day orders are assumed to lapse at the close
 of their session. That assumption is not verified against KIS mock behaviour
 and is recorded as an open item. Within the day, an `UNKNOWN` candidate blocks
-placement until the edge answers differently or the day ends.
+placement until the trading day ends.
 
 ## Edge send contract for a cancel
 
