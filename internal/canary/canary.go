@@ -646,6 +646,8 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 			CommandID    string `json:"command_id"`
 			AccountScope string `json:"account_scope"`
 			CancelState  string `json:"cancel_state"`
+			// Actionable is the edge's word on whether a cancel can reach the broker.
+			Actionable *bool `json:"actionable"`
 		} `json:"candidates"`
 	}
 	decodeErr := json.NewDecoder(lookupResponse.Body).Decode(&listed)
@@ -657,7 +659,7 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 	for _, candidate := range candidates {
 		// Only this canary's own commands on this scope may be cancelled from here.
 		if len(candidate.CommandID) <= len(commandIDPrefix) || !strings.HasPrefix(candidate.CommandID, commandIDPrefix) ||
-			candidate.AccountScope != accountScope || !validCarryOverState(candidate.CancelState) {
+			candidate.AccountScope != accountScope || !validCarryOverState(candidate.CancelState) || candidate.Actionable == nil {
 			return carryOverFailed(result, nil), true
 		}
 	}
@@ -665,10 +667,24 @@ func carryOverRun(ctx context.Context, config Config, now func() time.Time, clie
 		return Result{}, false
 	}
 
-	first := candidates[0].CommandID
+	// Pending is reported whatever is attempted. The attempt goes to the first
+	// candidate the edge can act on; when none can act, nothing is sent and the
+	// run still fails closed.
 	result.Outcome = OutcomeCarryOverPending
+	result.CarryOver = &CarryOverEvidence{Pending: len(candidates), CommandID: candidates[0].CommandID}
+	target := -1
+	for index, candidate := range candidates {
+		if *candidate.Actionable {
+			target = index
+			break
+		}
+	}
+	if target < 0 {
+		return result, true
+	}
+	first := candidates[target].CommandID
+	result.CarryOver.CommandID = first
 	result.Stage = StageCancelSent
-	result.CarryOver = &CarryOverEvidence{Pending: len(candidates), CommandID: first}
 	cancelRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		base+"/v1/commands/"+url.PathEscape(first)+"/cancel", nil)
 	cancelRequest.Header.Set("X-Correlation-ID", first)

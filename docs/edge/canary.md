@@ -66,11 +66,14 @@ edge for this scope's unconfirmed canary commands in the current trading day:
 The window is the scope's exchange trading day: the Seoul day for `kis_mock`,
 the New York day for `kis_mock_us`. The edge lists accepted canary commands on
 that scope whose latest cancel is absent, `UNKNOWN`, or `REJECTED_THROTTLED`.
-Commands never sent to the broker come first. When the list is empty, the run
+Each candidate carries `actionable`, which is true only when a cancel can reach
+the broker: a never-sent command, or a `REJECTED_THROTTLED` one still under the
+attempt cap. An order resolved by command-scoped evidence is never actionable. When the list is empty, the run
 continues normally. When it is not empty, the run:
 
-- makes one cancel attempt for the first candidate, through the edge's normal
-  `POST /v1/commands/{command_id}/cancel`;
+- makes one cancel attempt for the first candidate the edge marks
+  `actionable` (its `POST /v1/commands/{command_id}/cancel`); when none is
+  actionable, it sends nothing;
 - places nothing in that run;
 - exits `1` with `outcome=carry_over_pending`, whatever the cancel answered,
   because a carried-over cancel is not proof that a place works now.
@@ -110,6 +113,16 @@ The canary and the edge must agree on `GET /v1/cancel-carryover`. Upgrade the
 edge before the canary. Roll the canary back before the edge. An edge that lacks
 the route answers `404`, so every in-session run ends `carry_over_check_failed`
 without placing. The `/metrics` gate does not detect this skew.
+
+**The `cancel_attempts` migration is forward-only.** On first start, this edge
+rebuilds `cancel_attempts` in place, keyed by (`command_id`, `attempt_no`). The
+`main` edge (b257db5) inserts with `ON CONFLICT(command_id)`, which has no
+matching unique constraint after the migration, so every new cancel marker
+would fail as `storage_failure` with no broker send. Rolling the edge back to
+`main` therefore leaves canary orders resting with no record. Before deploying
+this revision, stop the edge and back up `edge.sqlite`. Restoring that backup is
+the only supported way back to a pre-migration edge. This is a documentation
+requirement only; no test covers the rollback.
 
 ## Overall deadline
 

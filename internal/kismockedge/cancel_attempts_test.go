@@ -235,6 +235,9 @@ func TestCarryOverCandidatesListUnconfirmedCanaryCancelsInWindowAndScope(t *test
 	if got[0].Attempts != 0 || got[1].LatestState != string(CancelStateRejectedThrottled) || got[2].LatestState != string(CancelStateUnknown) {
 		t.Fatalf("candidate evidence = %+v", got)
 	}
+	if !got[0].Actionable() || !got[1].Actionable() || got[2].Actionable() {
+		t.Fatalf("actionable = %t %t %t, want true true false", got[0].Actionable(), got[1].Actionable(), got[2].Actionable())
+	}
 }
 
 func TestCancelCarryOverEndpointValidatesAndStaysReadOnly(t *testing.T) {
@@ -342,5 +345,49 @@ func TestLegacyCancelAttemptTableMigratesMarkerToAttemptOne(t *testing.T) {
 	}
 	if rows != 1 {
 		t.Fatalf("migrated rows = %d, want 1", rows)
+	}
+}
+
+// An ambiguous place that a command-scoped resolution later proved ACCEPTED is
+// still a canary order resting on the account. It must be listed so the run
+// blocks placement, but the edge never cancels it, so it is never actionable.
+func TestEvidenceResolvedMockOrderIsListedAndNeverCancelled(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "edge.sqlite"))
+	var cancels atomic.Int64
+	transport := &countingTransport{respond: func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost && request.URL.Path == mockOrderPath {
+			return testHTTPResponse(http.StatusInternalServerError, cancelBodyOther5xx), nil
+		}
+		if request.URL.Path == mockCancelPath {
+			cancels.Add(1)
+		}
+		return testHTTPResponse(http.StatusInternalServerError, ""), nil
+	}}
+	service := newTestService(store, testKISMockBroker(transport), true)
+	day := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	service.Now = func() time.Time { return day }
+	ctx := context.Background()
+	const commandID = "broker-edge-canary:resolved-1"
+
+	receipt, err := service.Process(ctx, testCommand(commandID))
+	if err != nil || receipt.Disposition != executioncontracts.DispositionUnknown {
+		t.Fatalf("ambiguous place = %+v err=%v, want UNKNOWN", receipt, err)
+	}
+	if _, err := store.ResolveUnknown(ctx, commandID, executioncontracts.DispositionAccepted, "kis-resolved-9", "", day); err != nil {
+		t.Fatal(err)
+	}
+
+	cancel, _ := service.Cancel(ctx, commandID)
+	if cancel.State != CancelStateUnknown || cancel.ErrorCode != ErrorCancelNotEligible || cancels.Load() != 0 {
+		t.Fatalf("cancel = %+v broker cancels=%d, want not eligible with no send", cancel, cancels.Load())
+	}
+
+	from := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	got, err := service.CancelCarryOverCandidates(ctx, executioncontracts.AccountScopeKISMock, "broker-edge-canary:", from, from.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].CommandID != commandID || !got[0].ResolvedByEvidence || got[0].Actionable() {
+		t.Fatalf("candidates = %+v, want the resolved order listed and not actionable", got)
 	}
 }

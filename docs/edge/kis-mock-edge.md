@@ -188,7 +188,7 @@ and again inside the RoundTripper immediately before any transport call.
 - `GET /v1/cancel-carryover` is read-only. It lists accepted commands on one
   KIS mock scope, with a required command-ID prefix and a placement window, whose
   latest cancel is absent, `UNKNOWN`, or `REJECTED_THROTTLED`. Commands never
-  sent come first. An empty prefix, unknown scope, unparsable window, or
+  sent come first, and each carries `actionable`, true only when a cancel can reach the broker. An empty prefix, unknown scope, unparsable window, or
   extra parameter is refused.
 - No account, order, or token values are emitted as metrics or response data.
 - This repository's tests use fake transports only; they do not execute a real

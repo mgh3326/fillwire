@@ -120,7 +120,7 @@ func TestCancelPacerWaitsOnlyTheRemainingGap(t *testing.T) {
 
 func TestCarryOverCancelsOnceAndPlacesNothing(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:old-1","account_scope":"kis_mock","cancel_state":"UNKNOWN"}]}`, "UNKNOWN")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:old-1","account_scope":"kis_mock","cancel_state":"","actionable":true}]}`, "UNKNOWN")
 	defer server.Close()
 	at := fixedKR(2026, time.September, 2, 10, 0)
 
@@ -142,7 +142,7 @@ func TestCarryOverCancelsOnceAndPlacesNothing(t *testing.T) {
 
 func TestRunPendingCarryOverExitsNonZeroWithoutPlacement(t *testing.T) {
 	log := &callLog{}
-	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:old-1","account_scope":"kis_mock","cancel_state":"UNKNOWN"}]}`, "UNKNOWN")
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:old-1","account_scope":"kis_mock","cancel_state":"","actionable":true}]}`, "UNKNOWN")
 	defer server.Close()
 	directory := t.TempDir()
 	at := fixedKR(2026, time.September, 2, 10, 0)
@@ -204,6 +204,7 @@ func TestCarryOverLookupFailureFailsClosed(t *testing.T) {
 		{"foreign command ID", http.StatusOK, `{"candidates":[{"command_id":"order-123","account_scope":"kis_mock","cancel_state":""}]}`},
 		{"bare prefix is not a command", http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:","account_scope":"kis_mock","cancel_state":""}]}`},
 		{"other scope", http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:x","account_scope":"kis_mock_us","cancel_state":""}]}`},
+		{"missing actionable flag", http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:x","account_scope":"kis_mock","cancel_state":""}]}`},
 		{"unexpected cancel state", http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:x","account_scope":"kis_mock","cancel_state":"CANCELLED"}]}`},
 		{"not JSON", http.StatusOK, `<html>`},
 	}
@@ -333,5 +334,42 @@ func TestCancelStillReachesEdgeWhenRunDeadlineExpiresDuringPacing(t *testing.T) 
 	}
 	if want := []string{"band", "place", "sleep", "cancel"}; !reflect.DeepEqual(log.snapshot(), want) {
 		t.Fatalf("call order = %v, want %v", log.snapshot(), want)
+	}
+}
+
+func TestCarryOverAttemptsOnlyAnActionableCandidate(t *testing.T) {
+	log := &callLog{}
+	// The head is UNKNOWN, which the edge answers from stored state without sending.
+	// The second candidate is never-sent and is the one the edge can act on.
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:head-1","account_scope":"kis_mock","cancel_state":"UNKNOWN","actionable":false},{"command_id":"broker-edge-canary:next-2","account_scope":"kis_mock","cancel_state":"","actionable":true}]}`, "CANCELLED")
+	defer server.Close()
+	at := fixedKR(2026, time.September, 2, 10, 0)
+
+	got, carried := carryOverRun(context.Background(), Config{EdgeURL: server.URL}, func() time.Time { return at }, server.Client(), Options{Sleep: recordingSleep(log)}.timeouts())
+
+	if !carried || got.Outcome != OutcomeCarryOverPending {
+		t.Fatalf("carried=%t outcome=%q", carried, got.Outcome)
+	}
+	if got.CarryOver == nil || got.CarryOver.Pending != 2 || got.CarryOver.CommandID != "broker-edge-canary:next-2" {
+		t.Fatalf("carry_over = %+v", got.CarryOver)
+	}
+	if want := []string{"lookup", "cancel"}; !reflect.DeepEqual(log.snapshot(), want) {
+		t.Fatalf("edge calls = %v, want %v", log.snapshot(), want)
+	}
+}
+
+func TestCarryOverNeverSendsWhenNoCandidateIsActionable(t *testing.T) {
+	log := &callLog{}
+	server := pacingEdge(t, log, http.StatusOK, `{"candidates":[{"command_id":"broker-edge-canary:stuck-1","account_scope":"kis_mock","cancel_state":"UNKNOWN","actionable":false}]}`, "CANCELLED")
+	defer server.Close()
+	at := fixedKR(2026, time.September, 2, 10, 0)
+
+	got, carried := carryOverRun(context.Background(), Config{EdgeURL: server.URL}, func() time.Time { return at }, server.Client(), Options{Sleep: recordingSleep(log)}.timeouts())
+
+	if !carried || got.Outcome != OutcomeCarryOverPending || got.CarryOver == nil || got.CarryOver.Pending != 1 {
+		t.Fatalf("carried=%t result=%+v", carried, got)
+	}
+	if want := []string{"lookup"}; !reflect.DeepEqual(log.snapshot(), want) {
+		t.Fatalf("edge calls = %v, want only the lookup", log.snapshot())
 	}
 }

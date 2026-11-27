@@ -159,10 +159,11 @@ func NewHandler(service *Service) http.Handler {
 			PlacedAt     string `json:"placed_at"`
 			Attempts     int    `json:"attempts"`
 			CancelState  string `json:"cancel_state"`
+			Actionable   bool   `json:"actionable"`
 		}
 		out := make([]candidateJSON, 0, len(candidates))
 		for _, candidate := range candidates {
-			out = append(out, candidateJSON{CommandID: candidate.CommandID, AccountScope: candidate.AccountScope, PlacedAt: candidate.PlacedAt, Attempts: candidate.Attempts, CancelState: candidate.LatestState})
+			out = append(out, candidateJSON{CommandID: candidate.CommandID, AccountScope: candidate.AccountScope, PlacedAt: candidate.PlacedAt, Attempts: candidate.Attempts, CancelState: candidate.LatestState, Actionable: candidate.Actionable()})
 		}
 		writer.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(writer).Encode(struct {

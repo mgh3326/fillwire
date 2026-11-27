@@ -166,9 +166,26 @@ func (service *Service) CancelCarryOverCandidates(ctx context.Context, scope, pr
 		}
 	}
 	sort.SliceStable(kept, func(i, j int) bool {
+		if kept[i].Actionable() != kept[j].Actionable() {
+			return kept[i].Actionable()
+		}
 		return kept[i].Attempts == 0 && kept[j].Attempts != 0
 	})
 	return kept, nil
+}
+
+// Actionable reports whether a cancel for this candidate can reach the broker.
+// Evidence-resolved orders are never cancelled by the edge. Otherwise a send
+// happens only for a never-sent command, or for a REJECTED_THROTTLED one still
+// under the attempt cap. Everything else is answered from stored state.
+func (candidate CancelCandidate) Actionable() bool {
+	if candidate.ResolvedByEvidence {
+		return false
+	}
+	if candidate.Attempts == 0 {
+		return true
+	}
+	return candidate.LatestState == string(CancelStateRejectedThrottled) && candidate.Attempts < maxCancelAttempts
 }
 
 func (service *Service) cancelReceipt(commandID string, state CancelState, code string) CancelReceipt {
