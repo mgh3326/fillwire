@@ -50,6 +50,20 @@ func (b *breaker) gate(now time.Time) (allowed, probe bool, wait time.Duration) 
 	}
 }
 
+// probeDue reports whether gate would admit a probe at now, without changing
+// state: the open window has elapsed, or the half-open probe reservation has
+// expired or was never taken.
+func (b *breaker) probeDue(now time.Time) bool {
+	switch b.state {
+	case breakerOpen:
+		return !now.Before(b.openUntil)
+	case breakerHalfOpen:
+		return !(b.probing && now.Sub(b.probeAt) < b.openFor)
+	default:
+		return false
+	}
+}
+
 // abandonProbe releases a probe reserved by gate when the request was refused
 // by a later layer and never ran.
 func (b *breaker) abandonProbe() {

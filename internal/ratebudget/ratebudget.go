@@ -327,23 +327,22 @@ func (l *Limiter) Acquire(k Key) error {
 			return &Refusal{Code: CodeCircuitOpen, RetryAfter: wait}
 		}
 	}
-	// A half-open probe pays from its endpoint bucket only. The provider bucket
-	// is the regular-pass budget: a probe spending it would starve the regular
-	// poll, and a drained regular poll would starve the probe. The probe stays
-	// bounded because the breaker admits one per open window.
+	// Every request pays from the provider+account bucket, the broker-facing
+	// limit, probes included. A regular request must leave one token for each
+	// probe that is due, so the regular pass cannot take a probe's slot; a probe
+	// needs only the token itself. Each endpoint still pays its own bucket.
 	endpointWait := ep.bucket.ready(now)
-	var providerWait time.Duration
+	hold := 0
 	if !probe {
-		providerWait = ps.global.ready(now)
+		hold = ps.probesDue(now)
 	}
+	providerWait := ps.global.readyHolding(now, hold)
 	if wait := max(endpointWait, providerWait); wait > 0 {
 		ep.breaker.abandonProbe()
 		return &Refusal{Code: CodeRateLimited, RetryAfter: wait}
 	}
 	ep.bucket.take(now)
-	if !probe {
-		ps.global.take(now)
-	}
+	ps.global.take(now)
 	return nil
 }
 
@@ -429,6 +428,18 @@ func (l *Limiter) jittered(d time.Duration) time.Duration {
 		d = 0
 	}
 	return d
+}
+
+// probesDue counts the endpoints whose half-open probe is due now. Each one
+// holds one provider token back from the regular pass until its probe takes it.
+func (p *providerState) probesDue(now time.Time) int {
+	due := 0
+	for _, ep := range p.order {
+		if ep.breaker.probeDue(now) {
+			due++
+		}
+	}
+	return due
 }
 
 // blocked reports whether a majority of the provider's endpoints, isolated ones
