@@ -36,10 +36,16 @@ const (
 	OutcomeEdgeUnreachable    = "edge_unreachable"
 	OutcomePriceUnavailable   = "price_unavailable"
 	OutcomeNoSession          = "no_session"
-	commandIDPrefix           = "broker-edge-canary:"
-	defaultEdgeURL            = "http://127.0.0.1:8080"
-	defaultTextfileDirectory  = "/var/lib/node_exporter/textfile"
-	textfileName              = "broker_edge_canary.prom"
+	// OutcomeCarryOverPending: an earlier run's UNKNOWN cancel was found, so this
+	// run placed nothing and made its single cancel attempt for that order.
+	OutcomeCarryOverPending = "carry_over_pending"
+	// OutcomeCarryOverCheckFailed: the edge could not answer the carry-over
+	// lookup, so this run fails closed and places nothing.
+	OutcomeCarryOverCheckFailed = "carry_over_check_failed"
+	commandIDPrefix             = "broker-edge-canary:"
+	defaultEdgeURL              = "http://127.0.0.1:8080"
+	defaultTextfileDirectory    = "/var/lib/node_exporter/textfile"
+	textfileName                = "broker_edge_canary.prom"
 
 	// Stage names recorded in every outcome line. A *_sent stage means the
 	// request was dispatched without a usable answer; a *_acked stage means
@@ -68,6 +74,12 @@ const (
 	defaultCheckTimeout   = 25 * time.Second
 	defaultCancelTimeout  = 25 * time.Second
 	defaultOverallTimeout = 120 * time.Second
+
+	// defaultCancelGap is the minimum wait between the last edge response and a
+	// cancel dispatch. The KIS mock per-second order limit could not be confirmed
+	// from a primary source, so this is the 1.1 s fallback. A live run had its
+	// cancel rejected with EGW00201 only 88 ms after the place ack.
+	defaultCancelGap = 1100 * time.Millisecond
 )
 
 // Config is intentionally limited to mock command details and local output.
@@ -140,6 +152,19 @@ type Result struct {
 	// OrderCheck is present whenever the run performed the post-ambiguity
 	// evidence check on its own command.
 	OrderCheck *OrderCheckEvidence `json:"order_check,omitempty"`
+	// CarryOver is present when this run found an earlier run's UNKNOWN cancel
+	// and therefore placed nothing.
+	CarryOver *CarryOverEvidence `json:"carry_over,omitempty"`
+}
+
+// CarryOverEvidence records the carry-over lookup and the single cancel attempt
+// it triggered. Only command IDs and cancel states appear; no order values.
+type CarryOverEvidence struct {
+	// Pending counts the UNKNOWN canary cancels the edge listed.
+	Pending   int    `json:"pending"`
+	CommandID string `json:"command_id,omitempty"`
+	// CancelState is the state the edge answered for the carried-over cancel.
+	CancelState string `json:"cancel_state,omitempty"`
 }
 
 // Options makes the clock, HTTP client, writers, and deadlines injectable for
@@ -158,19 +183,34 @@ type Options struct {
 	PlaceTimeout   time.Duration
 	CheckTimeout   time.Duration
 	CancelTimeout  time.Duration
+
+	// CancelGap is the minimum wait between the last edge response and a cancel
+	// dispatch; zero uses defaultCancelGap. Sleep is injectable for bounded tests.
+	CancelGap time.Duration
+	Sleep     func(time.Duration)
 }
 
 type timeouts struct {
 	overall, band, place, check, cancel time.Duration
+	cancelGap                           time.Duration
+	sleep                               func(time.Duration)
 }
 
 func (options Options) timeouts() timeouts {
 	t := timeouts{
-		overall: defaultOverallTimeout,
-		band:    defaultBandTimeout,
-		place:   defaultPlaceTimeout,
-		check:   defaultCheckTimeout,
-		cancel:  defaultCancelTimeout,
+		overall:   defaultOverallTimeout,
+		band:      defaultBandTimeout,
+		place:     defaultPlaceTimeout,
+		check:     defaultCheckTimeout,
+		cancel:    defaultCancelTimeout,
+		cancelGap: defaultCancelGap,
+		sleep:     time.Sleep,
+	}
+	if options.CancelGap > 0 {
+		t.cancelGap = options.CancelGap
+	}
+	if options.Sleep != nil {
+		t.sleep = options.Sleep
 	}
 	if options.OverallTimeout > 0 {
 		t.overall = options.OverallTimeout
@@ -264,7 +304,13 @@ func Run(ctx context.Context, options Options) int {
 		lookup = os.Getenv
 	}
 	config := ConfigFromEnv(lookup)
-	result := execute(ctx, config, now, options.Client, options.timeouts())
+	budgets := options.timeouts()
+	// The carry-over check runs before any placement, so a run with an
+	// unconfirmed earlier cancel cannot add a second resting order.
+	result, carried := carryOverRun(ctx, config, now, options.Client, budgets)
+	if !carried {
+		result = execute(ctx, config, now, options.Client, budgets)
+	}
 	_ = json.NewEncoder(stdout).Encode(result)
 	if err := WriteTextfile(config.TextfileDir, result, now().UTC()); err != nil {
 		_, _ = fmt.Fprintln(stderr, "edge-canary: textfile_write_failed")
@@ -302,28 +348,18 @@ func execute(ctx context.Context, config Config, now func() time.Time, client *h
 	result.CommandID = commandID
 	result.StageDurationsMS = map[string]int64{}
 
-	// timed dispatches one request under its own stage deadline and records the
-	// stage duration from a monotonic wall clock regardless of the outcome.
+	// Every cancel dispatch (the normal one, the post-check cleanup) waits out the
+	// pacing gap measured from the last edge response, because each response can
+	// have consumed the broker's per-second order budget. The wait is not charged
+	// to the cancel_sent stage duration.
+	pacer := cancelPacer{now: now, sleep: budgets.sleep, gap: budgets.cancelGap}
 	timed := func(stage string, budget time.Duration, request *http.Request) (*http.Response, error) {
-		stageCtx, cancelStage := context.WithTimeout(ctx, budget)
-		defer cancelStage()
-		started := time.Now()
-		defer func() { result.StageDurationsMS[stage] = time.Since(started).Milliseconds() }()
-		response, err := client.Do(request.WithContext(stageCtx))
-		if err != nil {
-			return nil, err
+		if stage == StageCancelSent {
+			pacer.wait()
 		}
-		const maxResponseBytes = 1 << 20
-		body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-		response.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		if len(body) > maxResponseBytes {
-			return nil, errors.New("canary response exceeds size limit")
-		}
-		response.Body = io.NopCloser(bytes.NewReader(body))
-		return response, nil
+		response, err := timedRequest(ctx, client, result.StageDurationsMS, stage, budget, request)
+		pacer.mark()
+		return response, err
 	}
 
 	stock := config.KRSymbol
@@ -501,6 +537,140 @@ func (result *Result) cancel(
 	result.ErrorCode = ""
 	result.Rejection = nil
 	return &cancelled
+}
+
+// timedRequest dispatches one request under its own stage deadline and records
+// the stage duration from a monotonic wall clock regardless of the outcome.
+func timedRequest(ctx context.Context, client *http.Client, durations map[string]int64, stage string, budget time.Duration, request *http.Request) (*http.Response, error) {
+	stageCtx, cancelStage := context.WithTimeout(ctx, budget)
+	defer cancelStage()
+	started := time.Now()
+	defer func() { durations[stage] = time.Since(started).Milliseconds() }()
+	response, err := client.Do(request.WithContext(stageCtx))
+	if err != nil {
+		return nil, err
+	}
+	const maxResponseBytes = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	response.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxResponseBytes {
+		return nil, errors.New("canary response exceeds size limit")
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	return response, nil
+}
+
+// cancelPacer keeps a cancel dispatch at least gap after the most recent edge
+// response. The zero value of last means no edge response has been seen yet.
+type cancelPacer struct {
+	now   func() time.Time
+	sleep func(time.Duration)
+	gap   time.Duration
+	last  time.Time
+}
+
+func (pacer *cancelPacer) mark() { pacer.last = pacer.now() }
+
+func (pacer *cancelPacer) wait() {
+	if pacer.last.IsZero() || pacer.gap <= 0 {
+		return
+	}
+	if remaining := pacer.gap - pacer.now().Sub(pacer.last); remaining > 0 {
+		// The wait is deliberately not cancellable by the run deadline: the
+		// cancel after a place ack must still be attempted, or the resting order
+		// would leave no UNKNOWN marker for a later run to carry over.
+		pacer.sleep(remaining)
+	}
+}
+
+// carryOverRun is the pre-placement check. An earlier run's cancel that ended
+// UNKNOWN may still rest on the broker, so this run first asks the edge for
+// those markers. When one exists it makes exactly one cancel attempt for the
+// first one and reports carry_over_pending; the place leg never runs, so the
+// run returns carried=true. With no markers it returns carried=false and the
+// normal run proceeds. A failed or malformed lookup fails closed.
+//
+// The attempt uses the edge's own cancel endpoint. A committed UNKNOWN marker
+// answers with its stored state, so only the edge can decide whether a re-send
+// is permitted.
+func carryOverRun(ctx context.Context, config Config, now func() time.Time, client *http.Client, budgets timeouts) (Result, bool) {
+	runAt := now().UTC()
+	scope := SelectScope(runAt)
+	base, err := loopbackURL(config.EdgeURL)
+	if scope == ScopeNoSession || err != nil {
+		// No session makes no request; an invalid edge URL is reported by execute.
+		return Result{}, false
+	}
+	if client == nil {
+		client = &http.Client{}
+	}
+	result := Result{Scope: scope, Timestamp: runAt.Format(time.RFC3339), StageDurationsMS: map[string]int64{}}
+
+	lookupRequest, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		base+"/v1/cancel-attempts?state=UNKNOWN&command_prefix="+url.QueryEscape(commandIDPrefix), nil)
+	lookupResponse, err := timedRequest(ctx, client, result.StageDurationsMS, "carry_over", budgets.check, lookupRequest)
+	if err != nil {
+		return carryOverFailed(result, err), true
+	}
+	var listed struct {
+		// A pointer distinguishes a missing key, which is malformed, from an
+		// empty list, which is a clean edge.
+		CancelAttempts *[]struct {
+			CommandID string `json:"command_id"`
+		} `json:"cancel_attempts"`
+	}
+	decodeErr := json.NewDecoder(lookupResponse.Body).Decode(&listed)
+	lookupResponse.Body.Close()
+	if decodeErr != nil || lookupResponse.StatusCode != http.StatusOK || listed.CancelAttempts == nil {
+		return carryOverFailed(result, nil), true
+	}
+	attempts := *listed.CancelAttempts
+	for _, attempt := range attempts {
+		if len(attempt.CommandID) <= len(commandIDPrefix) || !strings.HasPrefix(attempt.CommandID, commandIDPrefix) {
+			// Only this canary's own commands may be cancelled from here.
+			return carryOverFailed(result, nil), true
+		}
+	}
+	if len(attempts) == 0 {
+		return Result{}, false
+	}
+
+	first := attempts[0].CommandID
+	result.Outcome = OutcomeCarryOverPending
+	result.Stage = StageCancelSent
+	result.CarryOver = &CarryOverEvidence{Pending: len(attempts), CommandID: first}
+	cancelRequest, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		base+"/v1/commands/"+url.PathEscape(first)+"/cancel", nil)
+	cancelRequest.Header.Set("X-Correlation-ID", first)
+	cancelResponse, err := timedRequest(ctx, client, result.StageDurationsMS, StageCancelSent, budgets.cancel, cancelRequest)
+	if err != nil {
+		if isDeadline(err) {
+			result.ErrorCode = ErrorCanaryTimeout
+		}
+		return result, true
+	}
+	var cancelled cancelReceipt
+	decodeErr = json.NewDecoder(cancelResponse.Body).Decode(&cancelled)
+	cancelResponse.Body.Close()
+	if decodeErr == nil {
+		result.Stage = StageCancelAcked
+		result.CarryOver.CancelState = cancelled.State
+		result.ErrorCode = cancelled.ErrorCode
+		result.Rejection = cancelled.Rejection
+	}
+	return result, true
+}
+
+func carryOverFailed(result Result, err error) Result {
+	result.Outcome = OutcomeCarryOverCheckFailed
+	result.ErrorCode = ErrorCheckFailed
+	if isDeadline(err) {
+		result.ErrorCode = ErrorCanaryTimeout
+	}
+	return result
 }
 
 // isDeadline reports whether the request failed because its own stage or the

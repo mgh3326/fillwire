@@ -205,6 +205,10 @@ func TestRunWritesJSONAndTextfileWithSafeLabels(t *testing.T) {
 	directory := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("content-type", "application/json")
+		if request.URL.Path == "/v1/cancel-attempts" {
+			_, _ = writer.Write([]byte(`{"cancel_attempts":[]}`))
+			return
+		}
 		if request.URL.Path == "/v1/price-band" {
 			_ = json.NewEncoder(writer).Encode(executioncontracts.PriceBandV1{SchemaVersion: executioncontracts.PriceBandV1SchemaVersion, StockCode: "005930", LowerLimit: "49700"})
 			return

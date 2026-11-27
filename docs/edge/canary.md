@@ -39,6 +39,55 @@ run writes its result as one JSON object to stdout. Set `CANARY_TEXTFILE_DIR` (d
 `/var/lib/node_exporter/textfile`) to expose the atomically replaced
 `broker_edge_canary.prom` node_exporter textfile.
 
+## Cancel pacing
+
+Every cancel dispatch waits until at least `1.1 s` has passed since the most
+recent edge response, so the place acknowledgement and the cancel are never
+back to back. A live run had its cancel refused with `EGW00201`
+(`초당 거래건수를 초과하였습니다`, HTTP 500, `rt_cd` 1) only 88 ms after the place
+ack. The KIS mock per-second order limit could not be confirmed from a primary
+source: community sources disagree (about 2 versus 5 requests per second). The
+`1.1 s` value is the fallback that covers a one-request-per-second window. It
+applies to both the normal cancel and the post-check cleanup. The wait is not
+charged to `durations_ms.cancel_sent`. It is also never cut short by the run
+deadline, so an acknowledged order always gets its cancel attempt.
+
+## Carry-over of an unconfirmed cancel
+
+A cancel that ends `UNKNOWN` leaves a durable marker on the edge, and the edge
+never retransmits it. The order may still rest on the broker. Before any
+placement, each run asks the edge:
+
+`GET /v1/cancel-attempts?state=UNKNOWN&command_prefix=broker-edge-canary%3A`
+
+It lists `UNKNOWN` cancel markers on `kis_mock` and `kis_mock_us` whose command
+IDs carry the canary prefix. When the list is empty, the run continues normally.
+When it is not empty, the run:
+
+- makes one cancel attempt for the first listed command, through the edge's
+  normal `POST /v1/commands/{command_id}/cancel`;
+- places nothing in that run;
+- exits `1` with `outcome=carry_over_pending`, whatever the cancel answered,
+  because a carried-over cancel is not proof that a place works now.
+
+The result carries `carry_over.pending` (the count listed),
+`carry_over.command_id`, and `carry_over.cancel_state`. A lookup that fails,
+returns a non-200 response, lacks the `cancel_attempts` key, or lists a command
+outside the canary prefix ends with `outcome=carry_over_check_failed`, exits `1`,
+and places nothing.
+
+**Open limit.** The edge answers a repeated cancel for a command with its stored
+`UNKNOWN` receipt and sends nothing to the broker. So today the carried-over
+attempt keeps reporting `UNKNOWN` until the edge is allowed to re-send after a
+broker rejection that is provably unprocessed. That is a design decision for the
+edge owner and it is not made here. Until it is, a carried-over order keeps
+resting and every run stops before placing. That is the intended fail-closed
+behaviour.
+
+Only a `command_id` produced by this canary can be carried over. A run that
+placed an order and then crashed before its cancel leaves no marker, so it is not
+covered here.
+
 ## Timeouts
 
 Every stage carries its own deadline and the whole run carries one overall
