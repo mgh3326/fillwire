@@ -548,24 +548,34 @@ func TestRunnerReconnectsAfterServerShutdownWithOneConnection(t *testing.T) {
 
 func TestRunnerRedeclaresAfterRateLimitNoSoonerThanOneSecond(t *testing.T) {
 	var first atomic.Bool
-	var times sync.Map
-	var declarations atomic.Int32
+	// The write time is sent by the callback itself. The fake records a write
+	// before it calls onWrite, so counting writes cannot prove a timestamp is
+	// stored yet; waiting on the channel can.
+	writes := make(chan time.Time, 8)
 	l := startLane(t, wednesdayMidday, func(c *fakeConn, data []byte) {
 		if !bytes.HasPrefix(data, []byte("[")) {
 			return
 		}
-		times.Store(declarations.Add(1), time.Now())
+		writes <- time.Now()
 		if first.CompareAndSwap(false, true) {
 			go c.push(fixture(t, "error_rate_limit.json"))
 			return
 		}
 		ackAll(c, data)
 	}, nil)
-	conn := <-l.dialer.dialed
-	waitFor(t, "redeclaration", func() bool { return conn.count("[") == 2 })
-	t1, _ := times.Load(int32(1))
-	t2, _ := times.Load(int32(2))
-	if gap := t2.(time.Time).Sub(t1.(time.Time)); gap < 900*time.Millisecond {
+	next := func(what string) time.Time {
+		t.Helper()
+		select {
+		case at := <-writes:
+			return at
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout waiting for %s", what)
+			return time.Time{}
+		}
+	}
+	t1 := next("initial declaration")
+	t2 := next("redeclaration")
+	if gap := t2.Sub(t1); gap < 900*time.Millisecond {
 		t.Fatalf("redeclared after %s, want about 1s", gap)
 	}
 	if l.dialer.dials() != 1 {
