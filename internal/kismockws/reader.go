@@ -27,6 +27,9 @@ const (
 	noticeAckTimeout      = 5 * time.Second
 	subscribeRetryMin     = 500 * time.Millisecond
 	subscribeRetryMax     = 5 * time.Second
+	// defaultShutdownWait bounds each shutdown wait on the quote writer and the
+	// sink close, so a stalled write cannot hold the process after cancellation.
+	defaultShutdownWait = 5 * time.Second
 )
 
 // Config describes one record-only VTS session. Endpoint must be "mock";
@@ -58,6 +61,8 @@ type Module struct {
 	cfg          Config
 	appendRecord func(sink *recording.Sink, name string, at time.Time, value any) error
 
+	shutdownWait time.Duration
+
 	connected     atomic.Bool
 	malformed     atomic.Uint64
 	droppedQuotes atomic.Uint64
@@ -65,7 +70,10 @@ type Module struct {
 	mu            sync.RWMutex
 	lastAt        time.Time
 	lastErr       string
-	writeErr      error
+	// Quote and notice writes fail independently. A quote failure must not
+	// discard notices that are still queued for the same module.
+	quoteWriteErr  error
+	noticeWriteErr error
 }
 
 func New(cfg Config) (*Module, error) {
@@ -103,7 +111,7 @@ func New(cfg Config) (*Module, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Module{cfg: cfg}, nil
+	return &Module{cfg: cfg, shutdownWait: defaultShutdownWait}, nil
 }
 
 func validSymbol(value string) bool {
@@ -142,7 +150,7 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return err
 	}
-	defer func() { runErr = errors.Join(runErr, sink.Close()) }()
+	defer func() { runErr = errors.Join(runErr, sink.CloseWithin(m.shutdownWait)) }()
 	initialDrops := m.droppedQuotes.Load()
 	quoteEvents := make(chan ws.Event, quoteQueueSize)
 	quoteWriterDone := make(chan struct{})
@@ -251,7 +259,13 @@ func (m *Module) Run(ctx context.Context) (runErr error) {
 		}
 		close(quoteEvents)
 		drain()
-		<-quoteWriterDone
+		// A stalled quote write must not hold shutdown. The writer will not
+		// drain the queue once it stops waiting, so count those quotes as
+		// dropped. The bounded sink close reports the stalled write.
+		if !waitWithin(quoteWriterDone, m.shutdownWait) {
+			m.droppedQuotes.Add(uint64(len(quoteEvents)))
+			m.cfg.Logger.Warn("KIS mock quote writer still blocked at shutdown")
+		}
 		if dropped := m.droppedQuotes.Load() - initialDrops; dropped > 0 {
 			m.cfg.Logger.Warn("KIS mock quote recording queue overflowed", "dropped_quotes", dropped)
 		}
@@ -334,7 +348,7 @@ func (m *Module) recordQuote(sink *recording.Sink, event ws.Event, cancel contex
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	if m.append(sink, quoteRecordingName, at, value, cancel) {
+	if m.append(sink, &m.quoteWriteErr, quoteRecordingName, at, value, cancel) {
 		m.received(at)
 	}
 }
@@ -355,7 +369,7 @@ func (m *Module) recordNotice(sink *recording.Sink, event ws.Event, cancel conte
 			Fields     []string  `json:"fields"`
 			Raw        []byte    `json:"raw,omitempty"`
 		}{"malformed_notice", event.TR, at.UTC(), "invalid notice layout", event.Fields, event.Raw}
-		if m.append(sink, malformedRecording, at, bad, cancel) {
+		if m.append(sink, &m.noticeWriteErr, malformedRecording, at, bad, cancel) {
 			m.received(at)
 		}
 		if m.cfg.Logger != nil {
@@ -368,15 +382,17 @@ func (m *Module) recordNotice(sink *recording.Sink, event ws.Event, cancel conte
 		if isFuturesNoticeTR(event.TR) {
 			stream = futuresRecordingName
 		}
-		if m.append(sink, stream, notice.ReceivedAt, notice, cancel) {
+		if m.append(sink, &m.noticeWriteErr, stream, notice.ReceivedAt, notice, cancel) {
 			m.received(notice.ReceivedAt)
 		}
 	}
 }
 
-func (m *Module) append(sink *recording.Sink, name string, at time.Time, value any, cancel context.CancelFunc) bool {
+// append writes one record. failure is the error slot for the record's class,
+// so a failed quote write refuses later quotes but not later notices.
+func (m *Module) append(sink *recording.Sink, failure *error, name string, at time.Time, value any, cancel context.CancelFunc) bool {
 	m.mu.RLock()
-	failed := m.writeErr != nil
+	failed := *failure != nil
 	m.mu.RUnlock()
 	if failed {
 		return false
@@ -386,7 +402,7 @@ func (m *Module) append(sink *recording.Sink, name string, at time.Time, value a
 		appendRecord = record
 	}
 	if err := appendRecord(sink, name, at, value); err != nil {
-		m.setWriteError(err)
+		m.setWriteError(failure, err)
 		m.setError("recording append failed")
 		if m.cfg.Logger != nil {
 			m.cfg.Logger.Error("KIS mock websocket recording failed")
@@ -417,17 +433,29 @@ func (m *Module) clearError() {
 	m.mu.Unlock()
 }
 
-func (m *Module) setWriteError(err error) {
+func (m *Module) setWriteError(failure *error, err error) {
 	m.mu.Lock()
-	if m.writeErr == nil {
-		m.writeErr = err
+	if *failure == nil {
+		*failure = err
 	}
 	m.mu.Unlock()
 }
 
 func (m *Module) recordingError(other error) error {
 	m.mu.RLock()
-	writeErr := m.writeErr
+	quoteErr, noticeErr := m.quoteWriteErr, m.noticeWriteErr
 	m.mu.RUnlock()
-	return errors.Join(other, writeErr)
+	return errors.Join(other, quoteErr, noticeErr)
+}
+
+// waitWithin reports whether done closes before timeout expires.
+func waitWithin(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

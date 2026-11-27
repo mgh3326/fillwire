@@ -160,7 +160,7 @@ func TestMalformedNoticeIsRecordedAndWriteFailureCancels(t *testing.T) {
 	}
 	canceled := false
 	module.appendRecord = func(*recording.Sink, string, time.Time, any) error { return errors.New("disk full") }
-	if module.append(sink, overseasRecordingName, at, got, func() { canceled = true }) {
+	if module.append(sink, &module.noticeWriteErr, overseasRecordingName, at, got, func() { canceled = true }) {
 		t.Fatal("failed append reported success")
 	}
 	if !canceled || module.Health().LastError != "recording append failed" {

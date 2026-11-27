@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -477,5 +478,148 @@ func TestSlowQuoteWriterDropsOverflowAndDrains(t *testing.T) {
 	case <-noticeWritten:
 	case <-ctx.Done():
 		t.Fatal("blocked quote writer stalled notice processing")
+	}
+}
+
+func quoteTestFrame() []byte {
+	fields := make([]string, 46)
+	fields[0], fields[1] = "005930", "100203"
+	fields[2], fields[12], fields[13], fields[21] = "100", "1", "1", "1"
+	return []byte("0|H0STCNT0|001|" + strings.Join(fields, "^"))
+}
+
+func TestStalledQuoteWriterDoesNotHoldShutdown(t *testing.T) {
+	var logs bytes.Buffer
+	transport := newAckTransport()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	module, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		RecordingDirectory: t.TempDir(), Approval: unusedApproval{}, SubscribePace: time.Nanosecond,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return transport, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	module.shutdownWait = 50 * time.Millisecond
+	quoteStarted, releaseQuote := make(chan struct{}), make(chan struct{})
+	var quoteAttempts atomic.Int64
+	module.appendRecord = func(sink *recording.Sink, name string, at time.Time, value any) error {
+		if name == quoteRecordingName && quoteAttempts.Add(1) == 1 {
+			value = blockingQuoteRecord{value: value, started: quoteStarted, release: releaseQuote}
+		}
+		return record(sink, name, at, value)
+	}
+	done := make(chan error, 1)
+	go func() { done <- module.Run(ctx) }()
+	for {
+		transport.mu.Lock()
+		count := len(transport.trs)
+		transport.mu.Unlock()
+		if count == 5 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("subscriptions did not complete")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	frame := quoteTestFrame()
+	transport.reads <- frame
+	select {
+	case <-quoteStarted:
+	case <-ctx.Done():
+		t.Fatal("quote writer did not start")
+	}
+	for i := 0; i < quoteQueueSize+2; i++ {
+		select {
+		case transport.reads <- frame:
+		case <-ctx.Done():
+			t.Fatal("blocked quote writer stalled the reader")
+		}
+	}
+	for module.Health().DroppedQuotes < 2 {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("reader dropped %d quotes, want 2", module.Health().DroppedQuotes)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, recording.ErrCloseTimeout) {
+			t.Fatalf("Run error = %v, want the bounded sink close to report the stalled write", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return while the quote writer was stalled")
+	}
+	// Two quotes overflowed the queue, and the 32 queued behind the stalled
+	// write were abandoned at shutdown.
+	if !strings.Contains(logs.String(), "dropped_quotes=34") {
+		t.Error("shutdown log did not report the 34 discarded quotes")
+	}
+	if !strings.Contains(logs.String(), "quote writer still blocked at shutdown") {
+		t.Error("shutdown log did not report the blocked quote writer")
+	}
+	// Release the stalled write. The writer's next attempt starts only after
+	// that write returns, and the sink is closed by then, so the queued quotes
+	// are refused without touching the disk. Wait for that attempt so no file
+	// write outlives the temporary recording directory.
+	close(releaseQuote)
+	deadline := time.After(2 * time.Second)
+	for quoteAttempts.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("stalled quote write did not finish after release")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func TestNoticesStillRecordAfterQuoteWriteFailure(t *testing.T) {
+	module, err := New(Config{
+		Endpoint: "mock", HTSID: "fixture-hts", Symbols: []string{"005930"},
+		RecordingDirectory: t.TempDir(), Approval: unusedApproval{},
+		Dialer: ws.DialerFunc(func(context.Context, string) (ws.Transport, error) { return nil, nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := recording.NewSink(t.TempDir(), Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+	quoteAttempts, noticesWritten := 0, 0
+	module.appendRecord = func(_ *recording.Sink, name string, _ time.Time, _ any) error {
+		if name == quoteRecordingName {
+			quoteAttempts++
+			return errors.New("quote disk full")
+		}
+		noticesWritten++
+		return nil
+	}
+	cancels := 0
+	cancelRun := func() { cancels++ }
+	module.recordQuote(sink, ws.Event{TR: "H0STCNT0", Raw: quoteTestFrame()}, cancelRun)
+	module.recordQuote(sink, ws.Event{TR: "H0STCNT0", Raw: quoteTestFrame()}, cancelRun)
+	noticeFields := make([]string, 22)
+	noticeFields[5], noticeFields[11], noticeFields[12], noticeFields[13] = "0", "0", "2", "2"
+	noticeFrame := []byte("0|" + TRFuturesNoticeAlt + "|001|" + strings.Join(noticeFields, "^"))
+	module.recordNotice(sink, ws.Event{TR: TRFuturesNoticeAlt, Raw: noticeFrame}, cancelRun)
+	if quoteAttempts != 1 {
+		t.Fatalf("quote writes attempted = %d, want 1 with later quotes refused", quoteAttempts)
+	}
+	if noticesWritten != 1 {
+		t.Fatalf("notices written = %d, want 1 after a quote write failure", noticesWritten)
+	}
+	if cancels != 1 {
+		t.Fatalf("run canceled %d times, want once for the quote failure", cancels)
+	}
+	if err := module.recordingError(nil); err == nil || !strings.Contains(err.Error(), "quote disk full") {
+		t.Fatalf("recording error = %v, want the quote failure", err)
 	}
 }
