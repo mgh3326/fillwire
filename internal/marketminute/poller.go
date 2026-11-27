@@ -142,6 +142,11 @@ type Config struct {
 	// DayMarketTrail is how long after a window ends the day targets are still
 	// read. Zero takes DefaultDayMarketTrail.
 	DayMarketTrail time.Duration
+	// DayMarketBudget caps one day-market pass: a day target that would start
+	// or wait past it is recorded as day_budget, so a slow or rate-limited day
+	// source cannot hold the next regular poll. Zero takes
+	// DefaultDayMarketBudget.
+	DayMarketBudget time.Duration
 }
 
 // Poller runs one concurrent shadow poll over a target list.
@@ -155,6 +160,10 @@ type Poller struct {
 	// dayTargets are derived from the listed US targets; empty when the
 	// day-market source is off.
 	dayTargets []Target
+	// dayProbe indexes the day target that probes the half-open day circuit
+	// on the next day pass. It advances after every day pass that reads, so a
+	// target that always fails cannot hold the probe.
+	dayProbe int
 }
 
 const defaultWorkers = 4
@@ -197,6 +206,12 @@ func NewPoller(config Config) (*Poller, error) {
 	}
 	if config.DayMarketTrail < 0 {
 		return nil, fmt.Errorf("%w: day-market trail must not be negative", ErrConfig)
+	}
+	if config.DayMarketBudget == 0 {
+		config.DayMarketBudget = DefaultDayMarketBudget
+	}
+	if config.DayMarketBudget < 0 {
+		return nil, fmt.Errorf("%w: day-market budget must not be negative", ErrConfig)
 	}
 	var dayTargets []Target
 	for _, target := range config.Targets {
@@ -243,14 +258,25 @@ type jobResult struct {
 // is recorded for every request; a refusal is retried after its RetryAfter.
 //
 // With the day-market source on, its targets are polled after the listed ones
-// are written, and only while the day market's own windows allow it. A day
-// target refused by an open circuit is skipped instead of waited for.
-func (p *Poller) Run(ctx context.Context) (Report, error) {
-	report := Report{Targets: len(p.config.Targets), Refusals: map[string]int{}}
+// are written, and only while the day market's own windows allow it. The day
+// pass polls one target alone first, as the half-open probe, and the rest
+// after it, so they see the probe's outcome instead of racing it. A day target
+// is skipped only when its circuit reports a window still to wait out, and
+// the whole day pass stops at DayMarketBudget.
+//
+// The sink is flushed between the two passes and before Run returns, so rows
+// the regular pass wrote are not held in a buffer while the day pass runs or
+// when it fails.
+func (p *Poller) Run(ctx context.Context) (report Report, err error) {
+	defer func() { err = errors.Join(err, p.flushSink()) }()
+	report = Report{Targets: len(p.config.Targets), Refusals: map[string]int{}}
 	if len(p.config.Targets) == 0 {
 		return report, nil
 	}
-	if err := p.pass(ctx, p.config.Targets, &report); err != nil {
+	if err := p.pass(ctx, p.config.Targets, -1, time.Time{}, &report); err != nil {
+		return report, err
+	}
+	if err := p.flushSink(); err != nil {
 		return report, err
 	}
 	if !p.config.USDayMarket {
@@ -264,38 +290,22 @@ func (p *Poller) Run(ctx context.Context) (Report, error) {
 	}
 	day.Read = true
 	before := report.Rows
-	err := p.pass(ctx, p.dayTargets, &report)
+	probe := p.dayProbe
+	p.dayProbe = (p.dayProbe + 1) % len(p.dayTargets)
+	err = p.pass(ctx, p.dayTargets, probe, at.Add(p.config.DayMarketBudget), &report)
 	day.Rows = report.Rows - before
 	return report, err
 }
 
-// pass polls one target list and writes its closed bars.
-func (p *Poller) pass(ctx context.Context, targets []Target, report *Report) error {
+// pass polls one target list and writes its closed bars in list order. When
+// probe is an index, that target is polled alone first and the rest follow.
+// A zero deadline takes no time cap.
+func (p *Poller) pass(ctx context.Context, targets []Target, probe int, deadline time.Time, report *Report) error {
 	results := make([]jobResult, len(targets))
-	workers := min(p.config.Workers, len(targets))
-	jobs := make(chan int)
-	var wait sync.WaitGroup
-	for range workers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			for index := range jobs {
-				results[index] = p.pollOne(ctx, targets[index])
-			}
-		}()
+	if probe >= 0 {
+		results[probe] = p.pollOne(ctx, targets[probe], deadline)
 	}
-	for index := range targets {
-		select {
-		case jobs <- index:
-		case <-ctx.Done():
-			close(jobs)
-			wait.Wait()
-			return ctx.Err()
-		}
-	}
-	close(jobs)
-	wait.Wait()
-	if err := ctx.Err(); err != nil {
+	if err := p.fanOut(ctx, targets, probe, deadline, results); err != nil {
 		return err
 	}
 
@@ -361,11 +371,65 @@ func (p *Poller) write(ctx context.Context, bars []Bar) error {
 	return nil
 }
 
-func (p *Poller) pollOne(ctx context.Context, target Target) jobResult {
+// fanOut polls every target except skip with a bounded worker pool, storing
+// each result at the target's own index. A negative skip skips nothing.
+func (p *Poller) fanOut(ctx context.Context, targets []Target, skip int, deadline time.Time, results []jobResult) error {
+	workers := min(p.config.Workers, len(targets))
+	jobs := make(chan int)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for index := range jobs {
+				results[index] = p.pollOne(ctx, targets[index], deadline)
+			}
+		}()
+	}
+	for index := range targets {
+		if index == skip {
+			continue
+		}
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			close(jobs)
+			wait.Wait()
+			return ctx.Err()
+		}
+	}
+	close(jobs)
+	wait.Wait()
+	return ctx.Err()
+}
+
+// flusher is implemented by a sink that buffers rows, such as JSONLSink.
+type flusher interface {
+	Flush() error
+}
+
+// flushSink pushes the sink's buffered rows out. A sink that does not buffer
+// is left alone.
+func (p *Poller) flushSink() error {
+	if f, ok := p.config.Sink.(flusher); ok {
+		return f.Flush()
+	}
+	return nil
+}
+
+// pollOne performs one target's read, waiting out ratebudget refusals. A day
+// target is skipped only when its circuit refuses with a wait; a refusal with
+// no wait means a probe is in flight, so the target waits and tries again.
+// A non-zero deadline stops the waiting once the day pass is over budget.
+func (p *Poller) pollOne(ctx context.Context, target Target, deadline time.Time) jobResult {
 	result := jobResult{}
 	key := p.Key(target)
 	for {
 		observedBefore := p.config.Clock()
+		if !deadline.IsZero() && !observedBefore.Before(deadline) {
+			result.targetError = &TargetError{Market: target.Market, Symbol: target.Symbol, Venue: target.Venue, Class: classDayBudget}
+			return result
+		}
 		err := p.config.Limiter.Acquire(key)
 		if err == nil {
 			return p.fetch(ctx, target, key, observedBefore, result)
@@ -376,16 +440,22 @@ func (p *Poller) pollOne(ctx context.Context, target Target) jobResult {
 			return result
 		}
 		result.refusals = append(result.refusals, string(code))
-		if code == ratebudget.CodeCircuitOpen && isDayVenue(target.Venue) {
-			// Waiting would admit one probe per open window and hold the next
-			// regular poll behind a failing day source.
+		wait := time.Second
+		var refusal *ratebudget.Refusal
+		hasWait := errors.As(err, &refusal) && refusal.RetryAfter > 0
+		if hasWait {
+			wait = max(refusal.RetryAfter, time.Millisecond)
+		}
+		if code == ratebudget.CodeCircuitOpen && isDayVenue(target.Venue) && hasWait {
+			// The day circuit is holding its window: waiting would admit one
+			// probe per window and hold the next regular poll behind a failing
+			// day source.
 			result.targetError = &TargetError{Market: target.Market, Symbol: target.Symbol, Venue: target.Venue, Class: classCircuitOpen}
 			return result
 		}
-		wait := time.Second
-		var refusal *ratebudget.Refusal
-		if errors.As(err, &refusal) && refusal.RetryAfter > 0 {
-			wait = max(refusal.RetryAfter, time.Millisecond)
+		if !deadline.IsZero() && p.config.Clock().Add(wait).After(deadline) {
+			result.targetError = &TargetError{Market: target.Market, Symbol: target.Symbol, Venue: target.Venue, Class: classDayBudget}
+			return result
 		}
 		if sleepErr := p.config.Sleep(ctx, wait); sleepErr != nil {
 			result.targetError = &TargetError{Market: target.Market, Symbol: target.Symbol, Venue: target.Venue, Class: ErrorClass(sleepErr)}
