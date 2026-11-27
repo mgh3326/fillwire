@@ -25,6 +25,7 @@ const (
 	classMalformedResponse = "malformed_response"
 	classCanceled          = "canceled"
 	classCredentialHost    = "credential_host"
+	classCircuitOpen       = "circuit_open"
 )
 
 var (
@@ -298,7 +299,10 @@ func minuteRequest(target Target, now time.Time) (url.Values, string, string) {
 		query.Set("FID_ETC_CLS_CODE", "")
 		return query, DomesticPath, DomesticTR
 	default:
-		exchange := map[string]string{"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS"}[target.Venue]
+		exchange := map[string]string{
+			"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS",
+			VenueDayNASD: VenueDayNASD, VenueDayNYSE: VenueDayNYSE, VenueDayAMEX: VenueDayAMEX,
+		}[target.Venue]
 		query.Set("AUTH", "")
 		query.Set("EXCD", exchange)
 		query.Set("SYMB", strings.ReplaceAll(target.Symbol, ".", "/"))
@@ -327,8 +331,12 @@ func frameFromRow(target Target, row map[string]any) (FrameRow, bool) {
 			Volume:   number(row["cntg_vol"]),
 			Value:    number(row["acml_tr_pbmn"]),
 		}, label != ""
-	case "NASD", "NYSE", "AMEX":
-		label := joinLabel(text(row["xymd"]), text(row["xhms"]))
+	case "NASD", "NYSE", "AMEX", VenueDayNASD, VenueDayNYSE, VenueDayAMEX:
+		date, clock := "xymd", "xhms"
+		if isDayVenue(target.Venue) {
+			date, clock = "kymd", "khms"
+		}
+		label := joinLabel(text(row[date]), text(row[clock]))
 		return FrameRow{
 			DateTime: label,
 			Open:     number(row["open"]),

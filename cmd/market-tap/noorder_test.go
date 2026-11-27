@@ -26,11 +26,11 @@ var forbiddenImports = []string{
 
 var (
 	// orderSymbol matches function and type names of order clients.
-	orderSymbol = regexp.MustCompile(`(?i)(place|submit|send|cancel|amend|modify|revise)_?orders?|order_?(cash|credit|rvsecncl|resv|client)`)
-	// orderEndpoint matches KIS order REST paths and order transaction IDs
-	// (domestic TTTC/VTTC, overseas TTTT/VTTT/TTTS; order TR IDs end in U,
-	// read-only inquiries end in R).
-	orderEndpoint = regexp.MustCompile(`/trading/order|[TV]TT[CTS][0-9]{4}U`)
+	orderSymbol = regexp.MustCompile(`(?i)(place|submit|send|cancel|amend|modify|revise|daytime)_?orders?|order_?(cash|credit|rvsecncl|resv|client)`)
+	// orderEndpoint matches KIS order REST paths, the US day-market order
+	// paths included, and order transaction IDs (domestic TTTC/VTTC, overseas
+	// TTTT/VTTT/TTTS; order TR IDs end in U, read-only inquiries end in R).
+	orderEndpoint = regexp.MustCompile(`/trading/(daytime-)?order|[TV]TT[CTS][0-9]{4}U`)
 )
 
 func goTool(t *testing.T, args ...string) []byte {
@@ -103,6 +103,15 @@ func TestOrderScannersCatchOrderCode(t *testing.T) {
 	binary := []byte("\x00/uapi/domestic-stock/v1/trading/order-cash\x00TTTC0802U\x00FHKST03010200\x00")
 	if got := orderEndpoints(binary); len(got) != 2 {
 		t.Fatalf("orderEndpoints = %v, want the order path and TTTC0802U only", got)
+	}
+	// The US day-market order surface of the same official sample set.
+	dayNM := "  4a1f20 T example.com/overseas.DaytimeOrder\n  4a2000 T example.com/overseas.daytime_order_rvsecncl\n"
+	if got := orderSymbols(dayNM); len(got) != 2 {
+		t.Fatalf("orderSymbols = %v, want both day-market order symbols", got)
+	}
+	dayBinary := []byte("\x00/uapi/overseas-stock/v1/trading/daytime-order\x00TTTS6036U\x00HHDFS76950200\x00")
+	if got := orderEndpoints(dayBinary); len(got) != 2 {
+		t.Fatalf("orderEndpoints = %v, want the day-market order path and TTTS6036U only", got)
 	}
 }
 
